@@ -1,0 +1,458 @@
+﻿"""
+Unit tests for the Event Participation Gate (EPG).
+
+Tests EventAnchor (T_event detection) and ParticipationGate (dollar volume
+intensity gate with running peak threshold).
+"""
+from __future__ import annotations
+
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.epg.anchor import EventAnchor
+from core.epg.gate import ParticipationGate, GateState
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  EventAnchor Tests
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestEventAnchor:
+    """Tests for T_event detection."""
+
+    def test_fires_on_first_crossing(self):
+        """T_event fires exactly when lambda_hat first exceeds k * lambda_ref."""
+        anchor = EventAnchor(lambda_ref=100.0, k_multiplier=5)
+
+        # Below threshold: 5 * 100 = 500
+        result = anchor.update(lambda_hat_t=400.0, timestamp=1.0)
+        assert result is None
+        assert not anchor.has_fired
+
+        result = anchor.update(lambda_hat_t=499.9, timestamp=2.0)
+        assert result is None
+
+        # At threshold (not strictly greater)
+        result = anchor.update(lambda_hat_t=500.0, timestamp=3.0)
+        assert result is None  # must be > threshold, not >=
+
+        # Above threshold — fires
+        result = anchor.update(lambda_hat_t=500.1, timestamp=4.0)
+        assert result == 4.0
+        assert anchor.has_fired
+        assert anchor.t_event == 4.0
+
+    def test_does_not_refire_on_second_crossing(self):
+        """Once T_event is set, it does not move even if lambda_hat re-crosses."""
+        anchor = EventAnchor(lambda_ref=100.0, k_multiplier=5)
+
+        # First crossing
+        anchor.update(lambda_hat_t=600.0, timestamp=10.0)
+        assert anchor.t_event == 10.0
+
+        # Drop below and re-cross
+        anchor.update(lambda_hat_t=100.0, timestamp=20.0)
+        result = anchor.update(lambda_hat_t=700.0, timestamp=30.0)
+
+        # T_event unchanged
+        assert result == 10.0
+        assert anchor.t_event == 10.0
+
+    def test_returns_t_event_on_every_call_after_firing(self):
+        """After first crossing, every update returns T_event."""
+        anchor = EventAnchor(lambda_ref=50.0, k_multiplier=3)
+
+        # Fire
+        anchor.update(lambda_hat_t=200.0, timestamp=5.5)
+        assert anchor.t_event == 5.5
+
+        # Subsequent calls all return same T_event
+        for t in [6.0, 7.0, 100.0]:
+            assert anchor.update(lambda_hat_t=10.0, timestamp=t) == 5.5
+
+    def test_reset_clears_state(self):
+        """Reset allows T_event to be re-anchored (continuation events)."""
+        anchor = EventAnchor(lambda_ref=100.0, k_multiplier=5)
+
+        # Fire first session
+        anchor.update(lambda_hat_t=600.0, timestamp=10.0)
+        assert anchor.t_event == 10.0
+
+        # Reset for new session
+        anchor.reset()
+        assert anchor.t_event is None
+        assert not anchor.has_fired
+
+        # New session: T_event re-anchored at new crossing
+        result = anchor.update(lambda_hat_t=550.0, timestamp=100.0)
+        assert result == 100.0
+        assert anchor.t_event == 100.0
+
+    def test_invalid_params(self):
+        """Constructor rejects non-positive lambda_ref and k."""
+        with pytest.raises(ValueError):
+            EventAnchor(lambda_ref=0.0, k_multiplier=5)
+        with pytest.raises(ValueError):
+            EventAnchor(lambda_ref=-1.0, k_multiplier=5)
+        with pytest.raises(ValueError):
+            EventAnchor(lambda_ref=100.0, k_multiplier=0)
+
+    def test_threshold_property(self):
+        """Threshold is k * lambda_ref."""
+        anchor = EventAnchor(lambda_ref=200.0, k_multiplier=10)
+        assert anchor.threshold == 2000.0
+
+    def test_set_lambda_ref_updates_threshold(self):
+        """set_lambda_ref() updates the crossing threshold correctly."""
+        anchor = EventAnchor(lambda_ref=1.0, k_multiplier=5)
+        assert anchor.threshold == 5.0  # initial: 5 * 1.0
+
+        anchor.set_lambda_ref(5.0)
+        assert anchor.threshold == 25.0  # updated: 5 * 5.0
+        assert anchor.lambda_ref == 5.0
+
+        # Verify the new threshold is actually used for crossing detection
+        result = anchor.update(lambda_hat_t=24.9, timestamp=1.0)
+        assert result is None  # below new threshold
+
+        result = anchor.update(lambda_hat_t=25.1, timestamp=2.0)
+        assert result == 2.0   # above new threshold
+
+    def test_set_lambda_ref_rejects_nonpositive(self):
+        """set_lambda_ref() raises ValueError for non-positive values."""
+        anchor = EventAnchor(lambda_ref=1.0, k_multiplier=5)
+        with pytest.raises(ValueError):
+            anchor.set_lambda_ref(0.0)
+        with pytest.raises(ValueError):
+            anchor.set_lambda_ref(-1.0)
+        # Original lambda_ref unchanged after failed calls
+        assert anchor.lambda_ref == 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ParticipationGate Tests
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestParticipationGate:
+    """Tests for dollar volume intensity gate."""
+
+    def test_inactive_before_activation(self):
+        """Gate returns INACTIVE before T_event is established."""
+        gate = ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.65)
+        state = gate.update(dollar_vol=1000.0, timestamp=1.0)
+        assert state == GateState.INACTIVE
+
+    def test_warmup_for_first_5_minutes(self):
+        """Gate returns WARMUP for first 5 minutes after T_event."""
+        gate = ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # All updates within 5 min = 300s should return WARMUP
+        for t in [1.0, 60.0, 150.0, 299.9]:
+            state = gate.update(dollar_vol=1000.0, timestamp=t)
+            assert state == GateState.WARMUP, f"Expected WARMUP at t={t}s"
+
+    def test_pass_after_warmup(self):
+        """Gate returns PASS after warmup when lambda_V >= threshold."""
+        gate = ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # Build up lambda_V during warmup
+        for t in range(0, 300, 1):
+            gate.update(dollar_vol=5000.0, timestamp=float(t))
+
+        # First update after warmup — lambda_V is at peak, so always PASS
+        state = gate.update(dollar_vol=5000.0, timestamp=300.0)
+        assert state == GateState.PASS
+
+    def test_fail_when_below_threshold(self):
+        """Gate returns FAIL when lambda_V drops below p * peak."""
+        gate = ParticipationGate(half_life_seconds=60.0, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # Build peak during warmup with large trades
+        for t in range(0, 300, 1):
+            gate.update(dollar_vol=10000.0, timestamp=float(t))
+
+        peak_before = gate.lambda_v_peak
+        assert peak_before > 0
+
+        # Stop trading — let lambda_V decay (short half-life = 60s)
+        # After several half-lives with no volume, lambda_V → 0
+        state = gate.update(dollar_vol=0.0, timestamp=900.0)
+        assert state == GateState.FAIL
+        assert gate.lambda_v < gate.threshold
+
+    def test_lambda_v_decay_with_known_half_life(self):
+        """Verify exponential decay matches hand-computed values."""
+        tau = 120.0  # 2 minute half-life
+        gate = ParticipationGate(half_life_seconds=tau, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # Single trade at t=0
+        dv = 10000.0
+        gate.update(dollar_vol=dv, timestamp=0.0)
+        lv_0 = gate.lambda_v  # lambda_V right after the trade
+
+        # Expected: lambda_V = dv * (ln2 / tau) at t=0 (no prior state)
+        expected_lv_0 = dv * math.log(2) / tau
+        assert abs(lv_0 - expected_lv_0) < 1e-10
+
+        # After exactly one half-life with no trades, lambda_V should halve
+        gate.update(dollar_vol=0.0, timestamp=tau)
+        lv_half = gate.lambda_v
+        expected_half = lv_0 * 0.5
+        assert abs(lv_half - expected_half) < 1e-10, (
+            f"After 1 half-life: expected {expected_half:.6f}, got {lv_half:.6f}"
+        )
+
+        # After another half-life, halve again
+        gate.update(dollar_vol=0.0, timestamp=2 * tau)
+        lv_quarter = gate.lambda_v
+        expected_quarter = lv_0 * 0.25
+        assert abs(lv_quarter - expected_quarter) < 1e-10
+
+    def test_running_peak_is_causal(self):
+        """Running peak only reflects past values, not future ones."""
+        gate = ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # Small trades during warmup
+        for t in range(0, 300, 10):
+            gate.update(dollar_vol=100.0, timestamp=float(t))
+        peak_after_warmup = gate.lambda_v_peak
+
+        # Big trade post-warmup
+        gate.update(dollar_vol=1000000.0, timestamp=300.0)
+        peak_after_big = gate.lambda_v_peak
+
+        assert peak_after_big > peak_after_warmup
+        # The peak should equal the current lambda_V (since it's the max)
+        assert peak_after_big == gate.lambda_v
+
+    def test_threshold_boundary_exact(self):
+        """PASS/FAIL boundary: exactly at p * peak, just above, just below."""
+        gate = ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # Set a known peak by feeding a large trade
+        gate.update(dollar_vol=100000.0, timestamp=0.0)
+        peak = gate.lambda_v_peak
+
+        # Manually check threshold
+        threshold = 0.65 * peak
+        assert abs(gate.threshold - threshold) < 1e-10
+
+    def test_reset_clears_all_state(self):
+        """Reset clears peak, lambda_V, and T_event."""
+        gate = ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.65)
+        gate.activate(t_event=0.0)
+
+        # Build up state
+        for t in range(0, 100, 1):
+            gate.update(dollar_vol=5000.0, timestamp=float(t))
+
+        assert gate.lambda_v > 0
+        assert gate.lambda_v_peak > 0
+        assert gate.t_event == 0.0
+
+        # Reset
+        gate.reset()
+
+        assert gate.lambda_v == 0.0
+        assert gate.lambda_v_peak == 0.0
+        assert gate.t_event is None
+
+        # Must return INACTIVE after reset
+        state = gate.update(dollar_vol=1000.0, timestamp=200.0)
+        assert state == GateState.INACTIVE
+
+    def test_continuation_event_full_lifecycle(self):
+        """Full lifecycle: activate → warmup → pass → fail → reset → reactivate."""
+        gate = ParticipationGate(
+            half_life_seconds=60.0,
+            peak_threshold_p=0.65,
+            warmup_seconds=10.0,  # short warmup for test
+        )
+
+        # Session 1
+        gate.activate(t_event=0.0)
+
+        # Warmup phase
+        for t in range(1, 10):
+            state = gate.update(dollar_vol=5000.0, timestamp=float(t))
+            assert state == GateState.WARMUP
+
+        # Pass phase (still getting volume)
+        state = gate.update(dollar_vol=5000.0, timestamp=10.0)
+        assert state == GateState.PASS
+
+        # Let it decay → FAIL
+        state = gate.update(dollar_vol=0.0, timestamp=500.0)
+        assert state == GateState.FAIL
+
+        # Session 2 (continuation)
+        gate.reset()
+        gate.activate(t_event=1000.0)
+
+        # Back in warmup
+        state = gate.update(dollar_vol=5000.0, timestamp=1001.0)
+        assert state == GateState.WARMUP
+
+        # After warmup, should pass with ongoing volume
+        for t in range(1002, 1011):
+            gate.update(dollar_vol=5000.0, timestamp=float(t))
+        state = gate.update(dollar_vol=5000.0, timestamp=1011.0)
+        assert state == GateState.PASS
+
+    def test_invalid_params(self):
+        """Constructor rejects invalid parameters."""
+        with pytest.raises(ValueError):
+            ParticipationGate(half_life_seconds=0.0, peak_threshold_p=0.65)
+        with pytest.raises(ValueError):
+            ParticipationGate(half_life_seconds=-1.0, peak_threshold_p=0.65)
+        with pytest.raises(ValueError):
+            ParticipationGate(half_life_seconds=300.0, peak_threshold_p=0.0)
+        with pytest.raises(ValueError):
+            ParticipationGate(half_life_seconds=300.0, peak_threshold_p=1.5)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Integration Tests: EventAnchor + ParticipationGate Together
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestEPGIntegration:
+    """Test EventAnchor and ParticipationGate working together."""
+
+    def test_full_pipeline(self):
+        """
+        Simulate: trades arrive, anchor fires, gate activates,
+        warmup → pass → fade → fail.
+        """
+        anchor = EventAnchor(lambda_ref=100.0, k_multiplier=5)
+        gate = ParticipationGate(
+            half_life_seconds=60.0,
+            peak_threshold_p=0.65,
+            warmup_seconds=30.0,
+        )
+
+        # Pre-T_event: lambda_hat below threshold
+        for t in range(0, 20):
+            t_event = anchor.update(lambda_hat_t=200.0, timestamp=float(t))
+            assert t_event is None
+            state = gate.update(dollar_vol=1000.0, timestamp=float(t))
+            assert state == GateState.INACTIVE
+
+        # T_event fires at t=20
+        t_event = anchor.update(lambda_hat_t=600.0, timestamp=20.0)
+        assert t_event == 20.0
+        gate.activate(t_event)
+
+        # Warmup: t=20 to t=50
+        for t in range(21, 50):
+            anchor.update(lambda_hat_t=600.0, timestamp=float(t))
+            state = gate.update(dollar_vol=5000.0, timestamp=float(t))
+            assert state == GateState.WARMUP
+
+        # Post-warmup: should be PASS with continuous volume
+        state = gate.update(dollar_vol=5000.0, timestamp=50.0)
+        assert state == GateState.PASS
+
+        # Keep trading — stays PASS
+        for t in range(51, 80):
+            state = gate.update(dollar_vol=5000.0, timestamp=float(t))
+            assert state == GateState.PASS
+
+        # Volume stops — eventually FAIL (half-life=60s, so after ~3 half-lives)
+        state = gate.update(dollar_vol=0.0, timestamp=300.0)
+        assert state == GateState.FAIL
+
+    def test_premarket_lambda_ref(self):
+        """Pre-market events use a different lambda_ref and still fire correctly."""
+        # Pre-market: lower lambda_ref, should fire faster
+        anchor_pm = EventAnchor(lambda_ref=20.0, k_multiplier=5)
+        anchor_rh = EventAnchor(lambda_ref=200.0, k_multiplier=5)
+
+        # Same lambda_hat
+        lambda_hat = 150.0
+
+        # Pre-market fires (150 > 5*20=100)
+        assert anchor_pm.update(lambda_hat, 1.0) == 1.0
+
+        # Regular hours does not fire (150 < 5*200=1000)
+        assert anchor_rh.update(lambda_hat, 1.0) is None
+
+    def test_cold_start_lambda_ref_replaces_init_value(self):
+        """set_lambda_ref() with cold-start mu overrides global fallback init.
+
+        Simulates the correct runner flow:
+          1. Construct EventAnchor with global fallback (mu_buy+mu_sell = 0.2)
+          2. Call set_lambda_ref() with mu_buy+mu_sell from cold-start fit (2.0)
+          3. Verify T_event fires at k*2.0=10.0, NOT at k*0.2=1.0
+        """
+        k = 5
+        global_fallback = 0.2   # mu_buy + mu_sell from config
+        cold_start_lref = 2.0   # mu_buy + mu_sell from cold-start fit (pure background rate)
+
+        anchor = EventAnchor(lambda_ref=global_fallback, k_multiplier=k)
+        assert anchor.threshold == pytest.approx(k * global_fallback)  # 1.0
+
+        # Override with cold-start equilibrium rate
+        anchor.set_lambda_ref(cold_start_lref)
+        assert anchor.threshold == pytest.approx(k * cold_start_lref)  # 10.0
+
+        # lambda_hat just above old threshold but below new — must NOT fire
+        old_threshold_plus = k * global_fallback + 0.01  # 1.01
+        result = anchor.update(lambda_hat_t=old_threshold_plus, timestamp=1.0)
+        assert result is None, (
+            "T_event must not fire at old global-fallback threshold after set_lambda_ref()"
+        )
+
+        # lambda_hat just above new threshold — must fire
+        new_threshold_plus = k * cold_start_lref + 0.01  # 10.01
+        result = anchor.update(lambda_hat_t=new_threshold_plus, timestamp=2.0)
+        assert result == 2.0, (
+            "T_event must fire when lambda_hat exceeds cold-start mu threshold"
+        )
+
+    def test_mu_based_threshold_higher_n_base(self):
+        """Threshold scales with fitted mu, not n_base.
+
+        A high-mu stock (active, mu=1.65) should require higher lambda_hat to fire
+        T_event than a quiet stock (mu=0.2), even if both have high n_base.
+        This confirms the mu-only formula scales correctly across event types.
+        """
+        k = 5
+        anchor_quiet = EventAnchor(lambda_ref=1.0, k_multiplier=k)  # placeholder
+        anchor_active = EventAnchor(lambda_ref=1.0, k_multiplier=k)  # placeholder
+
+        # Set mu-based lambda_ref: quiet stock mu=0.1+0.1=0.2, active stock mu=0.826+0.826=1.65
+        anchor_quiet.set_lambda_ref(0.2)   # quiet stock threshold = 5 * 0.2 = 1.0
+        anchor_active.set_lambda_ref(1.65) # active stock threshold = 5 * 1.65 = 8.25
+
+        lambda_hat = 2.0  # above quiet threshold (1.0), below active threshold (8.25)
+
+        # Quiet stock fires
+        result_quiet = anchor_quiet.update(lambda_hat_t=lambda_hat, timestamp=1.0)
+        assert result_quiet == 1.0, "Quiet stock should fire at lambda_hat=2.0 (threshold=1.0)"
+
+        # Active stock does NOT fire
+        result_active = anchor_active.update(lambda_hat_t=lambda_hat, timestamp=1.0)
+        assert result_active is None, "Active stock must not fire at lambda_hat=2.0 (threshold=8.25)"
+
+        # Active stock fires when lambda_hat exceeds its threshold
+        result_active2 = anchor_active.update(lambda_hat_t=9.0, timestamp=2.0)
+        assert result_active2 == 2.0, "Active stock should fire at lambda_hat=9.0 (threshold=8.25)"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

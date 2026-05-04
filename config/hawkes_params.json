@@ -1,0 +1,19 @@
+{
+  "K": 1,
+  "model": "univariate",
+  "beta": 0.1,
+  "beta_is_fitted": false,
+  "beta_fixed": 0.1,
+  "mu_buy": 0.1,
+  "mu_sell": 0.1,
+  "alpha_buy_self": 0.004619197000627821,
+  "alpha_sell_self": 0.009890272412307796,
+  "rho": 0.99,
+  "refit_interval_events": 50,
+  "window_size": 10000,
+  "cold_start_size": 1000,
+  "n_training_events": 50,
+  "median_n_base": 0.15421199165725558,
+  "phase": "A",
+  "iteration": 7
+}

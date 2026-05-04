@@ -1,0 +1,17 @@
+{
+  "tight": {
+    "q_bar_fallback": 241.539995085876,
+    "q_bar_winsorize_cap": 742.0931044663457,
+    "n_events": 874
+  },
+  "medium": {
+    "q_bar_fallback": 284.62138496630325,
+    "q_bar_winsorize_cap": 867.3958588148168,
+    "n_events": 1060
+  },
+  "wide": {
+    "q_bar_fallback": 193.35354337777505,
+    "q_bar_winsorize_cap": 529.0269106495167,
+    "n_events": 226
+  }
+}

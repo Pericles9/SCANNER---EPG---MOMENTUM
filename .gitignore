@@ -1,0 +1,22 @@
+# Output Directories
+logs/
+results/
+*.log
+
+# Python Specific
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# OS generated files
+.DS_Store
+Thumbs.db

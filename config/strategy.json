@@ -1,0 +1,58 @@
+{
+  "description": "Scanner-EPG-Momentum strategy parameters — derived from hawkes-ofi-impact Phase S/T/U",
+  "strategy_version": "1.0",
+  "derived_from": "hawkes-ofi-impact",
+  "derivation_date": "2026-05-04",
+
+  "epg": {
+    "k_multiplier": 5,
+    "half_life_seconds": 300,
+    "peak_threshold_p": 0.65,
+    "warmup_seconds": 300,
+    "description": "Phase R: k=5, tau=300s, p=0.65. First fail median 1001s."
+  },
+
+  "hawkes": {
+    "K": 1,
+    "model": "univariate",
+    "beta": 0.1,
+    "beta_is_fitted": false,
+    "rho": 0.99,
+    "refit_interval_events": 50,
+    "cold_start_size": 1000,
+    "description": "Phase A iter 7: K=1 univariate, beta_fixed=0.1, rho=0.99. Online refit every 50 trades."
+  },
+
+  "exit_d": {
+    "theta": 0.65,
+    "tau_min_sec": 4.0,
+    "description": "Phase U T10 best combo: theta=0.65 tau=4s PF=1.3848. Default Phase U: theta=0.75 tau=8s."
+  },
+
+  "luld": {
+    "ref_window_sec": 300.0,
+    "proximity_pct_threshold": 2.0,
+    "warmup_sec": 60.0,
+    "rth_only": true,
+    "description": "Tier 2 LULD band proximity exit at 2% threshold. RTH only (09:30-16:00 ET)."
+  },
+
+  "gap_gate": {
+    "threshold": 0.30,
+    "backtest_only": true,
+    "description": "Requires intraday_pct >= 30% at entry. Backtest only — live feed handles this differently."
+  },
+
+  "epg_window_close_exit": {
+    "enabled": true,
+    "description": "EXIT when EPG PASS window closes (gate transitions PASS -> FAIL/INACTIVE). Phase S: 100% of exits via this mechanism."
+  },
+
+  "session": {
+    "premarket_start": "04:00",
+    "rth_start": "09:30",
+    "rth_end": "16:00",
+    "session_end": "20:00",
+    "timezone": "America/New_York"
+  }
+}
