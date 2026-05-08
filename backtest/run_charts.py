@@ -1,18 +1,22 @@
-﻿#!/usr/bin/env python3
-"""Phase S — Batch runner for per-event signal charts.
+#!/usr/bin/env python3
+"""Phase A — Batch runner for per-event signal charts.
 
-For each of the 81 events that produced trades:
+For each event that produced trades:
   1. Pull the event's trades from per_trade.parquet
-  2. Replay the EPG state via `replay_epg_for_event`
+  2. Replay the EPG + LULD state via `replay_epg_for_event`
   3. Resolve prev_close (cached on the trade record)
   4. Render the chart via `make_event_chart`
 
 Failures are logged to chart_errors.json without stopping the batch.
 
-Run serially -- 81 events.
+Usage:
+    python -m backtest.run_charts \
+        --results-dir results/phase_a \
+        --output-dir results/phase_a/charts
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -27,21 +31,29 @@ from backtest.charts import make_event_chart
 from backtest.epg_replay import replay_epg_for_event
 
 
-BASE = Path(__file__).resolve().parent.parent / "results" / "backtest"
-CHARTS_DIR = BASE / "event_charts"
+DEFAULT_BASE = Path(__file__).resolve().parent.parent / "results" / "backtest"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Phase A — per-event chart batch runner")
+    parser.add_argument("--results-dir", type=str, default=None,
+                        help="Directory containing per_trade.parquet and per_event_summary.json")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory to write chart HTML files (default: <results-dir>/charts)")
+    return parser.parse_args()
 
 
 def main():
-    CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+    base = Path(args.results_dir) if args.results_dir else DEFAULT_BASE
+    charts_dir = (Path(args.output_dir) if args.output_dir
+                  else base / "event_charts")
+    charts_dir.mkdir(parents=True, exist_ok=True)
 
-    trades_df = pd.read_parquet(BASE / "per_trade.parquet")
-    with open(BASE / "per_event_summary.json") as f:
+    trades_df = pd.read_parquet(base / "per_trade.parquet")
+    with open(base / "per_event_summary.json") as f:
         events = json.load(f)
 
-    # Only events with at least one trade get a chart (per spec: 81 events).
-    # `per_event_summary.json` includes events with status='event' that may
-    # have zero trades (gap gate blocked everything). Use the trades index
-    # to decide which events get a chart.
     trade_event_keys = set(zip(trades_df["ticker"], trades_df["date"]))
     chartable = [e for e in events
                  if (e["ticker"], e["date"]) in trade_event_keys]
@@ -54,7 +66,7 @@ def main():
         ticker = ev["ticker"]
         date = ev["date"]
         prev_close = float(ev["prev_close"])
-        out_path = CHARTS_DIR / f"{ticker}_{date}.html"
+        out_path = charts_dir / f"{ticker}_{date}.html"
         ev_trades = trades_df[
             (trades_df["ticker"] == ticker) & (trades_df["date"] == date)
         ].copy()
@@ -71,6 +83,7 @@ def main():
                 trades=ev_trades, epg_data=epg_data,
                 prev_close=prev_close,
                 output_path=str(out_path),
+                luld_data=epg_data.get("luld_timeline"),
             )
             t_ev2 = time.time()
             size_kb = out_path.stat().st_size / 1024.0
@@ -89,11 +102,13 @@ def main():
           f"charts written in {elapsed:.0f}s")
 
     if errors:
-        err_path = CHARTS_DIR / "chart_errors.json"
+        err_path = charts_dir / "chart_errors.json"
         with open(err_path, "w") as f:
             json.dump(errors, f, indent=2)
         print(f"Errors written: {err_path}")
 
+    return len(errors)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

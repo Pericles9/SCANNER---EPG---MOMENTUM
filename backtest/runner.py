@@ -348,6 +348,7 @@ def _process_event(args: dict) -> dict:
     rho_E = args["rho_E"]
     q_bar_cfg = args["q_bar_cfg"]
     gap_threshold = args["gap_threshold"]
+    exit_d_enabled = args["exit_d_enabled"]
     exit_d_theta = args["exit_d_theta"]
     exit_d_tau_min_ns = args["exit_d_tau_min_ns"]   # pre-converted to int ns
     luld_ref_window_sec = args["luld_ref_window_sec"]
@@ -567,7 +568,7 @@ def _process_event(args: dict) -> dict:
                 exit_fired = False
 
                 # Priority 1: EXIT_D
-                if not exit_d_disabled:
+                if exit_d_enabled and not exit_d_disabled:
                     lam_tot = lam_buy_out[i] + lam_sell_out[i]
                     I_t = lam_sell_out[i] / lam_tot if lam_tot > 0 else 0.0
                     if not math.isnan(I_t) and I_t > exit_d_theta:
@@ -930,6 +931,7 @@ def main():
         phase_cfg = json.load(f)
 
     # CLI overrides (for sensitivity sweep)
+    exit_d_enabled = phase_cfg["exit_d"].get("enabled", True)
     exit_d_theta = (args.exit_d_theta
                     if args.exit_d_theta is not None
                     else phase_cfg["exit_d"]["theta"])
@@ -942,7 +944,8 @@ def main():
     luld_cfg = phase_cfg["luld"]
 
     log.info(
-        f"Config: theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
+        f"Config: exit_d_enabled={exit_d_enabled} theta={exit_d_theta:.2f} "
+        f"tau_min={exit_d_tau_min_sec:.1f}s "
         f"gap={gap_threshold:.2f} luld_prox={luld_cfg['proximity_pct_threshold']}%"
     )
 
@@ -1039,6 +1042,7 @@ def main():
             "rho_E": hawkes_median.get("rho", 0.99),
             "q_bar_cfg": q_bar_cfg,
             "gap_threshold": gap_threshold,
+            "exit_d_enabled": exit_d_enabled,
             "exit_d_theta": exit_d_theta,
             "exit_d_tau_min_ns": exit_d_tau_min_ns,
             "luld_ref_window_sec": luld_cfg["ref_window_sec"],
@@ -1048,7 +1052,7 @@ def main():
 
     log.info(
         f"Work items: {len(work_items)} | gap={gap_threshold} | "
-        f"exit_d theta={exit_d_theta} tau_min={exit_d_tau_min_sec}s"
+        f"exit_d enabled={exit_d_enabled} theta={exit_d_theta} tau_min={exit_d_tau_min_sec}s"
     )
 
     # ── Process in parallel ──
@@ -1153,6 +1157,43 @@ def main():
         f"total_pnl%={summary.get('total_pnl_pct')}"
     )
     log.info("=" * 70)
+
+    # ── summary.json (phase spec output) ──
+    phase_summary = {
+        "phase": "phase_a",
+        "n_events_input": len(events),
+        "n_events_with_trades": len(results),
+        "n_events_skipped": len(skipped),
+        "n_events_errored": len(errors),
+        "n_trades": summary.get("n_trades", 0),
+        "profit_factor": summary.get("profit_factor"),
+        "win_rate": summary.get("win_rate"),
+        "mean_pnl_pct": summary.get("mean_pnl_pct"),
+        "median_pnl_pct": summary.get("median_pnl_pct"),
+        "mean_hold_sec": summary.get("mean_hold_sec"),
+        "exit_d_enabled": exit_d_enabled,
+        "exit_reason_breakdown": summary.get("exit_reason_breakdown", {}),
+        "meta": summary.get("meta", {}),
+    }
+    write_json_atomic(phase_summary, results_dir / "summary.json")
+    log.info(f"Written: {results_dir / 'summary.json'}")
+
+    # ── trade_log.json (phase spec output) ──
+    trade_log = [
+        {
+            "ticker": t["ticker"],
+            "date": t["date"],
+            "event_idx": t["event_idx"],
+            "entry_ts": t["entry_ts"],
+            "exit_ts": t["exit_ts"],
+            "exit_reason": t["exit_reason"],
+            "pnl_pct": t["pnl_pct"],
+            "hold_sec": t["hold_sec"],
+        }
+        for t in all_trades
+    ]
+    write_json_atomic(trade_log, results_dir / "trade_log.json")
+    log.info(f"Written: {results_dir / 'trade_log.json'} ({len(trade_log)} records)")
 
 
 if __name__ == "__main__":

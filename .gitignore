@@ -1,7 +1,9 @@
 # Output Directories
 logs/
-results/
 *.log
+*.json
+*.html
+*.parquet
 
 # Python Specific
 __pycache__/

@@ -1,18 +1,16 @@
 ﻿#!/usr/bin/env python3
-"""Phase S — Per-event signal chart builder.
+"""Phase A — Per-event signal chart builder.
 
 `make_event_chart()` writes a single standalone Plotly HTML file with
-four stacked panels:
+five stacked panels:
     1. 1-minute OHLCV candlesticks + EPG PASS shading + T_event marker + prev_close line
-    2. Tick price + L1 bid/ask + EPG PASS shading + entry/exit triangles + T_event marker
+    2. Tick price + L1 bid/ask + LULD lower band + EPG PASS shading + entry/exit triangles
     3. lambda_V intensity + running_peak + threshold + T_event marker
     4. EPG gate state step function + PASS / WARMUP shading
+    5. LULD proximity state step trace + EXIT_HALT shading
 
-Public API: `make_event_chart(ticker, date, trades, epg_data, prev_close, output_path)`.
-
-Note: this module replaced an earlier summary-chart generator. The six
-standalone summary HTMLs already on disk under
-`results/backtest/charts/` are unaffected.
+Public API: `make_event_chart(ticker, date, trades, epg_data, prev_close, output_path,
+                               luld_data=None)`.
 """
 from __future__ import annotations
 
@@ -111,13 +109,16 @@ def make_event_chart(
     epg_data: dict,
     prev_close: float,
     output_path: str,
+    luld_data: list | None = None,
 ) -> None:
-    """Render a single Phase S signal chart for one event.
+    """Render a single Phase A signal chart for one event.
 
     `trades` must contain at least: entry_ts, exit_ts, entry_price, exit_price,
-    pnl_pct (the absolute-timestamp columns added by the runner re-run).
+    pnl_pct, exit_reason.
 
     `epg_data` is the dict returned by `replay_epg_for_event`.
+    `luld_data` is the `luld_timeline` list from `replay_epg_for_event`
+    (list of {ts, state, lower_band} per tick). If None, LULD panels are skipped.
     """
     mom_pct = _resolve_mom_pct(ticker, date)
     td = load_trades(ticker, date, mom_pct)
@@ -132,11 +133,12 @@ def make_event_chart(
 
     # ── Build subplots ──
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[3, 3, 2, 1],
+        rows=5, cols=1, shared_xaxes=True,
+        row_heights=[3, 3, 2, 1, 1],
         vertical_spacing=0.03,
         subplot_titles=("1-Minute OHLCV", "Tick Price + L1",
-                        "λ_V Intensity", "EPG Gate State"),
+                        "λ_V Intensity", "EPG Gate State",
+                        "LULD Proximity State"),
     )
 
     # ─────────── Panel 1: 1-min candles ───────────
@@ -202,7 +204,24 @@ def make_event_chart(
     # PASS shading on Panel 2
     _add_pass_shading(fig, pass_windows, row=2)
 
-    # Entry / exit markers
+    # LULD lower band on Panel 2
+    if luld_data:
+        lb_ts = [r["ts"] for r in luld_data if r["lower_band"] is not None]
+        lb_vals = [r["lower_band"] for r in luld_data if r["lower_band"] is not None]
+        if lb_ts:
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.to_datetime(lb_ts, unit="ns", utc=True),
+                    y=lb_vals,
+                    mode="lines",
+                    line=dict(color="#FF4444", width=1, dash="dash"),
+                    name="LULD lower band",
+                    hoverinfo="skip",
+                ),
+                row=2, col=1,
+            )
+
+    # Entry / exit markers — colored by exit reason
     if not trades.empty:
         ent_ts = pd.to_datetime(trades["entry_ts"].astype("int64").values,
                                 unit="ns", utc=True)
@@ -211,6 +230,9 @@ def make_event_chart(
         ent_p = trades["entry_price"].values
         ex_p = trades["exit_price"].values
         pnl = trades["pnl_pct"].values
+        reasons = (trades["exit_reason"].values
+                   if "exit_reason" in trades.columns
+                   else [""] * len(pnl))
 
         fig.add_trace(
             go.Scatter(
@@ -222,16 +244,24 @@ def make_event_chart(
             ),
             row=2, col=1,
         )
-        exit_colors = ["#00CC44" if p > 0 else "#FF3333" for p in pnl]
+        _EXIT_COLORS = {
+            "luld_proximity": "#FF3333",      # red fill
+            "epg_window_close": "#FFFFFF",    # white fill
+            "session_end": "#AAAAAA",         # gray
+        }
+        exit_colors = [_EXIT_COLORS.get(r, "#AAAAAA") for r in reasons]
+        exit_line_colors = ["#CC0000" if r == "luld_proximity" else "#444444"
+                            for r in reasons]
         fig.add_trace(
             go.Scatter(
                 x=ex_ts, y=ex_p, mode="markers",
                 marker=dict(symbol="triangle-down", size=10, color=exit_colors,
-                            line=dict(color="#222", width=1)),
+                            line=dict(color=exit_line_colors, width=1.5)),
                 name="exit",
-                customdata=pnl,
+                customdata=np.column_stack([pnl, reasons]),
                 hovertemplate=("exit %{x|%H:%M:%S}<br>price %{y:.4f}"
-                               "<br>pnl %{customdata:.3f}%<extra></extra>"),
+                               "<br>pnl %{customdata[0]:.3f}%"
+                               "<br>reason: %{customdata[1]}<extra></extra>"),
             ),
             row=2, col=1,
         )
@@ -282,9 +312,46 @@ def make_event_chart(
     # WARMUP shading
     _add_warmup_shading(fig, epg_timeline, row=4)
 
+    # ─────────── Panel 5: LULD proximity state ───────────
+    if luld_data:
+        luld_ts = pd.to_datetime([r["ts"] for r in luld_data], unit="ns", utc=True)
+        luld_state_nums = [r["state"] for r in luld_data]
+        fig.add_trace(
+            go.Scatter(
+                x=luld_ts, y=luld_state_nums, mode="lines",
+                line=dict(color="#FF6666", width=1, shape="hv"),
+                name="LULD state", hoverinfo="skip", showlegend=False,
+            ),
+            row=5, col=1,
+        )
+        # Light red shading for EXIT_HALT regions
+        in_halt = False
+        halt_open_ts = None
+        for r in luld_data:
+            if r["state"] == 2 and not in_halt:
+                in_halt = True
+                halt_open_ts = r["ts"]
+            elif r["state"] != 2 and in_halt:
+                x0 = pd.Timestamp(halt_open_ts, unit="ns", tz="UTC")
+                x1 = pd.Timestamp(r["ts"], unit="ns", tz="UTC")
+                fig.add_vrect(
+                    x0=x0, x1=x1,
+                    fillcolor="rgba(255,80,80,0.25)", line_width=0,
+                    layer="below", row=5, col=1,
+                )
+                in_halt = False
+        if in_halt and halt_open_ts is not None:
+            x0 = pd.Timestamp(halt_open_ts, unit="ns", tz="UTC")
+            x1 = pd.Timestamp(luld_data[-1]["ts"], unit="ns", tz="UTC")
+            fig.add_vrect(
+                x0=x0, x1=x1,
+                fillcolor="rgba(255,80,80,0.25)", line_width=0,
+                layer="below", row=5, col=1,
+            )
+
     # ─────────── T_event vline (all panels) ───────────
     if t_event_ts is not None:
-        for r in (1, 2, 3, 4):
+        for r in (1, 2, 3, 4, 5):
             fig.add_vline(
                 x=t_event_ts, line=dict(color="#FFA500", width=1, dash="dash"),
                 row=r, col=1,
@@ -304,7 +371,7 @@ def make_event_chart(
 
     fig.update_layout(
         title=title,
-        height=1200,
+        height=1400,
         template="plotly_white",
         xaxis_rangeslider_visible=False,  # candle row default — hide
         hovermode="x unified",
@@ -326,8 +393,15 @@ def make_event_chart(
         ticktext=["INACTIVE", "WARMUP", "PASS", "FAIL"],
         row=4, col=1,
     )
+    fig.update_yaxes(
+        title_text="LULD state",
+        range=[-0.5, 2.5],
+        tickvals=[0, 1, 2],
+        ticktext=["INACTIVE", "ARMED", "EXIT_HALT"],
+        row=5, col=1,
+    )
     # Bottom axis label
-    fig.update_xaxes(title_text="Time (UTC)", row=4, col=1)
+    fig.update_xaxes(title_text="Time (UTC)", row=5, col=1)
 
     # ─────────── Top-right annotations on Panel 2 ───────────
     if not trades.empty:

@@ -38,9 +38,18 @@ from data.loaders.quotes import load_quotes
 from core.ofi.trade_ofi import compute_trade_ofi
 from core.epg.anchor import EventAnchor
 from core.epg.gate import ParticipationGate, GateState
+from core.exits.luld_proximity import LuldProximityExit, ProximityState
 
 # Reuse the production Hawkes refit machinery
 from backtest.runner import _hawkes_replay_with_refit
+
+
+# LULD state → integer for Panel 5
+_LULD_STATE_NUM = {
+    ProximityState.INACTIVE: 0,
+    ProximityState.SAFE: 1,      # displayed as ARMED
+    ProximityState.EXIT_HALT: 2,
+}
 
 # Match Phase S exactly
 EPG_K = 5
@@ -79,11 +88,14 @@ def replay_epg_for_event(
     if td.n_trades < 30 or qd.n_quotes < 10:
         return {"t_event": None, "epg_timeline": [], "pass_windows": []}
 
-    # ── Hawkes config ──
+    # ── Configs ──
     with open(CONFIG_DIR / "hawkes_params.json") as f:
         hawkes_median = json.load(f)
     with open(CONFIG_DIR / "q_bar_tiers.json") as f:
         q_bar_cfg = json.load(f)
+    with open(CONFIG_DIR / "strategy.json") as f:
+        strategy_cfg = json.load(f)
+    luld_cfg = strategy_cfg["luld"]
 
     # Per-event Hawkes params from Phase A (if available)
     phase_a_path = Path(__file__).resolve().parent.parent / "results" / "phase_a" / "production_fit_results.json"
@@ -159,6 +171,13 @@ def replay_epg_for_event(
     t_event_fired = False
     t_event_ns: Optional[int] = None
 
+    luld_exit = LuldProximityExit(
+        ref_window_sec=luld_cfg["ref_window_sec"],
+        proximity_pct_threshold=luld_cfg["proximity_pct_threshold"],
+        warmup_sec=luld_cfg["warmup_sec"],
+    )
+    luld_timeline: list[dict] = []
+
     for i in range(N):
         t_ev = anchor.update(lambda_hat[i], td.t_sec[i])
         if t_ev is not None and not t_event_fired:
@@ -178,6 +197,14 @@ def replay_epg_for_event(
             "state": state.value,
         })
 
+        # LULD replay
+        lr = luld_exit.update(ts_ns, float(td.prices[i]))
+        luld_timeline.append({
+            "ts": ts_ns,
+            "state": _LULD_STATE_NUM[lr.state],
+            "lower_band": float(lr.lower_band) if lr.lower_band is not None else None,
+        })
+
         # Track contiguous PASS windows
         if state == GateState.PASS and pass_open_ts is None:
             pass_open_ts = ts_ns
@@ -194,6 +221,7 @@ def replay_epg_for_event(
         "t_event": t_event_ns,
         "epg_timeline": epg_timeline,
         "pass_windows": pass_windows,
+        "luld_timeline": luld_timeline,
     }
 
 

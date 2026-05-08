@@ -24,6 +24,7 @@
   },
 
   "exit_d": {
+    "enabled": false,
     "theta": 0.65,
     "tau_min_sec": 4.0,
     "description": "Phase U T10 best combo: theta=0.65 tau=4s PF=1.3848. Default Phase U: theta=0.75 tau=8s."
