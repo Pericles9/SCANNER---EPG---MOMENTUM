@@ -251,8 +251,8 @@ The distribution is extremely right-skewed. Most trades exit quickly via LULD pr
 
 ## Related
 
-- Strategy spec: [[Scanner-EPG-Momentum.md]]
-- Project directory: [[Project_Directory.md]]
-- Parent Phase S: `hawkes-ofi-impact/docs/Phase_S_Results.md`
-- Parent Phase U: `hawkes-ofi-impact/docs/Phase_U_Results.md`
+- Strategy spec: [[Scanner-EPG-Momentum]]
+- Project directory: [[scanner-epg-momentum/docs/Project_Directory|Project Directory]]
+- Parent Phase S: [[Phase_S_Results]]
+- Parent Phase U: [[Phase_U_Results]]
 - T10 sweep results: `hawkes-ofi-impact/results/phase_t/` (theta/tau grid)

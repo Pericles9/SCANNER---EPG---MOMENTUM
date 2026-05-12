@@ -2,7 +2,7 @@
 tags:
   - type/data-schema
   - domain/data
-  - project/hawkes-ofi-impact
+  - project/scanner-epg-momentum
   - status/complete
 created: 2026-04-04
 ---

@@ -2,7 +2,7 @@
 tags:
   - type/implementation
   - domain/data
-  - project/hawkes-ofi-impact
+  - project/scanner-epg-momentum
   - status/complete
 created: 2026-04-04
 last_reviewed: 2026-04-04
@@ -49,6 +49,6 @@ timestamps = arrays["sip_timestamp"]
 - Most calibration code uses `data/loaders/trades.py` and `data/loaders/quotes.py` directly via pyarrow rather than this client.
 
 ## Related
-- [[data/Schema.md]] — column names and types
+- [[Data Schema]] — column names and types
 - [[Trade Loader]] — higher-level loader using pyarrow directly
 - [[Quote Loader]] — higher-level loader using pyarrow directly

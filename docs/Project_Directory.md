@@ -1,3 +1,14 @@
+---
+tags:
+  - type/reference
+  - domain/backtest
+  - domain/hawkes
+  - project/scanner-epg-momentum
+  - status/wip
+created: 2026-05-04
+last_reviewed: 2026-05-07
+---
+
 # Project Directory — scanner-epg-momentum
 
 ## Directory Tree

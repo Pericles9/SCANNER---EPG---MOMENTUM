@@ -189,10 +189,24 @@ Median across val events: ~0.154 (Phase A iter 7).
 
 ---
 
+## Branch Lineage
+
+This strategy was branched from `hawkes-ofi-impact` after Phase U. The branch point and
+what was retained vs removed:
+
+| Source phase | What was inherited |
+|-------------|-------------------|
+| [[Phase_S_Results]] | EPG entry stack (k=5, τ=300s, p=0.65), gap gate (30%), Setup Filter |
+| [[Phase_T_Results]] | `LuldProximityExit` module, EXIT_D simulation infrastructure |
+| [[Phase_U_Results]] | EXIT_D + LULD integrated runner; T10 best combo θ=0.65, τ=4s adopted as default |
+
+**Removed from parent:** OFI normalization, Gate 3 (burst magnitude), dynamic stop (EXIT_2),
+regime stack, OFI directional gate, sell_ratio gate. All calibration phases A–R of the
+parent project remain in `hawkes-ofi-impact/`.
+
 ## Related
 
-- Parent project: `D:\Trading Research\hawkes-ofi-impact`
-- Phase S results: `hawkes-ofi-impact/docs/Phase_S_Results.md`
-- Phase T results: `hawkes-ofi-impact/docs/Phase_T_Results.md`
-- Phase U results: `hawkes-ofi-impact/docs/Phase_U_Results.md`
-- EPG research: `hawkes-ofi-impact/results/epg/research_summary.md`
+- Parent strategy spec: [[Scanner-Hawkes-OFI Impact]]
+- EPG research: [[research_summary]]
+- Phase A (this project): [[scanner-epg-momentum/results/phase_a/Phase A Results|Phase A Results]]
+- Project directory: [[scanner-epg-momentum/docs/Project_Directory|Project Directory]]

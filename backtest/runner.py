@@ -45,6 +45,7 @@ from core.epg.anchor import EventAnchor
 from core.epg.gate import ParticipationGate, GateState
 from core.filters.setup_filter import run_setup_filter
 from core.exits.luld_proximity import LuldProximityExit, ProximityState
+from core.exits.reentry import ReentrySignal
 from core.hawkes.engine import hawkes_replay_fixed_beta
 from core.hawkes.forgetting import fit_hawkes_forgetting, fit_online, HawkesParams
 
@@ -354,6 +355,8 @@ def _process_event(args: dict) -> dict:
     luld_ref_window_sec = args["luld_ref_window_sec"]
     luld_proximity_pct_threshold = args["luld_proximity_pct_threshold"]
     luld_warmup_sec = args["luld_warmup_sec"]
+    reentry_enabled = args["reentry_enabled"]
+    reentry_tau_recovery_sec = args["reentry_tau_recovery_sec"]
 
     base = {"ticker": ticker, "date": date, "event_idx": event_idx}
 
@@ -466,6 +469,12 @@ def _process_event(args: dict) -> dict:
             lr = luld_pre.update(int(td.timestamps[i]), float(td.prices[i]))
             luld_states.append(lr.state)
 
+        # ── 5b. Re-entry signal (one per event; reset between uses) ──
+        reentry_sig = ReentrySignal(
+            theta=exit_d_theta,
+            tau_recovery_sec=reentry_tau_recovery_sec,
+        )
+
         # ── 6. PASS window durations (observational, for stats) ──
         session_start_ns, _ = _session_ns_bounds(date)
         pass_window_durations = []
@@ -497,6 +506,11 @@ def _process_event(args: dict) -> dict:
         exit_d_disabled = False
         dump_timer_start_ns = None
 
+        # Re-entry state
+        waiting_for_reentry = False
+        n_reentries = 0
+        current_entry_type = "first"
+
         prev_state = GateState.INACTIVE
 
         for i in range(N):
@@ -509,59 +523,92 @@ def _process_event(args: dict) -> dict:
                     gap_gate_queued = False
                     gap_gate_blocks += 1  # window closed before gap was met
 
-                rising_edge = (
-                    cur == GateState.PASS
-                    and prev_state in (GateState.INACTIVE, GateState.WARMUP, GateState.FAIL)
-                )
+                # ── Re-entry monitoring (after EXIT_D fired, within PASS window) ──
+                if waiting_for_reentry:
+                    if cur != GateState.PASS:
+                        # PASS window closed — cancel re-entry wait
+                        waiting_for_reentry = False
+                        reentry_sig.reset()
+                    elif reentry_enabled:
+                        if reentry_sig.update(
+                            int(td.timestamps[i]),
+                            lam_buy_out[i], lam_sell_out[i], cur,
+                        ):
+                            entry_price = float(td.prices[min(i + 1, N - 1)])
+                            entry_idx = i
+                            entry_t_sec = td.t_sec[i]
+                            intraday_pct_at_entry = (
+                                (float(td.prices[i]) - prev_close) / prev_close
+                            )
+                            in_position = True
+                            waiting_for_reentry = False
+                            reentry_sig.reset()
+                            n_reentries += 1
+                            current_entry_type = "reentry"
+                            lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
+                            I_entry = (lam_sell_out[i] / lam_tot_e
+                                       if lam_tot_e > 0 else 0.0)
+                            exit_d_disabled = (not math.isnan(I_entry)
+                                               and I_entry > exit_d_theta)
+                            dump_timer_start_ns = None
 
-                if rising_edge:
-                    pass_edges_total += 1
-                    cur_price = float(td.prices[i])
-                    intraday_pct = (cur_price - prev_close) / prev_close
-                    if intraday_pct >= gap_threshold:
-                        # Immediate entry
-                        if i + 1 < N:
-                            entry_price = float(td.prices[i + 1])
-                        else:
-                            entry_price = cur_price
-                        entry_idx = i
-                        entry_t_sec = td.t_sec[i]
-                        intraday_pct_at_entry = intraday_pct
-                        in_position = True
-                        gap_gate_queued = False
-                        # EXIT_D setup at entry (trigger tick intensity)
-                        lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
-                        I_entry = (lam_sell_out[i] / lam_tot_e
-                                   if lam_tot_e > 0 else 0.0)
-                        exit_d_disabled = (not math.isnan(I_entry)
-                                           and I_entry > exit_d_theta)
-                        dump_timer_start_ns = None
-                    else:
-                        # Gap not yet met — enter queued wait
-                        gap_gate_queued = True
+                # ── Normal rising-edge entry (only when not in re-entry wait) ──
+                if not in_position and not waiting_for_reentry:
+                    rising_edge = (
+                        cur == GateState.PASS
+                        and prev_state in (GateState.INACTIVE, GateState.WARMUP, GateState.FAIL)
+                    )
 
-                elif gap_gate_queued and cur == GateState.PASS:
-                    # Still in same PASS window; re-check gap on each tick
-                    cur_price = float(td.prices[i])
-                    intraday_pct = (cur_price - prev_close) / prev_close
-                    if intraday_pct >= gap_threshold:
-                        if i + 1 < N:
-                            entry_price = float(td.prices[i + 1])
+                    if rising_edge:
+                        pass_edges_total += 1
+                        cur_price = float(td.prices[i])
+                        intraday_pct = (cur_price - prev_close) / prev_close
+                        if intraday_pct >= gap_threshold:
+                            # Immediate entry
+                            if i + 1 < N:
+                                entry_price = float(td.prices[i + 1])
+                            else:
+                                entry_price = cur_price
+                            entry_idx = i
+                            entry_t_sec = td.t_sec[i]
+                            intraday_pct_at_entry = intraday_pct
+                            in_position = True
+                            gap_gate_queued = False
+                            current_entry_type = "first"
+                            # EXIT_D setup at entry (trigger tick intensity)
+                            lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
+                            I_entry = (lam_sell_out[i] / lam_tot_e
+                                       if lam_tot_e > 0 else 0.0)
+                            exit_d_disabled = (not math.isnan(I_entry)
+                                               and I_entry > exit_d_theta)
+                            dump_timer_start_ns = None
                         else:
-                            entry_price = cur_price
-                        entry_idx = i
-                        entry_t_sec = td.t_sec[i]
-                        intraday_pct_at_entry = intraday_pct
-                        in_position = True
-                        gap_gate_queued = False
-                        gap_gate_queued_entries += 1
-                        # EXIT_D setup
-                        lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
-                        I_entry = (lam_sell_out[i] / lam_tot_e
-                                   if lam_tot_e > 0 else 0.0)
-                        exit_d_disabled = (not math.isnan(I_entry)
-                                           and I_entry > exit_d_theta)
-                        dump_timer_start_ns = None
+                            # Gap not yet met — enter queued wait
+                            gap_gate_queued = True
+
+                    elif gap_gate_queued and cur == GateState.PASS:
+                        # Still in same PASS window; re-check gap on each tick
+                        cur_price = float(td.prices[i])
+                        intraday_pct = (cur_price - prev_close) / prev_close
+                        if intraday_pct >= gap_threshold:
+                            if i + 1 < N:
+                                entry_price = float(td.prices[i + 1])
+                            else:
+                                entry_price = cur_price
+                            entry_idx = i
+                            entry_t_sec = td.t_sec[i]
+                            intraday_pct_at_entry = intraday_pct
+                            in_position = True
+                            gap_gate_queued = False
+                            gap_gate_queued_entries += 1
+                            current_entry_type = "first"
+                            # EXIT_D setup
+                            lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
+                            I_entry = (lam_sell_out[i] / lam_tot_e
+                                       if lam_tot_e > 0 else 0.0)
+                            exit_d_disabled = (not math.isnan(I_entry)
+                                               and I_entry > exit_d_theta)
+                            dump_timer_start_ns = None
 
             else:
                 # ── In position: check exits in priority order ──
@@ -608,6 +655,7 @@ def _process_event(args: dict) -> dict:
                                 "prev_close": float(prev_close),
                                 "time_of_day_sec": float(tod_sec),
                                 "session_bucket": session_bucket(tod_sec),
+                                "entry_type": current_entry_type,
                                 "exit_reason": "exit_d",
                                 "natural_exit_idx": int(nat_idx),
                                 "natural_exit_ts": int(nat_ts),
@@ -620,6 +668,9 @@ def _process_event(args: dict) -> dict:
                             intraday_pct_at_entry = None
                             exit_d_disabled = False
                             dump_timer_start_ns = None
+                            if reentry_enabled:
+                                waiting_for_reentry = True
+                                reentry_sig.reset()
                             exit_fired = True
                     else:
                         dump_timer_start_ns = None  # timer reset
@@ -650,6 +701,7 @@ def _process_event(args: dict) -> dict:
                         "prev_close": float(prev_close),
                         "time_of_day_sec": float(tod_sec),
                         "session_bucket": session_bucket(tod_sec),
+                        "entry_type": current_entry_type,
                         "exit_reason": "luld_proximity",
                         "natural_exit_idx": i,
                         "natural_exit_ts": int(td.timestamps[i]),
@@ -694,6 +746,7 @@ def _process_event(args: dict) -> dict:
                         "prev_close": float(prev_close),
                         "time_of_day_sec": float(tod_sec),
                         "session_bucket": session_bucket(tod_sec),
+                        "entry_type": current_entry_type,
                         "exit_reason": "epg_window_close",
                         "natural_exit_idx": i,
                         "natural_exit_ts": int(td.timestamps[i]),
@@ -734,6 +787,7 @@ def _process_event(args: dict) -> dict:
                 "prev_close": float(prev_close),
                 "time_of_day_sec": float(tod_sec),
                 "session_bucket": session_bucket(tod_sec),
+                "entry_type": current_entry_type,
                 "exit_reason": "session_end",
                 "natural_exit_idx": N - 1,
                 "natural_exit_ts": int(td.timestamps[N - 1]),
@@ -751,6 +805,7 @@ def _process_event(args: dict) -> dict:
             "status": "event",
             "trades": trades,
             "n_trades_in_event": int(len(trades)),
+            "n_reentries_in_event": int(n_reentries),
             "n_pass_edges": int(pass_edges_total),
             "n_gap_gate_blocks": int(gap_gate_blocks),
             "n_gap_gate_queued_entries": int(gap_gate_queued_entries),
@@ -818,6 +873,25 @@ def compute_run_summary(events: list[dict]) -> dict:
             "win_rate": round(float(np.mean(w)) * 100, 2),
         }
 
+    # Entry type breakdown
+    by_entry_type = defaultdict(list)
+    for t in all_trades:
+        by_entry_type[t.get("entry_type", "first")].append(t)
+    entry_type_breakdown = {}
+    for etype, trades_e in by_entry_type.items():
+        p = np.array([t["pnl_pct"] for t in trades_e])
+        w = p > 0; l = p < 0
+        w_sum = float(np.sum(p[w])) if w.any() else 0.0
+        l_sum = float(np.abs(np.sum(p[l]))) if l.any() else 1e-10
+        entry_type_breakdown[etype] = {
+            "count": len(trades_e),
+            "pct_of_trades": round(100 * len(trades_e) / n_trades, 2),
+            "profit_factor": round(w_sum / l_sum, 4),
+            "win_rate": round(float(np.mean(w)) * 100, 2),
+            "mean_pnl_pct": round(float(np.mean(p)), 4),
+            "mean_hold_sec": round(float(np.mean([t["hold_sec"] for t in trades_e])), 2),
+        }
+
     # Exit reason breakdown
     by_exit = defaultdict(list)
     for t in all_trades:
@@ -873,6 +947,7 @@ def compute_run_summary(events: list[dict]) -> dict:
         "mean_hold_sec": round(float(np.mean(hold)), 2),
         "median_hold_sec": round(float(np.median(hold)), 2),
         "session_breakdown": session_breakdown,
+        "entry_type_breakdown": entry_type_breakdown,
         "exit_reason_breakdown": exit_breakdown,
         "gap_gate": {
             "pass_edges_total": int(n_pass_edges),
@@ -931,6 +1006,7 @@ def main():
         phase_cfg = json.load(f)
 
     # CLI overrides (for sensitivity sweep)
+    phase_label = phase_cfg.get("phase", "phase_a")
     exit_d_enabled = phase_cfg["exit_d"].get("enabled", True)
     exit_d_theta = (args.exit_d_theta
                     if args.exit_d_theta is not None
@@ -942,10 +1018,14 @@ def main():
                      if args.gap_threshold is not None
                      else phase_cfg["gap_gate"]["threshold"])
     luld_cfg = phase_cfg["luld"]
+    reentry_cfg = phase_cfg.get("reentry", {})
+    reentry_enabled = reentry_cfg.get("enabled", False)
+    reentry_tau_recovery_sec = reentry_cfg.get("tau_recovery_sec", 4.0)
 
     log.info(
-        f"Config: exit_d_enabled={exit_d_enabled} theta={exit_d_theta:.2f} "
-        f"tau_min={exit_d_tau_min_sec:.1f}s "
+        f"Config: phase={phase_label} exit_d_enabled={exit_d_enabled} "
+        f"theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
+        f"reentry_enabled={reentry_enabled} tau_recovery={reentry_tau_recovery_sec:.1f}s "
         f"gap={gap_threshold:.2f} luld_prox={luld_cfg['proximity_pct_threshold']}%"
     )
 
@@ -1048,6 +1128,8 @@ def main():
             "luld_ref_window_sec": luld_cfg["ref_window_sec"],
             "luld_proximity_pct_threshold": luld_cfg["proximity_pct_threshold"],
             "luld_warmup_sec": luld_cfg["warmup_sec"],
+            "reentry_enabled": reentry_enabled,
+            "reentry_tau_recovery_sec": reentry_tau_recovery_sec,
         })
 
     log.info(
@@ -1119,6 +1201,54 @@ def main():
         )
     write_json_atomic(per_event, results_dir / "per_event_summary.json")
 
+    # ── reentry_analysis.json (Phase B — skipped when reentry_enabled=False) ──
+    if reentry_enabled and all_trades:
+        reentry_counts = np.array(
+            [ev.get("n_reentries_in_event", 0) for ev in results], dtype=np.float64
+        )
+        first_trades = [t for t in all_trades if t.get("entry_type", "first") == "first"]
+        reentry_trades = [t for t in all_trades if t.get("entry_type") == "reentry"]
+
+        def _trade_metrics(tlist):
+            if not tlist:
+                return {"n_trades": 0, "profit_factor": None, "win_rate": None,
+                        "mean_pnl_pct": None, "mean_hold_sec": None,
+                        "exit_reason_breakdown": {}}
+            p = np.array([t["pnl_pct"] for t in tlist])
+            w = p > 0; l = p < 0
+            w_sum = float(np.sum(p[w])) if w.any() else 0.0
+            l_sum = float(np.abs(np.sum(p[l]))) if l.any() else 1e-10
+            by_ex = defaultdict(int)
+            for t in tlist:
+                by_ex[t["exit_reason"]] += 1
+            return {
+                "n_trades": len(tlist),
+                "profit_factor": round(w_sum / l_sum, 4),
+                "win_rate": round(float(np.mean(w)) * 100, 2),
+                "mean_pnl_pct": round(float(np.mean(p)), 4),
+                "mean_hold_sec": round(float(np.mean([t["hold_sec"] for t in tlist])), 2),
+                "exit_reason_breakdown": dict(by_ex),
+            }
+
+        reentry_analysis = {
+            "total_reentries": int(np.sum(reentry_counts)),
+            "events_with_reentries": int(np.sum(reentry_counts > 0)),
+            "mean_reentries_per_event": round(float(np.mean(reentry_counts)), 3),
+            "median_reentries_per_event": float(np.median(reentry_counts)),
+            "p25_reentries_per_event": float(np.percentile(reentry_counts, 25)),
+            "p75_reentries_per_event": float(np.percentile(reentry_counts, 75)),
+            "max_reentries_per_event": int(np.max(reentry_counts)),
+            "reentry_count_distribution": [int(x) for x in reentry_counts.tolist()],
+            "first_entry_metrics": _trade_metrics(first_trades),
+            "reentry_metrics": _trade_metrics(reentry_trades),
+        }
+        write_json_atomic(reentry_analysis, results_dir / "reentry_analysis.json")
+        log.info(
+            f"Re-entry analysis: total={reentry_analysis['total_reentries']} "
+            f"events_with_reentries={reentry_analysis['events_with_reentries']} "
+            f"mean_per_event={reentry_analysis['mean_reentries_per_event']}"
+        )
+
     # ── skipped_events.json ──
     if skipped or errors:
         skip_out = []
@@ -1160,7 +1290,7 @@ def main():
 
     # ── summary.json (phase spec output) ──
     phase_summary = {
-        "phase": "phase_a",
+        "phase": phase_label,
         "n_events_input": len(events),
         "n_events_with_trades": len(results),
         "n_events_skipped": len(skipped),
