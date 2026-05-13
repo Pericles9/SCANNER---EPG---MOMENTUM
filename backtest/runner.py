@@ -357,6 +357,9 @@ def _process_event(args: dict) -> dict:
     luld_warmup_sec = args["luld_warmup_sec"]
     reentry_enabled = args["reentry_enabled"]
     reentry_tau_recovery_sec = args["reentry_tau_recovery_sec"]
+    gap_gate_enabled = args.get("gap_gate_enabled", True)
+    watermark_threshold = args.get("watermark_threshold", None)
+    cvd_filter_enabled = args.get("cvd_filter_enabled", False)
 
     base = {"ticker": ticker, "date": date, "event_idx": event_idx}
 
@@ -443,11 +446,13 @@ def _process_event(args: dict) -> dict:
 
         epg_states = [GateState.INACTIVE] * N
         t_event_fired = False
+        t_event_idx = None
         for i in range(N):
             t_ev = anchor.update(lambda_hat[i], td.t_sec[i])
             if t_ev is not None and not t_event_fired:
                 gate.activate(t_ev)
                 t_event_fired = True
+                t_event_idx = i
             dv = float(td.prices[i]) * float(td.sizes[i])
             epg_states[i] = gate.update(dv, td.t_sec[i])
 
@@ -501,6 +506,8 @@ def _process_event(args: dict) -> dict:
         entry_price = None
         entry_t_sec = None
         intraday_pct_at_entry = None
+        entry_drawdown_from_high = 0.0
+        entry_cvd_at_entry = 0.0
 
         # Per-position EXIT_D state
         exit_d_disabled = False
@@ -511,11 +518,28 @@ def _process_event(args: dict) -> dict:
         n_reentries = 0
         current_entry_type = "first"
 
+        # Backside filter state (Phase C)
+        high_watermark_price = None
+        cvd_since_t_event = 0.0
+        n_watermark_blocks = 0
+        n_cvd_blocks = 0
+
         prev_state = GateState.INACTIVE
 
         for i in range(N):
             cur = epg_states[i]
             cur_luld = luld_states[i]
+
+            # ── Backside filter tracking: update from T_event onwards ──
+            if t_event_idx is not None and i >= t_event_idx:
+                cur_p_tick = float(td.prices[i])
+                if high_watermark_price is None:
+                    high_watermark_price = cur_p_tick
+                else:
+                    high_watermark_price = max(high_watermark_price, cur_p_tick)
+                if cvd_filter_enabled:
+                    direction = 1.0 if sides[i] == 1 else -1.0
+                    cvd_since_t_event += cur_p_tick * float(td.sizes[i]) * direction
 
             if not in_position:
                 # ── Gap gate queued: clear if PASS window ended ──
@@ -545,6 +569,12 @@ def _process_event(args: dict) -> dict:
                             reentry_sig.reset()
                             n_reentries += 1
                             current_entry_type = "reentry"
+                            re_cur_p = float(td.prices[i])
+                            entry_drawdown_from_high = (
+                                (high_watermark_price - re_cur_p) / high_watermark_price
+                                if high_watermark_price and high_watermark_price > 0 else 0.0
+                            )
+                            entry_cvd_at_entry = cvd_since_t_event
                             lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
                             I_entry = (lam_sell_out[i] / lam_tot_e
                                        if lam_tot_e > 0 else 0.0)
@@ -562,29 +592,70 @@ def _process_event(args: dict) -> dict:
                     if rising_edge:
                         pass_edges_total += 1
                         cur_price = float(td.prices[i])
-                        intraday_pct = (cur_price - prev_close) / prev_close
-                        if intraday_pct >= gap_threshold:
-                            # Immediate entry
-                            if i + 1 < N:
-                                entry_price = float(td.prices[i + 1])
+
+                        # ── Backside filter checks (Phase C Option A/C) ──
+                        entry_blocked = False
+                        drawdown_from_high_at_edge = 0.0
+                        if (watermark_threshold is not None
+                                and high_watermark_price is not None
+                                and high_watermark_price > 0):
+                            drawdown_from_high_at_edge = (
+                                (high_watermark_price - cur_price) / high_watermark_price
+                            )
+                            if drawdown_from_high_at_edge > watermark_threshold:
+                                n_watermark_blocks += 1
+                                entry_blocked = True
+                        if not entry_blocked and cvd_filter_enabled:
+                            if cvd_since_t_event < 0:
+                                n_cvd_blocks += 1
+                                entry_blocked = True
+
+                        if not entry_blocked:
+                            if gap_gate_enabled:
+                                intraday_pct = (cur_price - prev_close) / prev_close
+                                if intraday_pct >= gap_threshold:
+                                    # Immediate entry
+                                    if i + 1 < N:
+                                        entry_price = float(td.prices[i + 1])
+                                    else:
+                                        entry_price = cur_price
+                                    entry_idx = i
+                                    entry_t_sec = td.t_sec[i]
+                                    intraday_pct_at_entry = intraday_pct
+                                    in_position = True
+                                    gap_gate_queued = False
+                                    current_entry_type = "first"
+                                    entry_drawdown_from_high = drawdown_from_high_at_edge
+                                    entry_cvd_at_entry = cvd_since_t_event
+                                    lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
+                                    I_entry = (lam_sell_out[i] / lam_tot_e
+                                               if lam_tot_e > 0 else 0.0)
+                                    exit_d_disabled = (not math.isnan(I_entry)
+                                                       and I_entry > exit_d_theta)
+                                    dump_timer_start_ns = None
+                                else:
+                                    # Gap not yet met — enter queued wait
+                                    gap_gate_queued = True
                             else:
-                                entry_price = cur_price
-                            entry_idx = i
-                            entry_t_sec = td.t_sec[i]
-                            intraday_pct_at_entry = intraday_pct
-                            in_position = True
-                            gap_gate_queued = False
-                            current_entry_type = "first"
-                            # EXIT_D setup at entry (trigger tick intensity)
-                            lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
-                            I_entry = (lam_sell_out[i] / lam_tot_e
-                                       if lam_tot_e > 0 else 0.0)
-                            exit_d_disabled = (not math.isnan(I_entry)
-                                               and I_entry > exit_d_theta)
-                            dump_timer_start_ns = None
-                        else:
-                            # Gap not yet met — enter queued wait
-                            gap_gate_queued = True
+                                # Gap gate disabled — immediate entry on every rising edge
+                                intraday_pct = (cur_price - prev_close) / prev_close
+                                if i + 1 < N:
+                                    entry_price = float(td.prices[i + 1])
+                                else:
+                                    entry_price = cur_price
+                                entry_idx = i
+                                entry_t_sec = td.t_sec[i]
+                                intraday_pct_at_entry = intraday_pct
+                                in_position = True
+                                current_entry_type = "first"
+                                entry_drawdown_from_high = drawdown_from_high_at_edge
+                                entry_cvd_at_entry = cvd_since_t_event
+                                lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
+                                I_entry = (lam_sell_out[i] / lam_tot_e
+                                           if lam_tot_e > 0 else 0.0)
+                                exit_d_disabled = (not math.isnan(I_entry)
+                                                   and I_entry > exit_d_theta)
+                                dump_timer_start_ns = None
 
                     elif gap_gate_queued and cur == GateState.PASS:
                         # Still in same PASS window; re-check gap on each tick
@@ -602,7 +673,8 @@ def _process_event(args: dict) -> dict:
                             gap_gate_queued = False
                             gap_gate_queued_entries += 1
                             current_entry_type = "first"
-                            # EXIT_D setup
+                            entry_drawdown_from_high = 0.0
+                            entry_cvd_at_entry = cvd_since_t_event
                             lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
                             I_entry = (lam_sell_out[i] / lam_tot_e
                                        if lam_tot_e > 0 else 0.0)
@@ -657,6 +729,8 @@ def _process_event(args: dict) -> dict:
                                 "session_bucket": session_bucket(tod_sec),
                                 "entry_type": current_entry_type,
                                 "exit_reason": "exit_d",
+                                "drawdown_from_high": float(entry_drawdown_from_high),
+                                "cvd_at_entry": float(entry_cvd_at_entry),
                                 "natural_exit_idx": int(nat_idx),
                                 "natural_exit_ts": int(nat_ts),
                                 "natural_exit_price": float(nat_price),
@@ -703,6 +777,8 @@ def _process_event(args: dict) -> dict:
                         "session_bucket": session_bucket(tod_sec),
                         "entry_type": current_entry_type,
                         "exit_reason": "luld_proximity",
+                        "drawdown_from_high": float(entry_drawdown_from_high),
+                        "cvd_at_entry": float(entry_cvd_at_entry),
                         "natural_exit_idx": i,
                         "natural_exit_ts": int(td.timestamps[i]),
                         "natural_exit_price": float(exit_price),
@@ -748,6 +824,8 @@ def _process_event(args: dict) -> dict:
                         "session_bucket": session_bucket(tod_sec),
                         "entry_type": current_entry_type,
                         "exit_reason": "epg_window_close",
+                        "drawdown_from_high": float(entry_drawdown_from_high),
+                        "cvd_at_entry": float(entry_cvd_at_entry),
                         "natural_exit_idx": i,
                         "natural_exit_ts": int(td.timestamps[i]),
                         "natural_exit_price": float(exit_price),
@@ -789,6 +867,8 @@ def _process_event(args: dict) -> dict:
                 "session_bucket": session_bucket(tod_sec),
                 "entry_type": current_entry_type,
                 "exit_reason": "session_end",
+                "drawdown_from_high": float(entry_drawdown_from_high),
+                "cvd_at_entry": float(entry_cvd_at_entry),
                 "natural_exit_idx": N - 1,
                 "natural_exit_ts": int(td.timestamps[N - 1]),
                 "natural_exit_price": float(exit_price),
@@ -809,6 +889,9 @@ def _process_event(args: dict) -> dict:
             "n_pass_edges": int(pass_edges_total),
             "n_gap_gate_blocks": int(gap_gate_blocks),
             "n_gap_gate_queued_entries": int(gap_gate_queued_entries),
+            "gap_gate_enabled": gap_gate_enabled,
+            "n_watermark_blocks": int(n_watermark_blocks),
+            "n_cvd_blocks": int(n_cvd_blocks),
             "n_pass_windows": int(len(pass_window_durations)),
             "mean_pass_window_sec": (float(np.mean(pass_window_durations))
                                      if pass_window_durations else 0.0),
@@ -925,6 +1008,15 @@ def compute_run_summary(events: list[dict]) -> dict:
     pct_queued = (100 * n_queued_entries / n_trades
                   if n_trades > 0 else 0.0)
 
+    # Backside filter stats (Phase C)
+    n_watermark_blocks = sum(
+        ev.get("n_watermark_blocks", 0) for ev in events if ev.get("status") == "event"
+    )
+    n_cvd_blocks = sum(
+        ev.get("n_cvd_blocks", 0) for ev in events if ev.get("status") == "event"
+    )
+    n_entries_blocked = n_watermark_blocks + n_cvd_blocks
+
     intraday_q = np.percentile(intraday, [25, 50, 75]) * 100
     intraday_summary = {
         "mean_pct": round(float(np.mean(intraday) * 100), 2),
@@ -957,6 +1049,11 @@ def compute_run_summary(events: list[dict]) -> dict:
             "pct_entries_queued": round(pct_queued, 2),
             "intraday_pct_at_entry": intraday_summary,
         },
+        "backside_filter": {
+            "n_watermark_blocks": int(n_watermark_blocks),
+            "n_cvd_blocks": int(n_cvd_blocks),
+            "n_entries_blocked": int(n_entries_blocked),
+        },
     }
 
 
@@ -987,6 +1084,12 @@ def parse_args():
                         help="Filter to single ticker (for smoke test)")
     parser.add_argument("--date", type=str, default=None,
                         help="Filter to single date (for smoke test)")
+    parser.add_argument("--no-gap-gate", action="store_true", default=False,
+                        help="Disable gap gate — enter on every PASS rising edge (Phase C)")
+    parser.add_argument("--watermark-threshold", type=float, default=None,
+                        help="Watermark drawdown filter threshold (Phase C Option A)")
+    parser.add_argument("--cvd-filter", action="store_true", default=False,
+                        help="Enable CVD since T_event filter (Phase C Option C)")
     return parser.parse_args()
 
 
@@ -1022,11 +1125,28 @@ def main():
     reentry_enabled = reentry_cfg.get("enabled", False)
     reentry_tau_recovery_sec = reentry_cfg.get("tau_recovery_sec", 4.0)
 
+    # Phase C backside filter params
+    gap_gate_cfg = phase_cfg.get("gap_gate", {})
+    gap_gate_enabled = gap_gate_cfg.get("enabled", True)  # True = legacy behavior
+    if args.no_gap_gate:
+        gap_gate_enabled = False
+    watermark_cfg = phase_cfg.get("watermark_filter", {})
+    watermark_threshold = (watermark_cfg.get("threshold")
+                           if watermark_cfg.get("enabled", False) else None)
+    if args.watermark_threshold is not None:
+        watermark_threshold = args.watermark_threshold
+    cvd_cfg = phase_cfg.get("cvd_filter", {})
+    cvd_filter_enabled = cvd_cfg.get("enabled", False)
+    if args.cvd_filter:
+        cvd_filter_enabled = True
+
     log.info(
         f"Config: phase={phase_label} exit_d_enabled={exit_d_enabled} "
         f"theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
         f"reentry_enabled={reentry_enabled} tau_recovery={reentry_tau_recovery_sec:.1f}s "
-        f"gap={gap_threshold:.2f} luld_prox={luld_cfg['proximity_pct_threshold']}%"
+        f"gap_gate_enabled={gap_gate_enabled} gap={gap_threshold:.2f} "
+        f"watermark_threshold={watermark_threshold} cvd_filter={cvd_filter_enabled} "
+        f"luld_prox={luld_cfg['proximity_pct_threshold']}%"
     )
 
     # ── Load hawkes + q_bar configs ──
@@ -1130,6 +1250,9 @@ def main():
             "luld_warmup_sec": luld_cfg["warmup_sec"],
             "reentry_enabled": reentry_enabled,
             "reentry_tau_recovery_sec": reentry_tau_recovery_sec,
+            "gap_gate_enabled": gap_gate_enabled,
+            "watermark_threshold": watermark_threshold,
+            "cvd_filter_enabled": cvd_filter_enabled,
         })
 
     log.info(
@@ -1266,7 +1389,10 @@ def main():
         "split": args.split,
         "random_sample": args.random_sample,
         "seed": args.seed,
+        "gap_gate_enabled": gap_gate_enabled,
         "gap_threshold": gap_threshold,
+        "watermark_threshold": watermark_threshold,
+        "cvd_filter_enabled": cvd_filter_enabled,
         "exit_d_theta": exit_d_theta,
         "exit_d_tau_min_sec": exit_d_tau_min_sec,
         "luld_proximity_pct_threshold": luld_cfg["proximity_pct_threshold"],

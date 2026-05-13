@@ -142,7 +142,8 @@ Median across val events: ~0.154 (Phase A iter 7).
 | EXIT_D theta | 0.65 | T10 sweep best combo |
 | EXIT_D tau_min | 4.0s | T10 sweep best combo |
 | LULD proximity | 2.0% | Phase T |
-| Gap gate | 30% | Phase S spec |
+| Gap gate | 30% (Phase B) / disabled (Phase C) | Phase S spec; removed Phase C |
+| CVD filter | enabled (Phase C) | Phase C best single filter |
 
 ---
 
@@ -168,21 +169,44 @@ Median across val events: ~0.154 (Phase A iter 7).
 
 - PF=1.3848, 134 EXIT_D fires (same 81 events)
 
+### Phase B — EXIT_D (T10 best) + Re-Entry (this project)
+
+- 100-event val seed=42, 81 events traded
+- PF=1.3825, n_trades=1,689 (385 first + 1,304 re-entries), win=45.2%, mean_pnl=+0.294%
+- EXIT_D: 1,350 fires (PF=1.571), LULD: 27 fires (PF=0.044), EPG close: 312
+- Pre-market PF=1.395 (recovered from Phase A PF=1.009)
+- Gap gate blocked 60.4% of 971 PASS edges
+
+### Phase C — Gap Gate Removed, CVD Filter (this project)
+
+- Same 100-event val seed=42 sample, gap gate disabled
+- **CVD filter (winner):** PF=2.0328, n=1,145, win=46.81%, mean_pnl=+0.852%, 666 blocked
+- No-filter baseline: PF=1.7391, n=3,588 (gap gate off, no filter)
+- Watermark 5% (best sweep): PF=1.9443, n=1,945, 572 blocked
+- Combined A+C: PF=2.336, n=677 (thin sample; not recommended for deployment)
+- **Bias note:** Gap gate removal introduces look-ahead vs Phase B — Phase C PF is not
+  directly comparable to Phase B. CVD filter requires holdout validation (Phase D).
+
 ---
 
 ## Known Limitations
 
-1. **LULD fires are destructive.** 16 fires with mean -5.97% — the proximity exit may be
-   exiting positions just before a halt that doesn't materialize, or in situations where
-   price recovers immediately after the band proximity.
+1. **LULD fires are destructive.** 27 fires in Phase B with PF=0.044, mean=-3.4% — the
+   proximity exit may be exiting positions before a halt that doesn't materialize, or where
+   price recovers immediately after band proximity.
 
-2. **Pre-market regression with EXIT_D.** Likely EXIT_D fires prematurely in thin pre-market
-   order flow where intensity imbalance signals are noisier.
+2. **Pre-market regression with EXIT_D (resolved in Phase B).** Phase A pre-market PF
+   dropped to 1.009 with EXIT_D+LULD; Phase B recovered to 1.395. EXIT_D cuts losing
+   pre-market trades before LULD can fire.
 
-3. **Gap gate queues reduce effective sample.** 40 queued entries out of 971 PASS edges —
-   quality of queued entries vs immediate entries not yet analyzed.
+3. **Gap gate removal is a look-ahead bias in Phase C.** The live scanner filters events
+   by gap size; removing the gap gate in backtest admits sub-30% gap entries the scanner
+   would not flag. Phase C PF uplift vs Phase B is partially attributable to this bias.
+   The CVD filter is a candidate replacement that does not rely on gap level.
 
-4. **T10 best combo not yet validated on full val.** Only tested on 100-event stratified sample.
+4. **CVD filter not yet validated on holdout.** Phase C CVD PF=2.0328 exceeds the 2.0
+   escalation threshold. Holdout validation (Phase D) is required before treating as
+   deployable.
 
 5. **Setup filter using parent calibration.** Phase F0 has not been re-run for this project.
    The filter params may not be optimally calibrated for the exact data split used here.
