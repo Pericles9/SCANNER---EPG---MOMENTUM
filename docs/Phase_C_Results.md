@@ -213,11 +213,100 @@ documented.
 
 | Priority | Task |
 |----------|------|
-| High | Phase D: Validate CVD filter on holdout split |
-| High | Investigate CVD PF=2.03 > 2.0 escalation — confirm it holds on holdout before treating as deployable |
-| Medium | Characterize CVD-blocked entries: session, gap size, hold time if not blocked |
+| High | Phase D: Validate watermark 5% filter on holdout split (now best single-filter candidate after CVD bug fix) |
+| High | Re-evaluate CVD filter role — fixed PF=1.7544 barely exceeds no-filter baseline; may not warrant standalone Phase D validation |
+| Medium | Characterize watermark-blocked entries: session, gap size, hold time if not blocked |
 | Medium | Determine if gap gate removal has a viable live-trading analog (e.g., filter on gap<15% rather than gap<30%) |
-| Low | Re-run watermark sweep with proper holdout validation before adopting as secondary filter |
+| Low | Re-run watermark sweep with holdout validation before adopting |
+
+---
+
+## Phase C.5 — CVD Accumulator Bug Fix (2026-05-13)
+
+### Bug Description
+
+A systematic bug was found in the Phase C CVD accumulator (`backtest/runner.py` lines 540–542):
+
+```python
+# BUGGY (Phase C original):
+direction = 1.0 if sides[i] == 1 else -1.0
+cvd_since_t_event += cur_p_tick * float(td.sizes[i]) * direction
+```
+
+Ambiguous trades (`sides[i] == 0`, classified by neither Lee-Ready step) were mapped to
+`direction = -1.0` (sell) by the `else` branch. Across the 81-event val sample, 9.5% of all
+trades (672,706 / 7,046,943) were ambiguous, raising the effective sell rate from 43.9% to
+53.4% under the buggy code. This caused the filter to block 281 additional entries (666 → 385
+blocks) that the correct classifier would have admitted.
+
+**Fix:** `cvd_since_t_event += cur_p_tick * float(td.sizes[i]) * float(sides[i])`
+
+`float(0) = 0.0`, so ambiguous trades now contribute zero to CVD. Fix is in
+`backtest/runner.py` line 541. Unit tests: `tests/test_cvd_accumulator.py` (6 tests).
+
+### Signing Verification (T3)
+
+Four independent checks run on the fixed CVD accumulator before re-running:
+
+| Check | Test | Result | Value |
+|-------|------|--------|-------|
+| A | OFI ambiguity rate per event (flag if >30%) | CLEAR | 0/81 events flagged |
+| B | Spearman rho(CVD_fixed, I(t)) at rising edges | CLEAR | rho=−0.055, p=0.084, n=971 |
+| C | Spearman rho(CVD_fixed, 30s fwd return) | CLEAR | rho=−0.016, p=0.617, n=971 |
+| D | Visual spot-check: uptrend CVD behavior | FALSE POSITIVE | 75% blocked for XBP (genuine distribution, 0 decision changes) |
+
+Check D was triggered by XBP 2023-12-04 (uptrend event, 75% of rising edges CVD-blocked
+under fixed accumulator). Investigation showed genuine sell-dominant flow at those edges
+(buy-dollar ratios 0.30–0.50); the buggy and fixed accumulators made identical pass/block
+decisions for this event. False positive confirmed; proceeded to T4.
+
+Visual charts: `results/phase_c_fix/validation_charts/`
+
+### Phase C.5 Results — Fixed CVD vs Buggy (INVALID)
+
+**The Phase C CVD results (PF=2.0328) are INVALID.** Do not use them for deployment decisions.
+
+| Variant | Status | PF | n_trades | win% | mean_pnl% | blocks |
+|---------|--------|----|----------|------|-----------|--------|
+| No filter (T4 baseline) | VALID | 1.7391 | 3,588 | 46.46% | +0.524% | 0 |
+| Watermark 5% | VALID | 1.9443 | 1,945 | 46.68% | +0.615% | 572 |
+| CVD filter (buggy) | INVALID | 2.0328 | 1,145 | 46.81% | +0.852% | 666 |
+| CVD filter (fixed) | VALID | 1.7544 | 2,214 | 45.93% | +0.584% | 385 |
+
+**Winner change:** Watermark 5% (PF=1.9443) is now the best single-filter candidate.
+Fixed CVD (PF=1.7544) exceeds the no-filter baseline by only 0.015 PF and is below watermark.
+
+**Why PF dropped:** The bug over-blocked 281 entries. Those entries had lower average quality
+than the 385 correctly-blocked entries — admitting them pulled PF down from 2.03 to 1.75.
+The bug was accidentally finding better entries by rejecting too aggressively.
+
+### Phase C.5 Output Files
+
+| File | Contents |
+|------|----------|
+| `results/phase_c_fix/cvd_bug_diagnostic.json` | Bug quantification, T1c edge analysis |
+| `results/phase_c_fix/ofi_diagnostics.json` | T3 verification — Checks A, B, C, D |
+| `results/phase_c_fix/validation_charts/` | T3j visual spot-check charts (3 events) |
+| `results/phase_c_fix/cvd_filter_fixed/run_summary.json` | T4 fixed CVD re-run results |
+| `results/phase_c_fix/comparison_table_updated.json` | T5 updated 5-variant table |
+
+---
+
+## Phase C Original Run Artifacts
+
+| File | Contents |
+|------|----------|
+| `results/phase_c/no_filter_baseline/run_summary.json` | T4 baseline (no filter, no gap gate) |
+| `results/phase_c/cvd_filter/run_summary.json` | Option C CVD filter results — **INVALID (buggy accumulator)** |
+| `results/phase_c/watermark_0.02/run_summary.json` | Watermark sweep 2% |
+| `results/phase_c/watermark_0.03/run_summary.json` | Watermark sweep 3% |
+| `results/phase_c/watermark_0.05/run_summary.json` | Watermark sweep 5% (winner) |
+| `results/phase_c/watermark_0.07/run_summary.json` | Watermark sweep 7% |
+| `results/phase_c/combined_ac/run_summary.json` | Combined A+C (watermark 5% + CVD) — **INVALID (buggy CVD)** |
+| `results/phase_c/watermark_sweep.json` | Watermark sweep comparison table |
+| `results/phase_c/comparison_table.json` | 5-variant comparison table — **INVALID for CVD variants** |
+| `results/phase_c/event_charts/` | Per-event charts (CVD variant, 56 events) — buggy CVD panel |
+| `results/phase_c/event_charts/index.html` | Sortable index of per-event charts |
 
 ---
 
@@ -227,4 +316,5 @@ documented.
 - Phase B results: [[Phase B Results]]
 - Phase C config: `config/phase_c.json`
 - CVD filter runner: `backtest/runner.py` (`--cvd-filter` CLI flag)
-- Comparison table: `results/phase_c/comparison_table.json`
+- Comparison table (original, partially invalid): `results/phase_c/comparison_table.json`
+- Comparison table (updated, fixed CVD): `results/phase_c_fix/comparison_table_updated.json`

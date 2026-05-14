@@ -143,7 +143,7 @@ Median across val events: ~0.154 (Phase A iter 7).
 | EXIT_D tau_min | 4.0s | T10 sweep best combo |
 | LULD proximity | 2.0% | Phase T |
 | Gap gate | 30% (Phase B) / disabled (Phase C) | Phase S spec; removed Phase C |
-| CVD filter | enabled (Phase C) | Phase C best single filter |
+| CVD filter | disabled (fixed PF=1.7544) | Phase C.5: watermark 5% now best single filter |
 
 ---
 
@@ -177,15 +177,35 @@ Median across val events: ~0.154 (Phase A iter 7).
 - Pre-market PF=1.395 (recovered from Phase A PF=1.009)
 - Gap gate blocked 60.4% of 971 PASS edges
 
-### Phase C — Gap Gate Removed, CVD Filter (this project)
+### Phase C — Gap Gate Removed, Backside Filters (this project)
 
 - Same 100-event val seed=42 sample, gap gate disabled
-- **CVD filter (winner):** PF=2.0328, n=1,145, win=46.81%, mean_pnl=+0.852%, 666 blocked
 - No-filter baseline: PF=1.7391, n=3,588 (gap gate off, no filter)
-- Watermark 5% (best sweep): PF=1.9443, n=1,945, 572 blocked
+- Watermark 5% (Phase C winner): PF=1.9443, n=1,945, 572 blocked
+- **CVD filter (FIXED):** PF=1.7544, n=2,214, win=45.93%, mean_pnl=+0.584%, 385 blocked
+- CVD filter (BUGGY, INVALID): PF=2.0328, n=1,145 — buggy accumulator mapped ambiguous trades to sells; do not use
 - Combined A+C: PF=2.336, n=677 (thin sample; not recommended for deployment)
 - **Bias note:** Gap gate removal introduces look-ahead vs Phase B — Phase C PF is not
-  directly comparable to Phase B. CVD filter requires holdout validation (Phase D).
+  directly comparable to Phase B. Watermark 5% requires holdout validation (Phase D).
+
+### Phase D — Intra-Window Rolling High Watermark (this project)
+
+- Same 100-event val seed=42 sample, gap gate disabled
+- Replaces Phase C global watermark (anchored to T_event high) with per-window rolling high
+- Cross-window memory: `prior_window_peak` carries closed window peak into new window open
+- Re-entry blocking: Phase D also blocks re-entries when intra-window drawdown > threshold
+
+| Threshold | PF | n_trades | win% | entries_blocked% |
+| --------- | ---- | ------- | ---- | --------------- |
+| 2% | **2.6529** | 483 | 49.28% | 77.3% |
+| 3% | 2.576 | 667 | 48.73% | 72.7% |
+| 5% | 2.2155 | 1,213 | 47.16% | 64.0% |
+| 7% | 2.1651 | 1,589 | 46.82% | 54.2% |
+
+**Best: 2%** (PF=2.6529, n=483). PF > 2.5 escalation flagged and user-acknowledged.
+Re-entry validation: blocked re-entries have 5.72x higher drawdown than allowed.
+
+**Config:** `config/phase_d.json` | **Results:** `results/phase_d/` | **Docs:** [[Phase_D_Results]]
 
 ---
 
@@ -204,9 +224,9 @@ Median across val events: ~0.154 (Phase A iter 7).
    would not flag. Phase C PF uplift vs Phase B is partially attributable to this bias.
    The CVD filter is a candidate replacement that does not rely on gap level.
 
-4. **CVD filter not yet validated on holdout.** Phase C CVD PF=2.0328 exceeds the 2.0
-   escalation threshold. Holdout validation (Phase D) is required before treating as
-   deployable.
+4. **CVD accumulator bug invalidated Phase C CVD result.** Original CVD PF=2.0328 used a buggy
+   accumulator that mapped ambiguous trades (~9.5% of flow) to sells. Fixed PF=1.7544 (Phase C.5).
+   Watermark 5% (PF=1.9443) is now best single filter. Holdout validation (Phase D) required.
 
 5. **Setup filter using parent calibration.** Phase F0 has not been re-run for this project.
    The filter params may not be optimally calibrated for the exact data split used here.

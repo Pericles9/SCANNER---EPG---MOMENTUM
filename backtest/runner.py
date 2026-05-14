@@ -360,6 +360,7 @@ def _process_event(args: dict) -> dict:
     gap_gate_enabled = args.get("gap_gate_enabled", True)
     watermark_threshold = args.get("watermark_threshold", None)
     cvd_filter_enabled = args.get("cvd_filter_enabled", False)
+    intra_window_watermark_threshold = args.get("intra_window_watermark_threshold", None)
 
     base = {"ticker": ticker, "date": date, "event_idx": event_idx}
 
@@ -524,6 +525,17 @@ def _process_event(args: dict) -> dict:
         n_watermark_blocks = 0
         n_cvd_blocks = 0
 
+        # Phase D intra-window rolling high
+        current_window_high = None
+        prior_window_peak = None
+        first_window_seen = False
+        n_intra_window_blocks = 0
+        n_re_entries_intra_blocked = 0
+        blocked_edges = []
+        entry_dwh = None   # drawdown_from_window_high at entry
+        entry_cwh = None   # current_window_high at entry
+        entry_pwp = None   # prior_window_peak at entry
+
         prev_state = GateState.INACTIVE
 
         for i in range(N):
@@ -538,8 +550,16 @@ def _process_event(args: dict) -> dict:
                 else:
                     high_watermark_price = max(high_watermark_price, cur_p_tick)
                 if cvd_filter_enabled:
-                    direction = 1.0 if sides[i] == 1 else -1.0
-                    cvd_since_t_event += cur_p_tick * float(td.sizes[i]) * direction
+                    cvd_since_t_event += cur_p_tick * float(td.sizes[i]) * float(sides[i])
+
+            # ── Phase D: intra-window rolling high tracking ──
+            if intra_window_watermark_threshold is not None:
+                if cur == GateState.PASS and prev_state == GateState.PASS:
+                    if current_window_high is not None:
+                        current_window_high = max(current_window_high, float(td.prices[i]))
+                elif prev_state == GateState.PASS and cur != GateState.PASS:
+                    prior_window_peak = current_window_high
+                    current_window_high = None
 
             if not in_position:
                 # ── Gap gate queued: clear if PASS window ended ──
@@ -558,29 +578,75 @@ def _process_event(args: dict) -> dict:
                             int(td.timestamps[i]),
                             lam_buy_out[i], lam_sell_out[i], cur,
                         ):
-                            entry_price = float(td.prices[min(i + 1, N - 1)])
-                            entry_idx = i
-                            entry_t_sec = td.t_sec[i]
-                            intraday_pct_at_entry = (
-                                (float(td.prices[i]) - prev_close) / prev_close
-                            )
-                            in_position = True
-                            waiting_for_reentry = False
-                            reentry_sig.reset()
-                            n_reentries += 1
-                            current_entry_type = "reentry"
                             re_cur_p = float(td.prices[i])
-                            entry_drawdown_from_high = (
-                                (high_watermark_price - re_cur_p) / high_watermark_price
-                                if high_watermark_price and high_watermark_price > 0 else 0.0
-                            )
-                            entry_cvd_at_entry = cvd_since_t_event
-                            lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
-                            I_entry = (lam_sell_out[i] / lam_tot_e
-                                       if lam_tot_e > 0 else 0.0)
-                            exit_d_disabled = (not math.isnan(I_entry)
-                                               and I_entry > exit_d_theta)
-                            dump_timer_start_ns = None
+
+                            # Phase D: intra-window drawdown check for re-entry
+                            re_blocked = False
+                            if intra_window_watermark_threshold is not None:
+                                if current_window_high is not None and current_window_high > 0:
+                                    if current_window_high < re_cur_p - 1e-8:
+                                        raise RuntimeError(
+                                            f"ESCALATION: current_window_high="
+                                            f"{current_window_high} < re_entry_price="
+                                            f"{re_cur_p} at {ticker} {date} tick {i}"
+                                        )
+                                    re_dfw = max(
+                                        0.0,
+                                        (current_window_high - re_cur_p)
+                                        / current_window_high,
+                                    )
+                                    if re_dfw > intra_window_watermark_threshold:
+                                        n_intra_window_blocks += 1
+                                        n_re_entries_intra_blocked += 1
+                                        re_blocked = True
+                                        blocked_edges.append({
+                                            "ticker": ticker, "date": date,
+                                            "event_idx": event_idx,
+                                            "entry_ts": int(td.timestamps[i]),
+                                            "entry_type": "reentry",
+                                            "drawdown_from_window_high": float(re_dfw),
+                                            "current_window_high": float(current_window_high),
+                                            "prior_window_peak": (
+                                                float(prior_window_peak)
+                                                if prior_window_peak is not None else None
+                                            ),
+                                            "entry_blocked": True,
+                                        })
+                                        reentry_sig.reset()
+                                        waiting_for_reentry = False
+
+                            if not re_blocked:
+                                entry_price = float(td.prices[min(i + 1, N - 1)])
+                                entry_idx = i
+                                entry_t_sec = td.t_sec[i]
+                                intraday_pct_at_entry = (
+                                    (float(td.prices[i]) - prev_close) / prev_close
+                                )
+                                in_position = True
+                                waiting_for_reentry = False
+                                reentry_sig.reset()
+                                n_reentries += 1
+                                current_entry_type = "reentry"
+                                entry_drawdown_from_high = (
+                                    (high_watermark_price - re_cur_p) / high_watermark_price
+                                    if high_watermark_price and high_watermark_price > 0 else 0.0
+                                )
+                                entry_cvd_at_entry = cvd_since_t_event
+                                if intra_window_watermark_threshold is not None:
+                                    _re_dfw = (
+                                        max(0.0, (current_window_high - re_cur_p)
+                                            / current_window_high)
+                                        if current_window_high else 0.0
+                                    )
+                                    entry_dwh = _re_dfw
+                                    entry_cwh = current_window_high
+                                    entry_pwp = prior_window_peak
+                                lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
+                                I_entry = (lam_sell_out[i] / lam_tot_e
+                                           if lam_tot_e > 0 else 0.0)
+                                exit_d_disabled = (not math.isnan(I_entry)
+                                                   and I_entry > exit_d_theta)
+                                dump_timer_start_ns = None
 
                 # ── Normal rising-edge entry (only when not in re-entry wait) ──
                 if not in_position and not waiting_for_reentry:
@@ -593,12 +659,55 @@ def _process_event(args: dict) -> dict:
                         pass_edges_total += 1
                         cur_price = float(td.prices[i])
 
-                        # ── Backside filter checks (Phase C Option A/C) ──
+                        # ── Backside filter checks ──
                         entry_blocked = False
                         drawdown_from_high_at_edge = 0.0
-                        if (watermark_threshold is not None
-                                and high_watermark_price is not None
-                                and high_watermark_price > 0):
+                        _dfw_edge = 0.0
+
+                        if intra_window_watermark_threshold is not None:
+                            # Phase D: initialize intra-window rolling high on rising edge
+                            if not first_window_seen:
+                                if prior_window_peak is not None:
+                                    raise RuntimeError(
+                                        f"T1d ESCALATION: prior_window_peak="
+                                        f"{prior_window_peak} non-None on first "
+                                        f"PASS window of {ticker} {date}"
+                                    )
+                                first_window_seen = True
+                            current_window_high = (
+                                max(cur_price, prior_window_peak)
+                                if prior_window_peak is not None else cur_price
+                            )
+                            if current_window_high < cur_price - 1e-8:
+                                raise RuntimeError(
+                                    f"ESCALATION: current_window_high="
+                                    f"{current_window_high} < current_price="
+                                    f"{cur_price} at {ticker} {date} tick {i}"
+                                )
+                            _dfw_edge = (
+                                max(0.0, (current_window_high - cur_price)
+                                    / current_window_high)
+                                if current_window_high > 0 else 0.0
+                            )
+                            if _dfw_edge > intra_window_watermark_threshold:
+                                n_intra_window_blocks += 1
+                                entry_blocked = True
+                                blocked_edges.append({
+                                    "ticker": ticker, "date": date,
+                                    "event_idx": event_idx,
+                                    "entry_ts": int(td.timestamps[i]),
+                                    "entry_type": "first",
+                                    "drawdown_from_window_high": float(_dfw_edge),
+                                    "current_window_high": float(current_window_high),
+                                    "prior_window_peak": (
+                                        float(prior_window_peak)
+                                        if prior_window_peak is not None else None
+                                    ),
+                                    "entry_blocked": True,
+                                })
+                        elif (watermark_threshold is not None
+                              and high_watermark_price is not None
+                              and high_watermark_price > 0):
                             drawdown_from_high_at_edge = (
                                 (high_watermark_price - cur_price) / high_watermark_price
                             )
@@ -627,6 +736,10 @@ def _process_event(args: dict) -> dict:
                                     current_entry_type = "first"
                                     entry_drawdown_from_high = drawdown_from_high_at_edge
                                     entry_cvd_at_entry = cvd_since_t_event
+                                    if intra_window_watermark_threshold is not None:
+                                        entry_dwh = _dfw_edge
+                                        entry_cwh = current_window_high
+                                        entry_pwp = prior_window_peak
                                     lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
                                     I_entry = (lam_sell_out[i] / lam_tot_e
                                                if lam_tot_e > 0 else 0.0)
@@ -650,6 +763,10 @@ def _process_event(args: dict) -> dict:
                                 current_entry_type = "first"
                                 entry_drawdown_from_high = drawdown_from_high_at_edge
                                 entry_cvd_at_entry = cvd_since_t_event
+                                if intra_window_watermark_threshold is not None:
+                                    entry_dwh = _dfw_edge
+                                    entry_cwh = current_window_high
+                                    entry_pwp = prior_window_peak
                                 lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
                                 I_entry = (lam_sell_out[i] / lam_tot_e
                                            if lam_tot_e > 0 else 0.0)
@@ -675,6 +792,15 @@ def _process_event(args: dict) -> dict:
                             current_entry_type = "first"
                             entry_drawdown_from_high = 0.0
                             entry_cvd_at_entry = cvd_since_t_event
+                            if intra_window_watermark_threshold is not None:
+                                _q_p = float(td.prices[i])
+                                entry_dwh = (
+                                    max(0.0, (current_window_high - _q_p)
+                                        / current_window_high)
+                                    if current_window_high else 0.0
+                                )
+                                entry_cwh = current_window_high
+                                entry_pwp = prior_window_peak
                             lam_tot_e = lam_buy_out[i] + lam_sell_out[i]
                             I_entry = (lam_sell_out[i] / lam_tot_e
                                        if lam_tot_e > 0 else 0.0)
@@ -736,12 +862,16 @@ def _process_event(args: dict) -> dict:
                                 "natural_exit_price": float(nat_price),
                                 "natural_exit_pnl_pct": float(nat_pnl),
                                 "natural_exit_reason": nat_reason,
+                                "drawdown_from_window_high": entry_dwh,
+                                "current_window_high_at_entry": entry_cwh,
+                                "prior_window_peak_at_entry": entry_pwp,
                             })
                             in_position = False
                             entry_idx = entry_price = entry_t_sec = None
                             intraday_pct_at_entry = None
                             exit_d_disabled = False
                             dump_timer_start_ns = None
+                            entry_dwh = entry_cwh = entry_pwp = None
                             if reentry_enabled:
                                 waiting_for_reentry = True
                                 reentry_sig.reset()
@@ -784,12 +914,16 @@ def _process_event(args: dict) -> dict:
                         "natural_exit_price": float(exit_price),
                         "natural_exit_pnl_pct": float(pnl_pct),
                         "natural_exit_reason": "luld_proximity",
+                        "drawdown_from_window_high": entry_dwh,
+                        "current_window_high_at_entry": entry_cwh,
+                        "prior_window_peak_at_entry": entry_pwp,
                     })
                     in_position = False
                     entry_idx = entry_price = entry_t_sec = None
                     intraday_pct_at_entry = None
                     exit_d_disabled = False
                     dump_timer_start_ns = None
+                    entry_dwh = entry_cwh = entry_pwp = None
                     exit_fired = True
 
                 # Priority 3: EPG window close
@@ -831,12 +965,16 @@ def _process_event(args: dict) -> dict:
                         "natural_exit_price": float(exit_price),
                         "natural_exit_pnl_pct": float(pnl_pct),
                         "natural_exit_reason": "epg_window_close",
+                        "drawdown_from_window_high": entry_dwh,
+                        "current_window_high_at_entry": entry_cwh,
+                        "prior_window_peak_at_entry": entry_pwp,
                     })
                     in_position = False
                     entry_idx = entry_price = entry_t_sec = None
                     intraday_pct_at_entry = None
                     exit_d_disabled = False
                     dump_timer_start_ns = None
+                    entry_dwh = entry_cwh = entry_pwp = None
 
             prev_state = cur
 
@@ -874,6 +1012,9 @@ def _process_event(args: dict) -> dict:
                 "natural_exit_price": float(exit_price),
                 "natural_exit_pnl_pct": float(pnl_pct),
                 "natural_exit_reason": "session_end",
+                "drawdown_from_window_high": entry_dwh,
+                "current_window_high_at_entry": entry_cwh,
+                "prior_window_peak_at_entry": entry_pwp,
             })
 
         max_intraday_pct = float(
@@ -892,6 +1033,9 @@ def _process_event(args: dict) -> dict:
             "gap_gate_enabled": gap_gate_enabled,
             "n_watermark_blocks": int(n_watermark_blocks),
             "n_cvd_blocks": int(n_cvd_blocks),
+            "n_intra_window_blocks": int(n_intra_window_blocks),
+            "n_re_entries_intra_blocked": int(n_re_entries_intra_blocked),
+            "blocked_edges": blocked_edges,
             "n_pass_windows": int(len(pass_window_durations)),
             "mean_pass_window_sec": (float(np.mean(pass_window_durations))
                                      if pass_window_durations else 0.0),
@@ -1008,14 +1152,20 @@ def compute_run_summary(events: list[dict]) -> dict:
     pct_queued = (100 * n_queued_entries / n_trades
                   if n_trades > 0 else 0.0)
 
-    # Backside filter stats (Phase C)
+    # Backside filter stats (Phase C / Phase D)
     n_watermark_blocks = sum(
         ev.get("n_watermark_blocks", 0) for ev in events if ev.get("status") == "event"
     )
     n_cvd_blocks = sum(
         ev.get("n_cvd_blocks", 0) for ev in events if ev.get("status") == "event"
     )
-    n_entries_blocked = n_watermark_blocks + n_cvd_blocks
+    n_intra_window_blocks = sum(
+        ev.get("n_intra_window_blocks", 0) for ev in events if ev.get("status") == "event"
+    )
+    n_re_entries_intra_blocked = sum(
+        ev.get("n_re_entries_intra_blocked", 0) for ev in events if ev.get("status") == "event"
+    )
+    n_entries_blocked = n_watermark_blocks + n_cvd_blocks + n_intra_window_blocks
 
     intraday_q = np.percentile(intraday, [25, 50, 75]) * 100
     intraday_summary = {
@@ -1052,6 +1202,8 @@ def compute_run_summary(events: list[dict]) -> dict:
         "backside_filter": {
             "n_watermark_blocks": int(n_watermark_blocks),
             "n_cvd_blocks": int(n_cvd_blocks),
+            "n_intra_window_blocks": int(n_intra_window_blocks),
+            "n_re_entries_intra_blocked": int(n_re_entries_intra_blocked),
             "n_entries_blocked": int(n_entries_blocked),
         },
     }
@@ -1090,6 +1242,8 @@ def parse_args():
                         help="Watermark drawdown filter threshold (Phase C Option A)")
     parser.add_argument("--cvd-filter", action="store_true", default=False,
                         help="Enable CVD since T_event filter (Phase C Option C)")
+    parser.add_argument("--intra-window-watermark-threshold", type=float, default=None,
+                        help="Phase D intra-window rolling high watermark threshold")
     return parser.parse_args()
 
 
@@ -1140,12 +1294,22 @@ def main():
     if args.cvd_filter:
         cvd_filter_enabled = True
 
+    # Phase D intra-window watermark
+    intra_window_cfg = phase_cfg.get("intra_window_watermark", {})
+    intra_window_watermark_threshold = (
+        intra_window_cfg.get("threshold")
+        if intra_window_cfg.get("enabled", False) else None
+    )
+    if args.intra_window_watermark_threshold is not None:
+        intra_window_watermark_threshold = args.intra_window_watermark_threshold
+
     log.info(
         f"Config: phase={phase_label} exit_d_enabled={exit_d_enabled} "
         f"theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
         f"reentry_enabled={reentry_enabled} tau_recovery={reentry_tau_recovery_sec:.1f}s "
         f"gap_gate_enabled={gap_gate_enabled} gap={gap_threshold:.2f} "
         f"watermark_threshold={watermark_threshold} cvd_filter={cvd_filter_enabled} "
+        f"intra_window_watermark={intra_window_watermark_threshold} "
         f"luld_prox={luld_cfg['proximity_pct_threshold']}%"
     )
 
@@ -1253,6 +1417,7 @@ def main():
             "gap_gate_enabled": gap_gate_enabled,
             "watermark_threshold": watermark_threshold,
             "cvd_filter_enabled": cvd_filter_enabled,
+            "intra_window_watermark_threshold": intra_window_watermark_threshold,
         })
 
     log.info(
@@ -1315,12 +1480,32 @@ def main():
         except Exception as e:
             log.error(f"per_trade.parquet write failed: {e}")
 
+    # ── blocked_edges.parquet (Phase D) ──
+    if intra_window_watermark_threshold is not None:
+        all_blocked = []
+        for ev in results:
+            all_blocked.extend(ev.get("blocked_edges", []))
+        if all_blocked:
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                be_tbl = pa.Table.from_pylist(all_blocked)
+                pq.write_table(be_tbl, str(results_dir / "blocked_edges.parquet"))
+                log.info(
+                    f"Written: {results_dir / 'blocked_edges.parquet'} "
+                    f"({len(all_blocked)} rows)"
+                )
+            except Exception as e:
+                log.error(f"blocked_edges.parquet write failed: {e}")
+        else:
+            log.info("No blocked edges to write.")
+
     # ── per_event_summary.json ──
     per_event = []
     for ev in results:
         per_event.append(
             {k: v for k, v in ev.items()
-             if k not in ("trades", "pass_window_durations")}
+             if k not in ("trades", "pass_window_durations", "blocked_edges")}
         )
     write_json_atomic(per_event, results_dir / "per_event_summary.json")
 
@@ -1393,6 +1578,7 @@ def main():
         "gap_threshold": gap_threshold,
         "watermark_threshold": watermark_threshold,
         "cvd_filter_enabled": cvd_filter_enabled,
+        "intra_window_watermark_threshold": intra_window_watermark_threshold,
         "exit_d_theta": exit_d_theta,
         "exit_d_tau_min_sec": exit_d_tau_min_sec,
         "luld_proximity_pct_threshold": luld_cfg["proximity_pct_threshold"],
