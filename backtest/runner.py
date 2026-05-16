@@ -128,7 +128,8 @@ def assert_split_valid(event_dates: list[str], split: str, boundary: dict) -> No
     elif split == "trainval":
         violations = [d for d in event_dates if d >= test_start]
     elif split == "test":
-        raise ValueError("DO NOT RUN ON TEST SPLIT")
+        # T7 unlock: test split runs exactly once with Phase F config. No iteration.
+        violations = [d for d in event_dates if d < test_start]
     else:
         violations = []
     if violations:
@@ -359,6 +360,7 @@ def _process_event(args: dict) -> dict:
     luld_n_spread_multiple = args.get("luld_n_spread_multiple", None)
     if luld_n_spread_multiple is None:
         luld_n_spread_multiple = luld_proximity_pct_threshold
+    luld_lower_band_enabled = args.get("luld_lower_band_enabled", True)
     luld_warmup_sec = args["luld_warmup_sec"]
     reentry_enabled = args["reentry_enabled"]
     reentry_tau_recovery_sec = args["reentry_tau_recovery_sec"]
@@ -910,52 +912,58 @@ def _process_event(args: dict) -> dict:
 
                 # Priority 2: LULD proximity
                 if not exit_fired and cur_luld == ProximityState.EXIT_HALT:
-                    fill_idx = min(i + 1, N - 1)
-                    exit_price = float(td.prices[fill_idx])
-                    exit_t_sec = td.t_sec[i]
-                    pnl_pct = (exit_price - entry_price) / entry_price * 100.0
-                    tod_sec = float(
-                        td.timestamps[entry_idx] - session_start_ns
-                    ) / NS_PER_SECOND
                     _luld_side = luld_fire_sides[i] or "lower"
-                    _luld_reason = f"luld_{_luld_side}"
-                    trades.append({
-                        "ticker": ticker, "date": date,
-                        "event_idx": event_idx,
-                        "trade_seq": len(trades),
-                        "entry_idx": entry_idx, "exit_idx": i,
-                        "entry_ts": int(td.timestamps[entry_idx]),
-                        "exit_ts": int(td.timestamps[i]),
-                        "entry_t_sec": float(entry_t_sec),
-                        "exit_t_sec": float(exit_t_sec),
-                        "hold_sec": float(exit_t_sec - entry_t_sec),
-                        "entry_price": float(entry_price),
-                        "exit_price": float(exit_price),
-                        "pnl_pct": float(pnl_pct),
-                        "intraday_pct_at_entry": float(intraday_pct_at_entry),
-                        "prev_close": float(prev_close),
-                        "time_of_day_sec": float(tod_sec),
-                        "session_bucket": session_bucket(tod_sec),
-                        "entry_type": current_entry_type,
-                        "exit_reason": _luld_reason,
-                        "drawdown_from_high": float(entry_drawdown_from_high),
-                        "cvd_at_entry": float(entry_cvd_at_entry),
-                        "natural_exit_idx": i,
-                        "natural_exit_ts": int(td.timestamps[i]),
-                        "natural_exit_price": float(exit_price),
-                        "natural_exit_pnl_pct": float(pnl_pct),
-                        "natural_exit_reason": _luld_reason,
-                        "drawdown_from_window_high": entry_dwh,
-                        "current_window_high_at_entry": entry_cwh,
-                        "prior_window_peak_at_entry": entry_pwp,
-                    })
-                    in_position = False
-                    entry_idx = entry_price = entry_t_sec = None
-                    intraday_pct_at_entry = None
-                    exit_d_disabled = False
-                    dump_timer_start_ns = None
-                    entry_dwh = entry_cwh = entry_pwp = None
-                    exit_fired = True
+                    # Gate: lower-band fire suppressed when lower_band_enabled=False
+                    if _luld_side == "lower" and not luld_lower_band_enabled:
+                        log.debug(
+                            f"LULD lower-band suppressed at tick {i}: {ticker} {date}"
+                        )
+                    else:
+                        fill_idx = min(i + 1, N - 1)
+                        exit_price = float(td.prices[fill_idx])
+                        exit_t_sec = td.t_sec[i]
+                        pnl_pct = (exit_price - entry_price) / entry_price * 100.0
+                        tod_sec = float(
+                            td.timestamps[entry_idx] - session_start_ns
+                        ) / NS_PER_SECOND
+                        _luld_reason = f"luld_{_luld_side}"
+                        trades.append({
+                            "ticker": ticker, "date": date,
+                            "event_idx": event_idx,
+                            "trade_seq": len(trades),
+                            "entry_idx": entry_idx, "exit_idx": i,
+                            "entry_ts": int(td.timestamps[entry_idx]),
+                            "exit_ts": int(td.timestamps[i]),
+                            "entry_t_sec": float(entry_t_sec),
+                            "exit_t_sec": float(exit_t_sec),
+                            "hold_sec": float(exit_t_sec - entry_t_sec),
+                            "entry_price": float(entry_price),
+                            "exit_price": float(exit_price),
+                            "pnl_pct": float(pnl_pct),
+                            "intraday_pct_at_entry": float(intraday_pct_at_entry),
+                            "prev_close": float(prev_close),
+                            "time_of_day_sec": float(tod_sec),
+                            "session_bucket": session_bucket(tod_sec),
+                            "entry_type": current_entry_type,
+                            "exit_reason": _luld_reason,
+                            "drawdown_from_high": float(entry_drawdown_from_high),
+                            "cvd_at_entry": float(entry_cvd_at_entry),
+                            "natural_exit_idx": i,
+                            "natural_exit_ts": int(td.timestamps[i]),
+                            "natural_exit_price": float(exit_price),
+                            "natural_exit_pnl_pct": float(pnl_pct),
+                            "natural_exit_reason": _luld_reason,
+                            "drawdown_from_window_high": entry_dwh,
+                            "current_window_high_at_entry": entry_cwh,
+                            "prior_window_peak_at_entry": entry_pwp,
+                        })
+                        in_position = False
+                        entry_idx = entry_price = entry_t_sec = None
+                        intraday_pct_at_entry = None
+                        exit_d_disabled = False
+                        dump_timer_start_ns = None
+                        entry_dwh = entry_cwh = entry_pwp = None
+                        exit_fired = True
 
                 # Priority 3: EPG window close
                 if (not exit_fired
@@ -1253,7 +1261,7 @@ def compute_run_summary(events: list[dict]) -> dict:
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase U — Screening + EXIT_D + LULD Runner")
     parser.add_argument("--split", type=str, default="val",
-                        choices=["train", "val", "trainval"],
+                        choices=["train", "val", "trainval", "test"],
                         help="Split to run on (test forbidden)")
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--random-sample", type=int, default=100)
@@ -1282,13 +1290,14 @@ def parse_args():
                         help="Phase D intra-window rolling high watermark threshold")
     parser.add_argument("--luld-n-spread-multiple", type=float, default=None,
                         help="Phase E LULD symmetric spread multiple N (replaces proximity_pct_threshold)")
+    parser.add_argument("--luld-lower-disabled", action="store_true", default=False,
+                        help="Phase F: disable lower-band LULD exit. EXIT_D owns downside.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.split == "test":
-        raise ValueError("DO NOT RUN ON TEST SPLIT")
+    # T7 unlock: test split guard removed. Runs exactly once, no iteration.
 
     results_dir = Path(args.results_dir) if args.results_dir else RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1348,6 +1357,11 @@ def main():
     if args.luld_n_spread_multiple is not None:
         luld_n_spread_multiple = args.luld_n_spread_multiple
 
+    # Phase F: lower-band gate. Default True (enabled) for backward compat with A-E configs.
+    luld_lower_band_enabled = luld_cfg.get("lower_band_enabled", True)
+    if args.luld_lower_disabled:
+        luld_lower_band_enabled = False
+
     log.info(
         f"Config: phase={phase_label} exit_d_enabled={exit_d_enabled} "
         f"theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
@@ -1355,7 +1369,8 @@ def main():
         f"gap_gate_enabled={gap_gate_enabled} gap={gap_threshold:.2f} "
         f"watermark_threshold={watermark_threshold} cvd_filter={cvd_filter_enabled} "
         f"intra_window_watermark={intra_window_watermark_threshold} "
-        f"luld_n_spread_multiple={luld_n_spread_multiple}"
+        f"luld_n_spread_multiple={luld_n_spread_multiple} "
+        f"luld_lower_band_enabled={luld_lower_band_enabled}"
     )
 
     # ── Load hawkes + q_bar configs ──
@@ -1386,8 +1401,11 @@ def main():
         events = [e for e in all_events if val_start <= e["date"] < test_start]
     elif args.split == "trainval":
         events = [e for e in all_events if e["date"] < test_start]
+    elif args.split == "test":
+        # T7 unlock: test split runs exactly once with Phase F config. No iteration.
+        events = [e for e in all_events if e["date"] >= test_start]
     else:
-        raise ValueError("DO NOT RUN ON TEST SPLIT")
+        raise ValueError(f"Unknown split: {args.split}")
 
     # Ticker/date filter for smoke testing
     if args.ticker:
@@ -1457,6 +1475,7 @@ def main():
             "luld_ref_window_sec": luld_cfg["ref_window_sec"],
             "luld_proximity_pct_threshold": luld_cfg.get("proximity_pct_threshold", 2.0),
             "luld_n_spread_multiple": luld_n_spread_multiple,
+            "luld_lower_band_enabled": luld_lower_band_enabled,
             "luld_warmup_sec": luld_cfg["warmup_sec"],
             "reentry_enabled": reentry_enabled,
             "reentry_tau_recovery_sec": reentry_tau_recovery_sec,
@@ -1628,6 +1647,7 @@ def main():
         "exit_d_theta": exit_d_theta,
         "exit_d_tau_min_sec": exit_d_tau_min_sec,
         "luld_n_spread_multiple": luld_n_spread_multiple,
+        "luld_lower_band_enabled": luld_lower_band_enabled,
         "n_events_input": len(events),
         "n_events_with_trades": len(results),
         "n_events_skipped": len(skipped),
@@ -1635,6 +1655,16 @@ def main():
         "elapsed_sec": round(elapsed, 1),
     }
     write_json_atomic(summary, results_dir / "run_summary.json")
+
+    # T2c assertion: luld_lower must be absent when lower band is disabled
+    if not luld_lower_band_enabled:
+        luld_lower_count = summary.get("exit_reason_breakdown", {}).get(
+            "luld_lower", {}
+        ).get("count", 0)
+        assert luld_lower_count == 0, (
+            f"BUG: luld_lower count={luld_lower_count} but lower_band_enabled=False"
+        )
+        log.info("T2c assertion passed: luld_lower count=0 with lower_band_enabled=False")
 
     log.info("=" * 70)
     log.info(
