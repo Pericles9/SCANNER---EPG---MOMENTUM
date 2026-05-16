@@ -306,6 +306,7 @@ def _find_natural_exit(
     N: int,
     td,
     luld_states: list,
+    luld_fire_sides: list,
     epg_states: list,
 ) -> tuple[int, int, float, str]:
     """Scan forward from i_exit_d to find next LULD or EPG close exit.
@@ -318,7 +319,8 @@ def _find_natural_exit(
     for j in range(i_exit_d + 1, N):
         if luld_states[j] == ProximityState.EXIT_HALT:
             fill_j = min(j + 1, N - 1)
-            return j, int(td.timestamps[j]), float(td.prices[fill_j]), "luld_proximity"
+            side = luld_fire_sides[j] or "lower"
+            return j, int(td.timestamps[j]), float(td.prices[fill_j]), f"luld_{side}"
         cur_epg = epg_states[j]
         if prev_epg == GateState.PASS and cur_epg != GateState.PASS:
             fill_j = min(j + 1, N - 1)
@@ -354,6 +356,9 @@ def _process_event(args: dict) -> dict:
     exit_d_tau_min_ns = args["exit_d_tau_min_ns"]   # pre-converted to int ns
     luld_ref_window_sec = args["luld_ref_window_sec"]
     luld_proximity_pct_threshold = args["luld_proximity_pct_threshold"]
+    luld_n_spread_multiple = args.get("luld_n_spread_multiple", None)
+    if luld_n_spread_multiple is None:
+        luld_n_spread_multiple = luld_proximity_pct_threshold
     luld_warmup_sec = args["luld_warmup_sec"]
     reentry_enabled = args["reentry_enabled"]
     reentry_tau_recovery_sec = args["reentry_tau_recovery_sec"]
@@ -465,15 +470,39 @@ def _process_event(args: dict) -> dict:
         # EXIT priority: EXIT_D > LULD > EPG window close.
         # Calling update() in a pre-pass lets _find_natural_exit() query
         # luld_states[] without re-entering the stateful buffer.
+        # Quote pointer uses the same pattern as the Lee-Ready classifier in
+        # core/ofi/trade_ofi.py: advance q_idx until the next quote is after
+        # the current trade timestamp, then use the prevailing quote.
         luld_pre = LuldProximityExit(
             ref_window_sec=luld_ref_window_sec,
-            proximity_pct_threshold=luld_proximity_pct_threshold,
+            n_spread_multiple=luld_n_spread_multiple,
             warmup_sec=luld_warmup_sec,
         )
         luld_states = []
+        luld_fire_sides = []
+        luld_fallback_count = 0
+        nq = qd.n_quotes
+        q_idx_luld = 0
         for i in range(N):
-            lr = luld_pre.update(int(td.timestamps[i]), float(td.prices[i]))
+            while q_idx_luld < nq - 1 and qd.timestamps[q_idx_luld + 1] <= td.timestamps[i]:
+                q_idx_luld += 1
+            if q_idx_luld < nq and qd.timestamps[q_idx_luld] <= td.timestamps[i]:
+                bid_q = float(qd.bid_prices[q_idx_luld])
+                ask_q = float(qd.ask_prices[q_idx_luld])
+            else:
+                bid_q = None
+                ask_q = None
+            if (bid_q is None or ask_q is None
+                    or ask_q <= bid_q or bid_q <= 0.0):
+                luld_fallback_count += 1
+            lr = luld_pre.update(int(td.timestamps[i]), float(td.prices[i]), bid_q, ask_q)
             luld_states.append(lr.state)
+            luld_fire_sides.append(lr.fire_side)
+        if N > 0 and luld_fallback_count / N > 0.10:
+            log.warning(
+                f"LULD fallback rate {luld_fallback_count}/{N}="
+                f"{100*luld_fallback_count/N:.1f}% > 10%% for {ticker} {date}"
+            )
 
         # ── 5b. Re-entry signal (one per event; reset between uses) ──
         reentry_sig = ReentrySignal(
@@ -833,7 +862,7 @@ def _process_event(args: dict) -> dict:
                             # Natural exit: what would have fired without EXIT_D
                             nat_idx, nat_ts, nat_price, nat_reason = \
                                 _find_natural_exit(i, N, td, luld_states,
-                                                   epg_states)
+                                                   luld_fire_sides, epg_states)
                             nat_pnl = ((nat_price - entry_price)
                                        / entry_price * 100.0)
                             trades.append({
@@ -888,6 +917,8 @@ def _process_event(args: dict) -> dict:
                     tod_sec = float(
                         td.timestamps[entry_idx] - session_start_ns
                     ) / NS_PER_SECOND
+                    _luld_side = luld_fire_sides[i] or "lower"
+                    _luld_reason = f"luld_{_luld_side}"
                     trades.append({
                         "ticker": ticker, "date": date,
                         "event_idx": event_idx,
@@ -906,14 +937,14 @@ def _process_event(args: dict) -> dict:
                         "time_of_day_sec": float(tod_sec),
                         "session_bucket": session_bucket(tod_sec),
                         "entry_type": current_entry_type,
-                        "exit_reason": "luld_proximity",
+                        "exit_reason": _luld_reason,
                         "drawdown_from_high": float(entry_drawdown_from_high),
                         "cvd_at_entry": float(entry_cvd_at_entry),
                         "natural_exit_idx": i,
                         "natural_exit_ts": int(td.timestamps[i]),
                         "natural_exit_price": float(exit_price),
                         "natural_exit_pnl_pct": float(pnl_pct),
-                        "natural_exit_reason": "luld_proximity",
+                        "natural_exit_reason": _luld_reason,
                         "drawdown_from_window_high": entry_dwh,
                         "current_window_high_at_entry": entry_cwh,
                         "prior_window_peak_at_entry": entry_pwp,
@@ -1036,6 +1067,7 @@ def _process_event(args: dict) -> dict:
             "n_intra_window_blocks": int(n_intra_window_blocks),
             "n_re_entries_intra_blocked": int(n_re_entries_intra_blocked),
             "blocked_edges": blocked_edges,
+            "n_luld_fallback": int(luld_fallback_count),
             "n_pass_windows": int(len(pass_window_durations)),
             "mean_pass_window_sec": (float(np.mean(pass_window_durations))
                                      if pass_window_durations else 0.0),
@@ -1165,6 +1197,9 @@ def compute_run_summary(events: list[dict]) -> dict:
     n_re_entries_intra_blocked = sum(
         ev.get("n_re_entries_intra_blocked", 0) for ev in events if ev.get("status") == "event"
     )
+    n_luld_fallback = sum(
+        ev.get("n_luld_fallback", 0) for ev in events if ev.get("status") == "event"
+    )
     n_entries_blocked = n_watermark_blocks + n_cvd_blocks + n_intra_window_blocks
 
     intraday_q = np.percentile(intraday, [25, 50, 75]) * 100
@@ -1206,6 +1241,7 @@ def compute_run_summary(events: list[dict]) -> dict:
             "n_re_entries_intra_blocked": int(n_re_entries_intra_blocked),
             "n_entries_blocked": int(n_entries_blocked),
         },
+        "luld_fallback_ticks": int(n_luld_fallback),
     }
 
 
@@ -1244,6 +1280,8 @@ def parse_args():
                         help="Enable CVD since T_event filter (Phase C Option C)")
     parser.add_argument("--intra-window-watermark-threshold", type=float, default=None,
                         help="Phase D intra-window rolling high watermark threshold")
+    parser.add_argument("--luld-n-spread-multiple", type=float, default=None,
+                        help="Phase E LULD symmetric spread multiple N (replaces proximity_pct_threshold)")
     return parser.parse_args()
 
 
@@ -1303,6 +1341,13 @@ def main():
     if args.intra_window_watermark_threshold is not None:
         intra_window_watermark_threshold = args.intra_window_watermark_threshold
 
+    # Phase E LULD symmetric spread multiple
+    luld_n_spread_multiple = luld_cfg.get("n_spread_multiple", None)
+    if luld_n_spread_multiple is None:
+        luld_n_spread_multiple = luld_cfg.get("proximity_pct_threshold", 2.0)
+    if args.luld_n_spread_multiple is not None:
+        luld_n_spread_multiple = args.luld_n_spread_multiple
+
     log.info(
         f"Config: phase={phase_label} exit_d_enabled={exit_d_enabled} "
         f"theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
@@ -1310,7 +1355,7 @@ def main():
         f"gap_gate_enabled={gap_gate_enabled} gap={gap_threshold:.2f} "
         f"watermark_threshold={watermark_threshold} cvd_filter={cvd_filter_enabled} "
         f"intra_window_watermark={intra_window_watermark_threshold} "
-        f"luld_prox={luld_cfg['proximity_pct_threshold']}%"
+        f"luld_n_spread_multiple={luld_n_spread_multiple}"
     )
 
     # ── Load hawkes + q_bar configs ──
@@ -1410,7 +1455,8 @@ def main():
             "exit_d_theta": exit_d_theta,
             "exit_d_tau_min_ns": exit_d_tau_min_ns,
             "luld_ref_window_sec": luld_cfg["ref_window_sec"],
-            "luld_proximity_pct_threshold": luld_cfg["proximity_pct_threshold"],
+            "luld_proximity_pct_threshold": luld_cfg.get("proximity_pct_threshold", 2.0),
+            "luld_n_spread_multiple": luld_n_spread_multiple,
             "luld_warmup_sec": luld_cfg["warmup_sec"],
             "reentry_enabled": reentry_enabled,
             "reentry_tau_recovery_sec": reentry_tau_recovery_sec,
@@ -1581,7 +1627,7 @@ def main():
         "intra_window_watermark_threshold": intra_window_watermark_threshold,
         "exit_d_theta": exit_d_theta,
         "exit_d_tau_min_sec": exit_d_tau_min_sec,
-        "luld_proximity_pct_threshold": luld_cfg["proximity_pct_threshold"],
+        "luld_n_spread_multiple": luld_n_spread_multiple,
         "n_events_input": len(events),
         "n_events_with_trades": len(results),
         "n_events_skipped": len(skipped),

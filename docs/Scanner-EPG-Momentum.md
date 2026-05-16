@@ -207,6 +207,29 @@ Re-entry validation: blocked re-entries have 5.72x higher drawdown than allowed.
 
 **Config:** `config/phase_d.json` | **Results:** `results/phase_d/` | **Docs:** [[Phase_D_Results]]
 
+### Phase E — Symmetric Spread-Multiple LULD Exit (this project)
+
+- Same 100-event val seed=42 sample, EXIT_D theta=0.65/tau=4s, watermark 2%, gap gate disabled
+- Replaces fixed 2% proximity threshold with N x bid-ask spread buffer on BOTH upper and lower bands
+- Trigger: `price < lower_band + N*spread` OR `price > upper_band - N*spread`
+- Fallback: if bid/ask invalid, buffer=0 (fires only at band); 266,955 fallback ticks across all N
+
+| N | PF | n_trades | win% | mean_pnl% | luld_lo | luld_hi | luld_lo_pf | luld_hi_pf | exit_d_pf |
+|---|-----|---------|------|-----------|---------|---------|-----------|-----------|-----------|
+| Phase D (2% fixed, lower only) | **2.6529** | 483 | 49.28 | +1.491% | 13 | 0 | 0.71 | — | 3.074 |
+| 1 | 1.9271 | 476 | 48.32 | +0.838% | 20 | 47 | 0.059 | 12.571 | 2.099 |
+| 2 | 1.7509 | 467 | 47.11 | +0.638% | 33 | 71 | 0.274 | 4.744 | 1.927 |
+| 3 | 1.7901 | 449 | 46.77 | +0.636% | 48 | 81 | 0.430 | 8.089 | 1.843 |
+
+**Best N: 1** (PF=1.9271). **Escalation TRIGGERED: best PF=1.9271 < 2.20 hard stop.**
+
+Key findings:
+- `luld_upper` PF=12.57 at N=1 — stocks running toward upper LULD are massive momentum winners; upper-band exit is genuine Phase E contribution (Phase D had zero upper-band exits)
+- `luld_lower` PF=0.059 at N=1 — pre-empts EXIT_D on its best declining trades; EXIT_D PF drops 3.074→2.099; lower-band exit destroys value at all N
+- Net effect of symmetric LULD: PF regression vs Phase D (2.6529→1.9271, -27%); phase failed its primary success criterion
+
+**Config:** `config/phase_e.json` | **Results:** `results/phase_e/` | **Docs:** [[Phase_E_Results]]
+
 ---
 
 ## Known Limitations
