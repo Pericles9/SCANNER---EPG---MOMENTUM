@@ -1,0 +1,213 @@
+"""Process 3: single asyncio consumer for the order_queue."""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import date
+from typing import Optional
+
+from live.config import CFG
+from live.db.pool import get_pool
+from live.orders.ibkr import Fill, IBKRClient
+from live.orders.risk import FlattenAllRequest, OrderRequest, RiskState
+
+log = logging.getLogger(__name__)
+
+
+async def order_worker(
+    order_queue: asyncio.Queue,
+    risk_state: RiskState,
+    ibkr: IBKRClient,
+    telegram,
+    session_date: date,
+) -> None:
+    """Consume order_queue. Single writer to RiskState."""
+    while True:
+        request = await order_queue.get()
+
+        if isinstance(request, FlattenAllRequest):
+            await _execute_flatten_all(ibkr, risk_state, telegram, request.reason)
+            continue
+
+        if not isinstance(request, OrderRequest):
+            log.warning("order_worker: unknown request type %s", type(request))
+            continue
+
+        if not risk_state.allows(request):
+            log.warning("Risk check blocked: %s %s", request.side, request.ticker)
+            if risk_state._loss_limit_hit:
+                await telegram.send_silent(
+                    f"Daily loss limit hit — entries blocked. PnL: {risk_state.daily_pnl:.2f}"
+                )
+                # Auto-kill: flatten all open positions once when loss limit is hit
+                if CFG.risk.auto_kill_on_daily_loss and not risk_state._auto_kill_fired:
+                    risk_state._auto_kill_fired = True
+                    log.critical(
+                        "Auto-kill: daily loss limit hit — flattening all open positions"
+                    )
+                    order_queue.put_nowait(FlattenAllRequest(reason="auto_kill_daily_loss"))
+            continue
+
+        # Resolve qty for exit orders (sentinel qty=0)
+        if not request.is_entry and request.qty == 0:
+            pos = risk_state.open_positions.get(request.ticker)
+            if pos is None:
+                log.warning("Exit for %s but no open position tracked", request.ticker)
+                continue
+            request.qty = pos["qty"]
+
+        fill: Optional[Fill] = await ibkr.submit(request)
+        if fill is None:
+            log.warning("order_worker: no fill for %s %s — order timed out with zero fills",
+                        request.side, request.ticker)
+            continue
+
+        # Write fill records in explicit transaction (non-negotiable)
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                order_id = await _write_order(conn, fill, session_date)
+                await _update_position(conn, fill, order_id, session_date)
+
+        # Update risk state (only order_worker writes RiskState)
+        risk_state.record_fill(
+            fill.ticker, fill.side, fill.qty, fill.fill_price,
+            filled_qty=fill.filled_qty,
+        )
+
+        await _notify_fill(telegram, fill, risk_state)
+
+        log.info("Fill: %s %s %d/%d @ %.4f slippage=%.1fbps status=%s reason=%s",
+                 fill.ticker, fill.side, fill.filled_qty, fill.qty,
+                 fill.fill_price, fill.slippage_bps, fill.status, fill.exit_reason)
+
+
+async def _execute_flatten_all(
+    ibkr: IBKRClient,
+    risk_state: RiskState,
+    telegram,
+    reason: str,
+) -> None:
+    log.critical("FLATTEN ALL: reason=%s", reason)
+    await telegram.send_silent(f"CRITICAL: FLATTEN ALL triggered — {reason}")
+    await ibkr.cancel_all_orders()
+    await ibkr.flatten_all(risk_state)
+    await asyncio.sleep(10)
+    log.critical("FLATTEN ALL: complete")
+    await telegram.send_silent("FLATTEN ALL: complete — all positions should be flat")
+
+
+def _to_ns(dt) -> int:
+    return int(dt.timestamp() * 1e9)
+
+
+async def _write_order(conn, fill: Fill, session_date: date) -> int:
+    notional = fill.fill_price * fill.filled_qty
+    filled_ns = _to_ns(fill.filled_at)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO orders
+            (strategy_id, ticker, session_date, session_bucket,
+             submitted_ns, filled_ns, side, qty, order_type,
+             limit_price, fill_price, notional, status,
+             broker_order_id, signal_reason,
+             filled_qty, remaining_qty, expected_price, slippage_bps)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        RETURNING id
+        """,
+        CFG.strategy_id,
+        fill.ticker,
+        session_date,
+        fill.session_bucket,
+        fill.submitted_ns,
+        filled_ns,
+        fill.side,
+        fill.qty,
+        fill.order_type,
+        fill.limit_price,
+        fill.fill_price,
+        notional,
+        fill.status,
+        str(fill.ibkr_order_id),
+        fill.exit_reason,
+        fill.filled_qty,
+        fill.remaining_qty,
+        fill.expected_price if fill.expected_price > 0 else None,
+        fill.slippage_bps,
+    )
+    return row["id"]
+
+
+async def _update_position(conn, fill: Fill, order_id: int, session_date: date) -> None:
+    filled_ns = _to_ns(fill.filled_at)
+
+    if fill.is_entry:
+        # NOTE: entry is recorded in signal state optimistically before this fill confirms.
+        # If IBKR rejects, signal state briefly shows a phantom position until the
+        # next tick clears it (~IBKR round-trip latency, typically <1s).
+        # filled_qty is used (not qty) — partial fills get a smaller position.
+        await conn.execute(
+            """
+            INSERT INTO positions
+                (strategy_id, ticker, session_date, qty, avg_entry_price, open_ns)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT DO NOTHING
+            """,
+            CFG.strategy_id, fill.ticker, session_date,
+            fill.filled_qty, fill.fill_price, filled_ns,
+        )
+    else:
+        # Read entry data before deleting the position row
+        entry = await conn.fetchrow(
+            """
+            SELECT avg_entry_price, qty, open_ns FROM positions
+            WHERE strategy_id=$1 AND ticker=$2 AND session_date=$3
+            """,
+            CFG.strategy_id, fill.ticker, session_date,
+        )
+        if entry:
+            entry_price = entry["avg_entry_price"]
+            qty = entry["qty"]
+            open_ns = entry["open_ns"]
+            pnl_dollar = (fill.fill_price - entry_price) * qty
+            pnl_pct = (fill.fill_price - entry_price) / entry_price if entry_price > 0 else 0.0
+            hold_sec = (filled_ns - open_ns) / 1e9 if open_ns else None
+
+            await conn.execute(
+                "DELETE FROM positions WHERE strategy_id=$1 AND ticker=$2 AND session_date=$3",
+                CFG.strategy_id, fill.ticker, session_date,
+            )
+            await conn.execute(
+                """
+                INSERT INTO trades
+                    (strategy_id, ticker, session_date, session_bucket,
+                     exit_order_id, entry_ns, exit_ns, hold_sec,
+                     entry_price, exit_price, qty,
+                     pnl_pct, pnl_dollar,
+                     intraday_pct_at_entry, exit_reason)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                """,
+                CFG.strategy_id, fill.ticker, session_date, fill.session_bucket,
+                order_id,
+                open_ns, filled_ns, hold_sec,
+                entry_price, fill.fill_price, qty,
+                pnl_pct, pnl_dollar,
+                fill.intraday_pct,
+                fill.exit_reason,
+            )
+
+
+async def _notify_fill(telegram, fill: Fill, risk_state: RiskState) -> None:
+    partial_note = f" [partial {fill.filled_qty}/{fill.qty}]" if fill.status == "partial_cancelled" else ""
+    if fill.is_entry:
+        msg = (
+            f"ENTRY: {fill.ticker} BUY {fill.filled_qty} @ ${fill.fill_price:.2f} "
+            f"({fill.session_bucket}) slip={fill.slippage_bps:.1f}bps{partial_note}"
+        )
+    else:
+        msg = (
+            f"EXIT: {fill.ticker} SELL {fill.filled_qty} @ ${fill.fill_price:.2f} "
+            f"reason={fill.exit_reason} slip={fill.slippage_bps:.1f}bps{partial_note} "
+            f"| daily PnL: ${risk_state.daily_pnl:.2f}"
+        )
+    await telegram.send_silent(msg)

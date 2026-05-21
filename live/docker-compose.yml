@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: epg
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: epg_live
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U epg -d epg_live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  trading:
+    build:
+      context: ..
+      dockerfile: live/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: postgresql://epg:password@db:5432/epg_live
+      POLYGON_API_KEY: ${POLYGON_API_KEY}
+      # On Docker Desktop (Windows/Mac), IBKR_HOST must be host.docker.internal
+      # to reach TWS running on the host machine. Override in .env.
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      DATA_ROOT: ${DATA_ROOT:-/data}
+      SKIP_POSITION_CHECK: ${SKIP_POSITION_CHECK:-false}
+    volumes:
+      # Mount the external data directory so session exports land in the
+      # same filtered/ catalog the backtest pipeline reads.
+      # On Windows: set DATA_ROOT=D:/Trading Research/data in .env
+      - ${DATA_ROOT:-/data}:/data
+    # Startup sequence: migrate DB → warm Numba JIT → start main process.
+    # $$DB_URL — double-dollar escapes Compose interpolation; shell sees $DB_URL at runtime.
+    command:
+      - sh
+      - -c
+      - >-
+        psql $$DB_URL -f live/db/migrate_v1.sql &&
+        echo 'DB migration applied' &&
+        python -c 'from backtest.runner import _hawkes_replay_with_refit; print("Numba warmed")' &&
+        python -m live.main
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

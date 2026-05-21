@@ -7,7 +7,7 @@ from pathlib import Path
 
 # ── Root paths ──────────────────────────────────────────────────────────
 
-DATA_ROOT = Path(__file__).resolve().parents[3] / "data"
+DATA_ROOT = Path(__file__).resolve().parents[4] / "data"
 FILTERED_DIR = DATA_ROOT / "filtered"
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 

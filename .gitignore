@@ -18,6 +18,7 @@ htmlcov/
 venv/
 env/
 ENV/
+.env
 
 # OS generated files
 .DS_Store

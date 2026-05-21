@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data.schemas.mom_db import CONFIG_DIR, NS_PER_SECOND
 from data.loaders.trades import (
@@ -43,7 +43,7 @@ from data.loaders.prev_close import get_prev_close
 from core.ofi.trade_ofi import compute_trade_ofi
 from core.epg.anchor import EventAnchor
 from core.epg.gate import ParticipationGate, GateState
-from core.filters.setup_filter import run_setup_filter
+from backtest.setup_filter import run_setup_filter
 from core.exits.luld_proximity import LuldProximityExit, ProximityState
 from core.exits.reentry import ReentrySignal
 from core.hawkes.engine import hawkes_replay_fixed_beta
@@ -53,8 +53,8 @@ from core.hawkes.forgetting import fit_hawkes_forgetting, fit_online, HawkesPara
 # ── Constants ──────────────────────────────────────────────────────────
 
 PHASE_NAME = "scanner_epg_momentum"
-RESULTS_DIR = Path(__file__).resolve().parent.parent / "results" / "backtest"
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+RESULTS_DIR = Path(__file__).resolve().parent / "results" / "backtest"
+LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 EPG_K = 5
 EPG_TAU = 300.0

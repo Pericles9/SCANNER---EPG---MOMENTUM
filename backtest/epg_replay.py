@@ -28,7 +28,7 @@ from typing import Optional
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data.schemas.mom_db import CONFIG_DIR
 from data.loaders.trades import (

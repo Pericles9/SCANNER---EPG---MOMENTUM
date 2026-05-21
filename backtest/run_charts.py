@@ -25,13 +25,13 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backtest.charts import make_event_chart
 from backtest.epg_replay import replay_epg_for_event
 
 
-DEFAULT_BASE = Path(__file__).resolve().parent.parent / "results" / "backtest"
+DEFAULT_BASE = Path(__file__).resolve().parent / "results" / "backtest"
 
 
 def parse_args():

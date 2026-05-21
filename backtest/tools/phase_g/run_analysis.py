@@ -21,7 +21,7 @@ import pandas as pd
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from core.filters.setup_filter import _compute_setup_signals  # noqa: E402
+from backtest.setup_filter import _compute_setup_signals  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths
