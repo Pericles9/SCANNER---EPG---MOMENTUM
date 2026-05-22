@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import logging.handlers
 import os
+import signal
 import sys
 from datetime import date
 from pathlib import Path
@@ -12,6 +14,76 @@ from pathlib import Path
 from live.config import CFG
 from live.db.pool import close_pool, init_pool
 from live.db.writer import BatchWriter
+
+
+def validate_config() -> None:
+    """Abort immediately if any required environment variable is missing."""
+    required = [
+        "DB_URL",
+        "POLYGON_API_KEY",
+        "IBKR_HOST",
+        "IBKR_PORT",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "DATA_ROOT",
+    ]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+
+
+def _check_numba_cache() -> None:
+    """Clear stale Numba .nbi/.nbc files when @nb.njit source has changed."""
+    log = logging.getLogger(__name__)
+    backtest_dir = Path(__file__).parent.parent / "backtest"
+    if not backtest_dir.is_dir():
+        return
+
+    njit_files: list[Path] = []
+    for py_file in sorted(backtest_dir.rglob("*.py")):
+        try:
+            content = py_file.read_text(encoding="utf-8", errors="ignore")
+            if "@nb.njit" in content or "@numba.njit" in content:
+                njit_files.append(py_file)
+        except OSError:
+            pass
+
+    if not njit_files:
+        return
+
+    h = hashlib.sha256()
+    for f in njit_files:
+        h.update(f.read_bytes())
+    current_hash = h.hexdigest()
+
+    hash_file = backtest_dir / ".numba_cache_hash"
+    if hash_file.exists():
+        stored = hash_file.read_text().strip()
+        if stored == current_hash:
+            return
+        log.warning("Numba source changed — clearing stale cache files")
+        cleared = 0
+        for ext in ("*.nbi", "*.nbc"):
+            for f in backtest_dir.rglob(ext):
+                try:
+                    f.unlink()
+                    cleared += 1
+                except OSError:
+                    pass
+        log.info("Numba cache cleared: %d files removed", cleared)
+
+    hash_file.write_text(current_hash)
+
+
+async def _sentinel_heartbeat() -> None:
+    """Touch /tmp/epg_alive every 10s so Docker HEALTHCHECK can verify process is alive."""
+    sentinel = Path("/tmp/epg_alive")
+    while True:
+        try:
+            sentinel.touch()
+        except OSError:
+            pass
+        await asyncio.sleep(10)
 
 
 def _setup_logging() -> None:
@@ -65,6 +137,19 @@ async def _reconcile_positions(ibkr, risk_state, pool) -> bool:
             mismatches.append(ticker)
 
     if mismatches:
+        ibkr_summary = {t: ibkr_positions.get(t, (0, 0.0))[0] for t in mismatches}
+        db_summary = {t: db_positions.get(t, 0) for t in mismatches}
+        logging.critical(
+            "POSITION MISMATCH DETECTED\n"
+            "  Mismatched tickers : %s\n"
+            "  IBKR qty           : %s\n"
+            "  DB qty             : %s\n"
+            "  Resolution         : reconcile manually, then restart with SKIP_POSITION_CHECK=true\n"
+            "  Runbook            : docs/STARTUP_RECONCILIATION.md",
+            ", ".join(mismatches),
+            ibkr_summary,
+            db_summary,
+        )
         if skip:
             logging.warning(
                 "SKIP_POSITION_CHECK=true — %d mismatch(es) ignored, seeding IBKR as truth. "
@@ -82,9 +167,21 @@ async def _reconcile_positions(ibkr, risk_state, pool) -> bool:
 
 
 async def main() -> None:
+    validate_config()
     _setup_logging()
+    _check_numba_cache()
     log = logging.getLogger(__name__)
     log.info("EPG live system starting — strategy_id=%s", CFG.strategy_id)
+
+    # Register SIGTERM/SIGINT so Docker stop / Ctrl-C flushes cleanly.
+    # add_signal_handler is Linux-only; on Windows (dev) it raises NotImplementedError.
+    loop = asyncio.get_running_loop()
+    _shutdown = asyncio.Event()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _shutdown.set)
+        loop.add_signal_handler(signal.SIGINT, _shutdown.set)
+    except NotImplementedError:
+        pass
 
     # Check kill flag at startup
     kill_flag = Path(__file__).parent / "kill.flag"
@@ -215,24 +312,40 @@ async def main() -> None:
             name="pnl_reporter",
         ),
         asyncio.create_task(equity_refresher(), name="equity_refresher"),
+        asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
     ]
 
     await telegram.send_silent(
         f"EPG live system started — {session_date.isoformat()} — paper trading"
     )
 
+    async def _await_shutdown() -> None:
+        await _shutdown.wait()
+        raise SystemExit(0)
+
+    _shutdown_task = asyncio.create_task(_await_shutdown(), name="shutdown_signal")
+    all_tasks = tasks + [_shutdown_task]
+
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        # FIRST_EXCEPTION: block until any task raises (crash or SIGTERM sentinel)
+        done, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_EXCEPTION)
         for task in done:
-            exc = task.exception()
-            if exc:
-                log.critical("Task %s raised: %s", task.get_name(), exc, exc_info=exc)
+            if task is _shutdown_task:
+                log.info("Shutdown signal received — beginning clean shutdown")
+                continue
+            if not task.cancelled() and task.exception():
+                log.critical(
+                    "Task %s raised: %s", task.get_name(), task.exception(),
+                    exc_info=task.exception(),
+                )
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutdown signal received")
     finally:
-        for task in tasks:
+        for task in all_tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await writer.flush()
+        log.info("clean shutdown — buffer flushed")
         await close_pool()
         await ibkr.disconnect()
         log.info("EPG live system stopped")

@@ -17,4 +17,4 @@ COPY live/ live/
 
 ENV PYTHONPATH=/app:/app/backtest
 
-CMD ["sh", "-c", "python -c 'from backtest.runner import _hawkes_replay_with_refit; print(\"Numba warmed\")' && python -m live.main"]
+CMD ["sh", "-c", "python -c 'from backtest.runner import _hawkes_replay_with_refit; print(\"Numba warmed\")' && exec python -m live.main"]

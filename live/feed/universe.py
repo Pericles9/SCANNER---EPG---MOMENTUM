@@ -192,15 +192,53 @@ class UniverseManager:
             log.warning("%s: queue full, dropping tick", ticker)
 
     async def _ws_loop(self) -> None:
-        """Maintain Polygon WebSocket connection."""
+        """Maintain Polygon WebSocket connection with exponential backoff.
+
+        Backoff: 1 → 2 → 4 → 8 → 16 → 30s max.
+        Dead man's switch: if WS has been down > 60s with an open position,
+        enqueue FlattenAllRequest once to protect capital.
+        """
+        _WS_DISCONNECT_FLATTEN_S = 60.0
+        _MAX_BACKOFF_S = 30.0
+        delay = 1.0
+        _flatten_fired = False
+
         while True:
+            prev_last_msg_t = self._ws_last_msg_t[0]
             try:
                 await self._ws_connect_and_run()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("WebSocket error — reconnecting in 5s")
-                await asyncio.sleep(5)
+                # If new messages arrived during this attempt, WS was up — reset state
+                if self._ws_last_msg_t[0] > prev_last_msg_t:
+                    delay = 1.0
+                    _flatten_fired = False
+
+                down_secs = (
+                    time.monotonic() - self._ws_last_msg_t[0]
+                    if self._ws_last_msg_t[0] > 0
+                    else 0.0
+                )
+                log.exception(
+                    "WebSocket error — reconnecting in %.0fs (down %.0fs)", delay, down_secs
+                )
+
+                if (
+                    not _flatten_fired
+                    and down_secs >= _WS_DISCONNECT_FLATTEN_S
+                    and self._risk_state.open_positions
+                ):
+                    _flatten_fired = True
+                    log.critical(
+                        "WebSocket down %.0fs with open position — triggering flatten-all",
+                        down_secs,
+                    )
+                    from live.orders.risk import FlattenAllRequest
+                    self._order_queue.put_nowait(FlattenAllRequest(reason="ws_disconnect_60s"))
+
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _MAX_BACKOFF_S)
 
     async def _ws_connect_and_run(self) -> None:
         async with aiohttp.ClientSession() as session:

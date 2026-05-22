@@ -17,6 +17,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   trading:
     build:
@@ -44,6 +45,7 @@ services:
       - ${DATA_ROOT:-/data}:/data
     # Startup sequence: migrate DB → warm Numba JIT → start main process.
     # $$DB_URL — double-dollar escapes Compose interpolation; shell sees $DB_URL at runtime.
+    # exec replaces sh so Python becomes the direct child and receives SIGTERM from Docker.
     command:
       - sh
       - -c
@@ -51,8 +53,14 @@ services:
         psql $$DB_URL -f live/db/migrate_v1.sql &&
         echo 'DB migration applied' &&
         python -c 'from backtest.runner import _hawkes_replay_with_refit; print("Numba warmed")' &&
-        python -m live.main
+        exec python -m live.main
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/epg_alive && test $(( $(date +%s) - $(stat -c %Y /tmp/epg_alive) )) -lt 60"]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+      start_period: 60s
 
 volumes:
   postgres_data:

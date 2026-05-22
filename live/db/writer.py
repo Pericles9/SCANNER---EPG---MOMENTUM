@@ -43,6 +43,10 @@ class BatchWriter:
             await asyncio.sleep(interval)
             await self._flush()
 
+    async def flush(self) -> None:
+        """Flush remaining buffered records. Called on clean shutdown."""
+        await self._flush()
+
     async def _flush(self) -> None:
         # Swap buffers atomically
         ticks, self._ticks = self._ticks, []
