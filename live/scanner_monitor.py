@@ -1,8 +1,7 @@
-"""Scanner monitor (Process 1): polls Polygon gainers, applies peak-hours gate, feeds universe queue.
+"""Scanner monitor (Process 1): polls Polygon gainers, applies entry gate, feeds universe queue.
 
 Entry gate:
-    Q1+Q2 during peak hours only (09:30-11:30 ET, 14:00-16:00 ET).
-    Off-peak: nothing admitted. Rationale: target dominant movers during high-liquidity windows.
+    All quartiles Q1–Q4 admitted at all hours. One session per ticker per day.
 
 Ticker eligibility:
     Only CS (common stock) tickers on XNYS or XNAS pass pre-quartile classification.
@@ -85,13 +84,7 @@ def is_peak_hours(dt: Optional[datetime] = None) -> bool:
 
 
 def _evaluate_entry_gate(quartile: int, dt: Optional[datetime] = None) -> bool:
-    """Admit Q1+Q2 tickers during peak hours (09:30-11:30, 14:00-16:00 ET) only."""
-    if not is_peak_hours(dt):
-        log.debug("[Q1Q2-peak] gate: off-peak — rejecting all tickers")
-        return False
-    if quartile not in (1, 2):
-        log.debug("[Q1Q2-peak] gate: Q%d rejected (peak hours, but not Q1 or Q2)", quartile)
-        return False
+    """Admit all quartiles Q1–Q4 at all hours."""
     return True
 
 
@@ -189,7 +182,7 @@ async def scanner_loop(
     """Main scanner polling loop (Process 1).
 
     Polls Polygon gainers every poll_interval_s seconds.
-    [Q1Q2-peak] gate override: Q1+Q2 during peak hours only — see module docstring.
+    All quartiles Q1–Q4 admitted. One session per ticker per day.
     """
     closed_today: set[str] = set()
 
@@ -234,7 +227,7 @@ async def _poll_once(
         if not _evaluate_entry_gate(ctx.scanner_quartile, now_et):
             continue
         if ctx.ticker in closed_today:
-            log.debug("[Q1Q2-peak] gate: %s already closed today", ctx.ticker)
+            log.debug("[scanner] gate: %s already closed today", ctx.ticker)
             continue
         try:
             universe_queue.put_nowait((ctx.ticker, {
@@ -247,7 +240,7 @@ async def _poll_once(
                 "snapshot_ns": ctx.snapshot_ns,
             }))
             log.info(
-                "[Q1Q2-peak] queued %s Q%d %.1f%%",
+                "[scanner] queued %s Q%d %.1f%%",
                 ctx.ticker, ctx.scanner_quartile, ctx.pct_change,
             )
         except asyncio.QueueFull:

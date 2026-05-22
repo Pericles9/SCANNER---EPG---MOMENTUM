@@ -442,7 +442,7 @@ These are decided. If you think one is wrong, flag it — do not silently change
 
 | Decision | Value |
 |---|---|
-| Scanner gate | Q1 and Q2 during peak hours (09:30–11:30 and 14:00–16:00 ET). Off-peak: nothing admitted. Implemented in `scanner_monitor._evaluate_entry_gate`. |
+| Scanner gate | All quartiles Q1–Q4 admitted at all hours. One session per ticker per day. Implemented in `scanner_monitor._evaluate_entry_gate`. |
 | `scanner_heat` | Collected and stored. Not the entry gate. |
 | Setup filter threshold | Q̃ ≥ 0.65. Final. |
 | Warmup gate | Q̃ ≥ 0.75 for first 65 bars |
