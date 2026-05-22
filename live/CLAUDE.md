@@ -201,7 +201,7 @@ Two concurrent Polygon REST calls:
 | ≥ 1000 | Full replay — normal path |
 | 100–999 | Use global `lambda_ref` fallback. Log DEGRADED. EPG gate starts from zero state. |
 | < 100 | Proceed with caution. Log DEGRADED with count. |
-| Timeout (> 5s) | Global `lambda_ref` fallback. EPG from zero. Log DEGRADED. |
+| Timeout (> 10s) | Global `lambda_ref` fallback. EPG from zero. Log DEGRADED. |
 
 **Write to `sessions` table** on context fetch completion: `context_fetch_ms`, `cold_start_n`, `degraded_mode`, `lambda_ref_global`, `lambda_ref_fitted`, `mu_buy_fitted`, `mu_sell_fitted`.
 
@@ -442,7 +442,7 @@ These are decided. If you think one is wrong, flag it — do not silently change
 
 | Decision | Value |
 |---|---|
-| Scanner gate | `scanner_quartile` Q3 and Q4 only. Q1 and Q2 are not traded. |
+| Scanner gate | Q1 and Q2 during peak hours (09:30–11:30 and 14:00–16:00 ET). Off-peak: nothing admitted. Implemented in `scanner_monitor._evaluate_entry_gate`. |
 | `scanner_heat` | Collected and stored. Not the entry gate. |
 | Setup filter threshold | Q̃ ≥ 0.65. Final. |
 | Warmup gate | Q̃ ≥ 0.75 for first 65 bars |

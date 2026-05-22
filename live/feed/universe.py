@@ -36,6 +36,7 @@ class UniverseManager:
         hot_signal_events: list,
         hot_hawkes_refits: list,
         session_date: date,
+        telegram=None,
     ) -> None:
         self._order_queue = order_queue
         self._risk_state = risk_state
@@ -45,6 +46,7 @@ class UniverseManager:
         self._hot_signal_events = hot_signal_events
         self._hot_hawkes_refits = hot_hawkes_refits
         self._session_date = session_date
+        self._telegram = telegram
 
         self._universe: dict[str, TickerContext] = {}
         self._closed_today: set[str] = set()
@@ -197,20 +199,21 @@ class UniverseManager:
         Backoff: 1 → 2 → 4 → 8 → 16 → 30s max.
         Dead man's switch: if WS has been down > 60s with an open position,
         enqueue FlattenAllRequest once to protect capital.
+        Telegram alerts fire on first disconnect and on successful reconnect.
         """
         _WS_DISCONNECT_FLATTEN_S = 60.0
         _MAX_BACKOFF_S = 30.0
         delay = 1.0
         _flatten_fired = False
+        _disconnected: list[bool] = [False]
 
         while True:
             prev_last_msg_t = self._ws_last_msg_t[0]
             try:
-                await self._ws_connect_and_run()
+                await self._ws_connect_and_run(_disconnected)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # If new messages arrived during this attempt, WS was up — reset state
                 if self._ws_last_msg_t[0] > prev_last_msg_t:
                     delay = 1.0
                     _flatten_fired = False
@@ -223,6 +226,15 @@ class UniverseManager:
                 log.exception(
                     "WebSocket error — reconnecting in %.0fs (down %.0fs)", delay, down_secs
                 )
+
+                if not _disconnected[0]:
+                    _disconnected[0] = True
+                    if self._telegram is not None:
+                        asyncio.create_task(
+                            self._telegram.send_silent(
+                                f"Polygon WS disconnected — reconnecting (down {down_secs:.0f}s)"
+                            )
+                        )
 
                 if (
                     not _flatten_fired
@@ -240,7 +252,8 @@ class UniverseManager:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _MAX_BACKOFF_S)
 
-    async def _ws_connect_and_run(self) -> None:
+    async def _ws_connect_and_run(self, disconnected: list[bool]) -> None:
+        _reconnect_alerted = False
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(_POLYGON_WS_URL) as ws:
                 # Auth
@@ -261,6 +274,15 @@ class UniverseManager:
                                 ev = item.get("ev")
                                 if ev in ("T", "Q"):
                                     self._ws_last_msg_t[0] = time.monotonic()
+                                    if disconnected[0] and not _reconnect_alerted:
+                                        _reconnect_alerted = True
+                                        disconnected[0] = False
+                                        if self._telegram is not None:
+                                            asyncio.create_task(
+                                                self._telegram.send_silent(
+                                                    "Polygon WS reconnected — feed restored"
+                                                )
+                                            )
                                     await self._dispatch(item)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break

@@ -1,10 +1,8 @@
 """Scanner monitor (Process 1): polls Polygon gainers, applies peak-hours gate, feeds universe queue.
 
-Gate override (effective 2026-05-21):
-    This module gates entries on Q1+Q2 during peak hours only (09:30-11:30 ET, 14:00-16:00 ET).
-    This OVERRIDES the locked decision in live/CLAUDE.md which specifies Q3+Q4 only (Phase G v2).
-    Rationale: target dominant movers during high-liquidity windows.
-    CLAUDE.md is intentionally left unchanged — this override is documented here and in log lines only.
+Entry gate:
+    Q1+Q2 during peak hours only (09:30-11:30 ET, 14:00-16:00 ET).
+    Off-peak: nothing admitted. Rationale: target dominant movers during high-liquidity windows.
 
 Ticker eligibility:
     Only CS (common stock) tickers on XNYS or XNAS pass pre-quartile classification.
@@ -87,11 +85,7 @@ def is_peak_hours(dt: Optional[datetime] = None) -> bool:
 
 
 def _evaluate_entry_gate(quartile: int, dt: Optional[datetime] = None) -> bool:
-    """Gate override: Q1+Q2 during peak hours only.
-
-    [Q1Q2-peak] log tag marks all decisions made by this override gate.
-    Overrides locked CLAUDE.md decision (Q3+Q4 only from Phase G v2).
-    """
+    """Admit Q1+Q2 tickers during peak hours (09:30-11:30, 14:00-16:00 ET) only."""
     if not is_peak_hours(dt):
         log.debug("[Q1Q2-peak] gate: off-peak — rejecting all tickers")
         return False

@@ -86,6 +86,32 @@ async def _sentinel_heartbeat() -> None:
         await asyncio.sleep(10)
 
 
+async def _ibkr_watchdog(ibkr, telegram) -> None:
+    """Poll IBKR connection every 15s. Reconnect and alert via Telegram on failure."""
+    _log = logging.getLogger(__name__)
+    _down = False
+    while True:
+        await asyncio.sleep(15)
+        if ibkr.is_connected():
+            if _down:
+                _down = False
+                await telegram.send_silent("IBKR reconnected")
+            continue
+        if not _down:
+            _down = True
+            _log.critical("IBKR connection lost — attempting reconnect")
+            await telegram.send_silent("IBKR disconnected — attempting reconnect")
+        else:
+            _log.warning("IBKR still disconnected — retrying")
+        try:
+            await ibkr.connect()
+            _down = False
+            _log.info("IBKR reconnected successfully")
+            await telegram.send_silent("IBKR reconnected")
+        except Exception:
+            _log.exception("IBKR reconnect failed — will retry in 15s")
+
+
 def _setup_logging() -> None:
     log_dir = Path(CFG.logging.log_dir)
     log_dir.mkdir(exist_ok=True)
@@ -226,13 +252,13 @@ async def main() -> None:
     session_date = date.today()
     universe_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     order_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-    writer = BatchWriter()
 
-    # Shared hot buffers (signal_loop appends; writer flushes)
+    # Shared hot buffers: signal_loop appends, BatchWriter flushes (same list objects)
     hot_ticks: list = []
     hot_quotes: list = []
     hot_signal_events: list = []
     hot_hawkes_refits: list = []
+    writer = BatchWriter(hot_ticks, hot_quotes, hot_signal_events, hot_hawkes_refits)
 
     # Kill sequence callback
     async def kill_callback() -> None:
@@ -251,6 +277,7 @@ async def main() -> None:
         hot_signal_events=hot_signal_events,
         hot_hawkes_refits=hot_hawkes_refits,
         session_date=session_date,
+        telegram=telegram,
     )
 
     # Wire bot state (bot reads shared objects — never writes)
@@ -313,6 +340,7 @@ async def main() -> None:
         ),
         asyncio.create_task(equity_refresher(), name="equity_refresher"),
         asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
+        asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
     ]
 
     await telegram.send_silent(

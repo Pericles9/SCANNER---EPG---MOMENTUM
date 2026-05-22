@@ -74,7 +74,7 @@ async def _fetch_trades(
     url = _TRADES_URL.format(ticker=ticker)
     params = {
         "timestamp.gte": str(session_start_ns),
-        "limit": 50000,
+        "limit": 25000,
         "apiKey": api_key,
     }
     results = []
@@ -84,7 +84,7 @@ async def _fetch_trades(
             data = await resp.json()
         results.extend(data.get("results", []))
         next_url = data.get("next_url")
-        if not next_url or len(results) >= 100_000:
+        if not next_url or len(results) >= 25_000:
             break
         url = next_url + f"&apiKey={api_key}"
         params = {}
