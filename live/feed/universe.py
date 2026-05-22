@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import date
 
 import aiohttp
@@ -51,6 +52,9 @@ class UniverseManager:
 
         # WebSocket outbound queue
         self._ws_send_queue: asyncio.Queue = asyncio.Queue()
+
+        # Last WS message timestamp — mutable box for bot /status and /services
+        self._ws_last_msg_t: list[float] = [0.0]
 
     async def run(self, universe_queue: asyncio.Queue) -> None:
         """Start WebSocket + process universe_queue in parallel."""
@@ -218,6 +222,7 @@ class UniverseManager:
                             for item in json.loads(msg.data):
                                 ev = item.get("ev")
                                 if ev in ("T", "Q"):
+                                    self._ws_last_msg_t[0] = time.monotonic()
                                     await self._dispatch(item)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
@@ -228,6 +233,10 @@ class UniverseManager:
         while True:
             msg = await self._ws_send_queue.get()
             await ws.send_str(json.dumps(msg))
+
+    @property
+    def ws_last_msg_t(self) -> list[float]:
+        return self._ws_last_msg_t
 
     async def _heartbeat_loop(self) -> None:
         from live.feed.signal_loop import heartbeat_monitor

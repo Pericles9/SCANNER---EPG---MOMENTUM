@@ -113,6 +113,7 @@ class LiveSignalState:
 
         # Last Hawkes state — for i_entry recording at order fill
         self._last_imbalance: float = 0.5
+        self._last_lambda_hat: float = 0.0
 
     def freeze(self) -> None:
         """Freeze signal processing during LULD halt."""
@@ -236,10 +237,11 @@ class LiveSignalState:
             self._last_bar_minute = bar_minute
             self._recompute_setup_filter()
 
-        # Track imbalance for i_entry recording
+        # Track imbalance and intensity for bot readout
         lam_total = hawkes_state.lambda_buy + hawkes_state.lambda_sell
         if lam_total > 1e-10:
             self._last_imbalance = hawkes_state.lambda_sell / lam_total
+        self._last_lambda_hat = hawkes_state.lambda_hat
 
         # LULD proximity
         luld_result = self._luld.update(ts_ns, price, self._last_bid, self._last_ask)
@@ -490,3 +492,19 @@ class LiveSignalState:
     def current_imbalance(self) -> float:
         """Last computed I(t) — called by signal_loop to record i_entry."""
         return self._last_imbalance
+
+    @property
+    def last_lambda_hat(self) -> float:
+        return self._last_lambda_hat
+
+    @property
+    def last_lambda_ref(self) -> float:
+        return self._lambda_ref
+
+    @property
+    def last_price(self) -> float:
+        return self._sf_prices[-1] if self._sf_prices else 0.0
+
+    @property
+    def epg_gate_state(self) -> str:
+        return self._prev_gate_state.value

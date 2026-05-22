@@ -25,6 +25,7 @@ class TelegramBot:
         self._app: Optional[Application] = None
         self._kill_callback: Optional[Callable] = None
         self._status_callback: Optional[Callable] = None
+        self._bot_state = None
 
     async def send(self, message: str) -> None:
         await self._bot.send_message(chat_id=self._chat_id, text=message)
@@ -41,6 +42,9 @@ class TelegramBot:
     def register_status_callback(self, callback: Callable) -> None:
         self._status_callback = callback
 
+    def register_bot_state(self, state) -> None:
+        self._bot_state = state
+
     async def start_polling(self) -> None:
         """Start Telegram bot for /kill command handling."""
         if not self._kill_callback:
@@ -55,21 +59,11 @@ class TelegramBot:
             await update.message.reply_text("Kill switch activated — flattening all positions.")
             await self._kill_callback()
 
-        async def status_handler(update: Update, context) -> None:
-            if str(update.effective_chat.id) != self._chat_id:
-                return
-            if self._status_callback:
-                try:
-                    status_text = await self._status_callback()
-                    await update.message.reply_text(status_text)
-                except Exception:
-                    log.exception("Status callback failed")
-                    await update.message.reply_text("Status query failed — check logs.")
-            else:
-                await update.message.reply_text("Status not available.")
-
         self._app.add_handler(CommandHandler("kill", kill_handler))
-        self._app.add_handler(CommandHandler("status", status_handler))
+
+        if self._bot_state is not None:
+            from live.bot.bot import setup_bot_handlers
+            setup_bot_handlers(self._app, self._bot_state)
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling()

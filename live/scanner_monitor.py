@@ -34,6 +34,13 @@ from live.ticker_classifier import classify_ticker
 log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
+
+_last_poll_t: list[float] = [0.0]
+
+
+def get_last_poll_t() -> float:
+    """Return monotonic time of the last completed scanner poll."""
+    return _last_poll_t[0]
 _GAINERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers"
 
 # Peak trading windows (ET). Bounds: [start, end).
@@ -210,6 +217,7 @@ async def _poll_once(
     closed_today: set[str],
 ) -> None:
     contexts, record = await build_snapshot_context(http, api_key)
+    _last_poll_t[0] = time.monotonic()
 
     if record.n_qualifying > 0:
         pool = get_pool()

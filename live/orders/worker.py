@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date
+import time
+from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from live.config import CFG
 from live.db.pool import get_pool
@@ -12,6 +14,17 @@ from live.orders.ibkr import Fill, IBKRClient
 from live.orders.risk import FlattenAllRequest, OrderRequest, RiskState
 
 log = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+_ALERT_START_HOUR = 4   # 04:00 ET inclusive
+_ALERT_END_HOUR = 20    # 20:00 ET exclusive
+
+_last_wake_t: list[float] = [0.0]
+
+
+def get_last_wake_t() -> float:
+    """Return monotonic time of the last order_worker loop iteration."""
+    return _last_wake_t[0]
 
 
 async def order_worker(
@@ -23,6 +36,7 @@ async def order_worker(
 ) -> None:
     """Consume order_queue. Single writer to RiskState."""
     while True:
+        _last_wake_t[0] = time.monotonic()
         request = await order_queue.get()
 
         if isinstance(request, FlattenAllRequest):
@@ -211,3 +225,33 @@ async def _notify_fill(telegram, fill: Fill, risk_state: RiskState) -> None:
             f"| daily PnL: ${risk_state.daily_pnl:.2f}"
         )
     await telegram.send_silent(msg)
+
+
+async def hourly_pnl_alert(
+    risk_state: RiskState,
+    telegram,
+    universe: dict,
+) -> None:
+    """Send hourly P&L summary during trading hours (04:00–20:00 ET). Reads RiskState — never writes."""
+    while True:
+        await asyncio.sleep(3600)
+        now_et = datetime.now(_ET)
+        if not (_ALERT_START_HOUR <= now_et.hour < _ALERT_END_HOUR):
+            log.debug("hourly_pnl_alert: suppressed outside trading hours (%s ET)", now_et.strftime("%H:%M"))
+            continue
+
+        n_trades = len(risk_state._trade_history)
+        sign = "+" if risk_state.daily_pnl >= 0 else ""
+        lines = [f"Hourly P&L: {sign}${risk_state.daily_pnl:.2f} | trades: {n_trades}"]
+
+        for ticker, pos in risk_state.open_positions.items():
+            ctx = universe.get(ticker)
+            if ctx and ctx.signal_state:
+                cur_price = ctx.signal_state.last_price
+                unreal = (cur_price - pos["avg_cost"]) * pos["qty"]
+                u_sign = "+" if unreal >= 0 else ""
+                lines.append(f"  Open: {ticker} {u_sign}${unreal:.2f} unrealised")
+            else:
+                lines.append(f"  Open: {ticker}")
+
+        await telegram.send_silent("\n".join(lines))

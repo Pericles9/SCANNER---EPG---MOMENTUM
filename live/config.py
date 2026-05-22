@@ -109,6 +109,11 @@ class ExportConfig:
 
 
 @dataclass
+class TelegramConfig:
+    authorised_user_id: int
+
+
+@dataclass
 class Config:
     strategy_id: str
     display_name: str
@@ -125,6 +130,7 @@ class Config:
     database: DatabaseConfig
     logging: LoggingConfig
     export: ExportConfig
+    telegram: TelegramConfig
 
 
 def _find_sentinels(obj: dict, path: str = "") -> list[str]:
@@ -229,6 +235,9 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
         ),
         export=ExportConfig(
             enabled=raw["export"]["enabled"],
+        ),
+        telegram=TelegramConfig(
+            authorised_user_id=raw["telegram"]["authorised_user_id"],
         ),
     )
 

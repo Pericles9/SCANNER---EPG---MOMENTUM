@@ -178,6 +178,12 @@ class IBKRClient:
 
         return None
 
+    def is_connected(self) -> bool:
+        return self._ib.isConnected()
+
+    async def account_values(self) -> list:
+        return self._ib.accountValues()
+
     async def flatten_all(self, risk_state) -> None:
         """Market-sell all open positions immediately."""
         positions = self.get_open_positions()

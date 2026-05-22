@@ -143,13 +143,6 @@ async def main() -> None:
 
     telegram.register_kill_callback(kill_callback)
 
-    # Status callback for /status Telegram command
-    async def status_callback() -> str:
-        from live.cli import get_system_status
-        return await get_system_status(risk_state, pool)
-
-    telegram.register_status_callback(status_callback)
-
     # Universe manager (Process 2 — WebSocket + signal loops)
     from live.feed.universe import UniverseManager
     universe_mgr = UniverseManager(
@@ -163,18 +156,27 @@ async def main() -> None:
         session_date=session_date,
     )
 
-    # Order worker (Process 3)
-    from live.orders.worker import order_worker
+    # Wire bot state (bot reads shared objects — never writes)
+    from live.scanner_monitor import _last_poll_t as scanner_last_poll_t
+    from live.orders.worker import _last_wake_t as worker_last_wake_t
+    from live.bot.bot import BotState
+    bot_state = BotState(
+        universe=universe_mgr._universe,
+        closed_today=universe_mgr._closed_today,
+        risk_state=risk_state,
+        order_queue=order_queue,
+        pool=pool,
+        ibkr=ibkr,
+        polygon_api_key=os.environ["POLYGON_API_KEY"],
+        heartbeat=universe_mgr._heartbeat,
+        scanner_last_poll_t=scanner_last_poll_t,
+        ws_last_msg_t=universe_mgr.ws_last_msg_t,
+        worker_last_wake_t=worker_last_wake_t,
+    )
+    telegram.register_bot_state(bot_state)
 
-    # Hourly PnL reporter
-    async def pnl_reporter() -> None:
-        import asyncio as _asyncio
-        while True:
-            await _asyncio.sleep(3600)
-            await telegram.send_silent(
-                f"Hourly PnL: ${risk_state.daily_pnl:.2f} | "
-                f"open positions: {len(risk_state.open_positions)}"
-            )
+    # Order worker (Process 3)
+    from live.orders.worker import hourly_pnl_alert, order_worker
 
     # Account equity refresher — updates every 5 minutes for Kelly sizing
     async def equity_refresher() -> None:
@@ -208,7 +210,10 @@ async def main() -> None:
         asyncio.create_task(writer.run(), name="batch_writer"),
         asyncio.create_task(kill_flag_watcher(kill_callback), name="kill_watcher"),
         asyncio.create_task(telegram.start_polling(), name="telegram_bot"),
-        asyncio.create_task(pnl_reporter(), name="pnl_reporter"),
+        asyncio.create_task(
+            hourly_pnl_alert(risk_state, telegram, universe_mgr._universe),
+            name="pnl_reporter",
+        ),
         asyncio.create_task(equity_refresher(), name="equity_refresher"),
     ]
 
