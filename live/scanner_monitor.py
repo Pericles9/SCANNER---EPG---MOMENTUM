@@ -41,6 +41,7 @@ def get_last_poll_t() -> float:
 _GAINERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers"
 
 # Peak trading windows (ET). Bounds: [start, end).
+# Used when CFG.scanner.peak_hours_only is True.
 _PEAK_WINDOWS: list[tuple[dtime, dtime]] = [
     (dtime(9, 30), dtime(11, 30)),
     (dtime(14, 0), dtime(16, 0)),
@@ -84,7 +85,20 @@ def is_peak_hours(dt: Optional[datetime] = None) -> bool:
 
 
 def _evaluate_entry_gate(quartile: int, dt: Optional[datetime] = None) -> bool:
-    """Admit all quartiles Q1–Q4 at all hours."""
+    """Admit tickers according to config.
+
+    When CFG.scanner.peak_hours_only is True: Q1+Q2 during peak hours only
+    (09:30-11:30 and 14:00-16:00 ET); all else rejected.
+    When False: all quartiles Q1–Q4 admitted at all hours.
+    """
+    if not CFG.scanner.peak_hours_only:
+        return True
+    if not is_peak_hours(dt):
+        log.debug("[scanner] gate: off-peak — rejecting all tickers")
+        return False
+    if quartile not in (1, 2):
+        log.debug("[scanner] gate: Q%d rejected (peak hours, but not Q1 or Q2)", quartile)
+        return False
     return True
 
 

@@ -15,6 +15,7 @@ class ScannerConfig:
     poll_interval_s: int
     trade_quartiles: list
     collect_scanner_heat: bool
+    peak_hours_only: bool
 
 
 @dataclass
@@ -168,6 +169,7 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
             poll_interval_s=raw["scanner"]["poll_interval_s"],
             trade_quartiles=raw["scanner"]["trade_quartiles"],
             collect_scanner_heat=raw["scanner"]["collect_scanner_heat"],
+            peak_hours_only=raw["scanner"]["peak_hours_only"],
         ),
         context_fetch=ContextFetchConfig(
             session_start_et_hour=cf["session_start_et_hour"],
