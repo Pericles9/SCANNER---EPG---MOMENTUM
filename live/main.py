@@ -86,6 +86,23 @@ async def _sentinel_heartbeat() -> None:
         await asyncio.sleep(10)
 
 
+async def _session_close_scheduler(universe_mgr, order_queue, risk_state, telegram) -> None:
+    """Sleep until 20:00 ET each day, then run session-close sweep."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+    _log = logging.getLogger(__name__)
+    while True:
+        now_et = datetime.now(_ET)
+        target_et = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
+        if now_et >= target_et:
+            target_et += timedelta(days=1)
+        secs = (target_et - now_et).total_seconds()
+        _log.info("Session close scheduler: sleeping %.0fs until 20:00 ET", secs)
+        await asyncio.sleep(secs)
+        await universe_mgr.session_close(order_queue, risk_state, telegram)
+
+
 async def _ibkr_watchdog(ibkr, telegram) -> None:
     """Poll IBKR connection every 15s. Reconnect and alert via Telegram on failure."""
     _log = logging.getLogger(__name__)
@@ -319,7 +336,10 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(
             __import__("live.scanner_monitor", fromlist=["scanner_loop"]).scanner_loop(
-                universe_queue, os.environ["POLYGON_API_KEY"]
+                universe_queue,
+                os.environ["POLYGON_API_KEY"],
+                universe_mgr=universe_mgr,
+                closed_today=universe_mgr.closed_today,
             ),
             name="scanner_monitor",
         ),
@@ -341,6 +361,10 @@ async def main() -> None:
         asyncio.create_task(equity_refresher(), name="equity_refresher"),
         asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
         asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
+        asyncio.create_task(
+            _session_close_scheduler(universe_mgr, order_queue, risk_state, telegram),
+            name="session_close_scheduler",
+        ),
     ]
 
     await telegram.send_silent(

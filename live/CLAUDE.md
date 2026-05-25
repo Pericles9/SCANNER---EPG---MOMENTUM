@@ -163,13 +163,13 @@ def compute_scanner_context(qualifying: list[dict]) -> list[dict]:
 - Filter: `todaysChangePerc >= config.scanner.gap_threshold` (0.30).
 - Capture the **full qualifying snapshot** — not just the triggered ticker. All context fields require the full picture.
 - Call `compute_scanner_context()` on the full list.
-- **Gate: skip any ticker where `scanner_quartile` is 1 or 2. Do not pass to universe manager.**
+- **No quartile gate — all Q1–Q4 tickers are passed to the universe manager.** `scanner_quartile` is still computed, stored in `scanner_snapshots`, and recorded at entry on `trades` (research field).
 - Write full snapshot JSON to `scanner_snapshots` table (one row per poll that has ≥1 qualifying name).
-- For each ticker passing the gate: push `(ticker, scanner_context)` to the universe manager via a shared `asyncio.Queue`.
-- `closed_today` set: if ticker was closed this session, do not re-add. Check before pushing.
-- Log every gate rejection at DEBUG level with the quartile value.
+- Reconcile the universe **in both directions** each poll: (1) push every qualifying ticker to the universe manager (idempotent), (2) call `universe.handle_snapshot_dropoffs(qualifying_set)` to remove tickers absent from the snapshot that have no open position.
+- `closed_today` set: real session closes (EPG_CLOSE, EXIT_D, LULD, EOD, session_close) lock the ticker out for the day. `scanner_dropoff` removals do NOT add to `closed_today` — a ticker that bounces back into the snapshot can re-enter the universe.
+- Refresh `last_scanner_snapshot` on every poll so the `/scanner` bot command can read it.
 
-**Verify:** Run against Polygon. Confirm context fields compute correctly. Confirm Q1/Q2 tickers are dropped. Confirm snapshot writes to DB.
+**Verify:** Run against Polygon. Confirm context fields compute correctly. Confirm all quartiles pass. Confirm snapshot writes to DB. Confirm `/scanner` returns universe + snapshot block.
 
 ---
 
@@ -442,7 +442,7 @@ These are decided. If you think one is wrong, flag it — do not silently change
 
 | Decision | Value |
 |---|---|
-| Scanner gate | All quartiles Q1–Q4 admitted at all hours. One session per ticker per day. Implemented in `scanner_monitor._evaluate_entry_gate`. |
+| Scanner entry gate | `todaysChangePerc >= 0.30` — all quartiles traded. One session per ticker per day (scanner_dropoff removals are re-eligible if the ticker bounces back). Reconciliation runs both directions each poll. Implemented in `scanner_monitor._poll_once` + `universe.handle_snapshot_dropoffs`. |
 | `scanner_heat` | Collected and stored. Not the entry gate. |
 | Setup filter threshold | Q̃ ≥ 0.65. Final. |
 | Warmup gate | Q̃ ≥ 0.75 for first 65 bars |

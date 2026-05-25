@@ -162,12 +162,19 @@ class UniverseManager:
         log.info("%s: context fetch complete, signal loop started", ticker)
 
     async def remove_ticker(self, ticker: str, close_reason: str = "session_close") -> None:
-        """Remove ticker from universe. Order: pop → cancel → unsubscribe → export."""
+        """Remove ticker from universe. Order: pop → cancel → unsubscribe → export.
+
+        scanner_dropoff removals do NOT add to closed_today so the ticker can re-enter
+        if it bounces back into the qualifying snapshot on a later poll. All other
+        close reasons (session_close, EPG_CLOSE, EXIT_D, LULD, EOD, KILL) lock the
+        ticker out for the rest of the session.
+        """
         ctx = self._universe.pop(ticker, None)
         if ctx is None:
             return
-        ctx.closed_today = True
-        self._closed_today.add(ticker)
+        if close_reason != "scanner_dropoff":
+            ctx.closed_today = True
+            self._closed_today.add(ticker)
         ctx.task.cancel()
         await self._ws_send_queue.put({
             "action": "unsubscribe",
@@ -297,6 +304,58 @@ class UniverseManager:
     @property
     def ws_last_msg_t(self) -> list[float]:
         return self._ws_last_msg_t
+
+    @property
+    def closed_today(self) -> set:
+        return self._closed_today
+
+    async def handle_snapshot_dropoffs(self, qualifying_tickers: set) -> None:
+        """Remove universe tickers absent from the current scanner snapshot (no open position)."""
+        for ticker in list(self._universe.keys()):
+            if ticker not in qualifying_tickers and not self._risk_state.has_position(ticker):
+                log.info("[scanner] drop-off: %s not in snapshot — removing from universe", ticker)
+                await self.remove_ticker(ticker, close_reason="scanner_dropoff")
+
+    async def close_ws(self) -> None:
+        """Close the active Polygon WebSocket. _ws_loop will reconnect (idle if no tickers)."""
+        ws = self._current_ws
+        if ws is None or ws.closed:
+            return
+        try:
+            await ws.close()
+            log.info("Polygon WS: closed by session_close")
+        except Exception:
+            log.exception("Polygon WS close failed")
+
+    async def session_close(self, order_queue: asyncio.Queue, risk_state, telegram) -> None:
+        """20:00 ET daily session close: flatten, sweep universe, reset daily state, close WS."""
+        log.info("Session close: starting 20:00 ET sweep")
+
+        if risk_state.open_positions:
+            tickers = list(risk_state.open_positions.keys())
+            log.critical(
+                "Session close: %d open position(s) at 20:00 ET — force-flattening: %s",
+                len(tickers), tickers,
+            )
+            from live.orders.risk import FlattenAllRequest
+            order_queue.put_nowait(FlattenAllRequest(reason="session_close_20et"))
+
+        for ticker in list(self._universe.keys()):
+            await self.remove_ticker(ticker, close_reason="session_close")
+
+        self._closed_today.clear()
+        risk_state.daily_pnl = 0.0
+        risk_state._loss_limit_hit = False
+
+        await self.close_ws()
+
+        log.info("Session close complete. Universe cleared, closed_today reset, WS closed.")
+        if telegram is not None:
+            asyncio.create_task(
+                telegram.send_silent(
+                    "Session closed. Universe cleared. WS disconnected. Ready for 04:00 ET open."
+                )
+            )
 
     async def _heartbeat_loop(self) -> None:
         from live.feed.signal_loop import heartbeat_monitor

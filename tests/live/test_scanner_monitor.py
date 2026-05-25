@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from live.config import CFG
 from live.scanner_monitor import (
     ScannerContext,
     SnapshotRecord,
@@ -65,32 +66,49 @@ def test_is_peak_hours_post_close():
 
 
 # ── _evaluate_entry_gate ──────────────────────────────────────────────────────
+# Default (peak_hours_only=False) — all quartiles admitted at all hours.
 
-def test_entry_gate_q1_peak():
-    # Q1 during peak hours → admitted
+def test_entry_gate_q1_admitted_default():
     assert _evaluate_entry_gate(1, _et(10, 0)) is True
 
 
-def test_entry_gate_q2_peak():
-    # Q2 during peak hours → admitted
+def test_entry_gate_q2_admitted_default():
     assert _evaluate_entry_gate(2, _et(10, 0)) is True
 
 
-def test_entry_gate_q3_peak_rejected():
-    # Q3 during peak hours → rejected (only Q1+Q2 pass)
+def test_entry_gate_q3_admitted_default():
+    """Was previously rejected when peak_hours_only was True."""
+    assert _evaluate_entry_gate(3, _et(10, 0)) is True
+
+
+def test_entry_gate_q4_admitted_default():
+    assert _evaluate_entry_gate(4, _et(10, 0)) is True
+
+
+def test_entry_gate_q1_off_peak_admitted_default():
+    """No hours cap — Q1 admitted off-peak too."""
+    assert _evaluate_entry_gate(1, _et(12, 0)) is True
+
+
+# Legacy peak-hours mode (peak_hours_only=True) — Q1+Q2 only during 09:30-11:30 / 14:00-16:00.
+
+def test_legacy_q3_peak_rejected(monkeypatch):
+    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
     assert _evaluate_entry_gate(3, _et(10, 0)) is False
 
 
-def test_entry_gate_q4_peak_rejected():
+def test_legacy_q4_peak_rejected(monkeypatch):
+    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
     assert _evaluate_entry_gate(4, _et(10, 0)) is False
 
 
-def test_entry_gate_q1_off_peak_rejected():
-    # Q1 outside peak hours → rejected regardless of quartile
+def test_legacy_q1_off_peak_rejected(monkeypatch):
+    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
     assert _evaluate_entry_gate(1, _et(12, 0)) is False
 
 
-def test_entry_gate_q2_off_peak_rejected():
+def test_legacy_q2_off_peak_rejected(monkeypatch):
+    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
     assert _evaluate_entry_gate(2, _et(8, 0)) is False
 
 

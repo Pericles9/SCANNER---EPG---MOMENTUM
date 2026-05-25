@@ -285,6 +285,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*EPG Live Bot — Commands*\n"
         "/status    Session overview (≤25 lines)\n"
         "/universe  All tracked tickers and states\n"
+        "/scanner   Scanner snapshot + universe\n"
         "/position  Current open position detail\n"
         "/trades    Today's completed trades\n"
         "/risk      Risk state snapshot\n"
@@ -292,4 +293,102 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help      This message\n"
         "/kill      Kill switch — flatten all positions"
     )
+    await update.message.reply_text(text)
+
+
+def _format_scanner_response(state, now_et: datetime = None) -> str:
+    """Pure formatter for /scanner — returns the reply text. Testable without Telegram.
+
+    state must expose: universe (dict), closed_today (set), risk_state (with has_position),
+    ws_last_msg_t (list[float] — monotonic-time mutable box).
+    """
+    from live import scanner_monitor as sm
+    from live.feed import market_status as ms
+    if now_et is None:
+        now_et = datetime.now(_ET)
+    time_str = now_et.strftime("%H:%M:%S ET")
+
+    # Session-closed detection — prefer real Massive /v1/marketstatus/now state.
+    # Fall back to a clock check (4am–8pm ET) if the status cache hasn't been populated yet.
+    status = ms.get_last_market_status()
+    holidays = ms.get_upcoming_holidays()
+    today_et = now_et.date()
+
+    if status is not None:
+        if not status.is_tradable:
+            holiday_name = ms.today_holiday_name(holidays, today_et)
+            next_open = ms.next_open_date(holidays, today_et)
+            if holiday_name:
+                msg = f"📡 Scanner — closed for {holiday_name}."
+            else:
+                msg = f"📡 Scanner — session closed."
+            if next_open is not None:
+                msg += f" Next open: {next_open.strftime('%a %Y-%m-%d')} 04:00 ET."
+            return msg
+    else:
+        # Status not yet fetched — clock fallback
+        if now_et.hour < 4 or now_et.hour >= 20:
+            return f"📡 Scanner — session closed. Next open 04:00 ET."
+
+    snapshot = sm.get_last_scanner_snapshot()
+    snapshot_by_ticker = {s["ticker"]: s for s in snapshot}
+
+    universe_items = list(state.universe.items())
+    if not universe_items:
+        return (
+            f"📡 Scanner — {time_str}\n"
+            f"Universe: empty\n\n"
+            f"Scanner: {len(snapshot)} names on deck"
+        )
+
+    # Enrich universe rows with latest snapshot pct_change (fall back to scanner_context)
+    rows = []
+    for ticker, ctx in universe_items:
+        snap = snapshot_by_ticker.get(ticker)
+        sc = ctx.scanner_context or {}
+        if snap is not None:
+            pct = snap["pct_change"]
+            quartile = snap["quartile"]
+            rank = snap["rank"]
+        else:
+            pct = sc.get("pct_change", 0.0)
+            quartile = sc.get("scanner_quartile", 0)
+            rank = sc.get("scanner_rank", 0)
+        has_pos = state.risk_state.has_position(ticker)
+        rows.append((pct, ticker, quartile, rank, has_pos))
+
+    rows.sort(key=lambda r: -r[0])
+
+    lines = [
+        f"📡 Scanner — {time_str}",
+        f"Universe: {len(rows)} active",
+        "",
+    ]
+    for pct, ticker, quartile, rank, has_pos in rows:
+        pos_tag = "  [POSITION]" if has_pos else ""
+        lines.append(f"  {ticker:<6} {pct:+.0f}%  Q{quartile}  rank {rank}{pos_tag}")
+
+    # Scanner block — snapshot names not in universe
+    universe_set = set(state.universe.keys())
+    not_in_universe = [s for s in snapshot if s["ticker"] not in universe_set]
+    lines.append("")
+    if not_in_universe:
+        lines.append(f"Scanner (not in universe): {len(not_in_universe)} names")
+        shown = not_in_universe[:3]
+        inline = ", ".join(f"{s['ticker']} +{s['pct_change']:.0f}%" for s in shown)
+        if len(not_in_universe) > 3:
+            inline += f" ... (+{len(not_in_universe) - 3} more)"
+        lines.append(f"  {inline}")
+    else:
+        lines.append("Scanner: no other names on deck")
+
+    return "\n".join(lines)
+
+
+@authorised_only
+async def scanner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_debounced("scanner"):
+        return
+    state = _bot_state(context)
+    text = _format_scanner_response(state)
     await update.message.reply_text(text)

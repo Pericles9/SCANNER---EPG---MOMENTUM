@@ -25,6 +25,7 @@ import numpy as np
 
 from live.config import CFG
 from live.db.pool import get_pool
+from live.feed import market_status
 from live.scanner.context import compute_scanner_context
 from live.ticker_classifier import classify_ticker
 
@@ -34,10 +35,19 @@ _ET = ZoneInfo("America/New_York")
 
 _last_poll_t: list[float] = [0.0]
 
+# Most recent qualifying snapshot (all names passing >= gap_threshold). Bot /scanner reads this.
+# Each entry: {"ticker": str, "pct_change": float, "quartile": int, "rank": int, "n": int}
+last_scanner_snapshot: list[dict] = []
+
 
 def get_last_poll_t() -> float:
     """Return monotonic time of the last completed scanner poll."""
     return _last_poll_t[0]
+
+
+def get_last_scanner_snapshot() -> list[dict]:
+    """Return the most recent qualifying snapshot (read-only — do not mutate)."""
+    return last_scanner_snapshot
 _GAINERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers"
 
 # Peak trading windows (ET). Bounds: [start, end).
@@ -192,18 +202,21 @@ async def build_snapshot_context(
 async def scanner_loop(
     universe_queue: asyncio.Queue,
     polygon_api_key: str,
+    universe_mgr=None,
+    closed_today: Optional[set] = None,
 ) -> None:
     """Main scanner polling loop (Process 1).
 
     Polls Polygon gainers every poll_interval_s seconds.
     All quartiles Q1–Q4 admitted. One session per ticker per day.
     """
-    closed_today: set[str] = set()
+    if closed_today is None:
+        closed_today = set()
 
     async with aiohttp.ClientSession() as http:
         while True:
             try:
-                await _poll_once(http, universe_queue, polygon_api_key, closed_today)
+                await _poll_once(http, universe_queue, polygon_api_key, closed_today, universe_mgr)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -216,9 +229,26 @@ async def _poll_once(
     universe_queue: asyncio.Queue,
     api_key: str,
     closed_today: set[str],
+    universe_mgr=None,
 ) -> None:
+    # Refresh real market status (status every poll, holidays once per ET day)
+    await market_status.refresh(http, api_key)
+
     contexts, record = await build_snapshot_context(http, api_key)
     _last_poll_t[0] = time.monotonic()
+
+    # Refresh module-level snapshot for /scanner bot command
+    global last_scanner_snapshot
+    last_scanner_snapshot = [
+        {
+            "ticker": ctx.ticker,
+            "pct_change": ctx.pct_change,
+            "quartile": ctx.scanner_quartile,
+            "rank": ctx.scanner_rank,
+            "n": ctx.scanner_n,
+        }
+        for ctx in contexts
+    ]
 
     if record.n_qualifying > 0:
         pool = get_pool()
@@ -235,6 +265,11 @@ async def _poll_once(
                 record.heat_p75,
                 record.snapshot_json,
             )
+
+    # Scanner drop-off: remove tickers that fell out of the snapshot (no open position)
+    if universe_mgr is not None and contexts:
+        qualifying_tickers = {ctx.ticker for ctx in contexts}
+        await universe_mgr.handle_snapshot_dropoffs(qualifying_tickers)
 
     now_et = get_now_et()
     for ctx in contexts:
@@ -259,6 +294,11 @@ async def _poll_once(
             )
         except asyncio.QueueFull:
             log.warning("Universe queue full, dropped %s", ctx.ticker)
+
+    log.info(
+        "Scanner poll complete: %d qualifying, %d in snapshot, %d in closed_today",
+        record.n_qualifying, len(contexts), len(closed_today),
+    )
 
 
 def mark_closed(closed_today: set[str], ticker: str) -> None:

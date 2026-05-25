@@ -33,4 +33,5 @@ def setup_bot_handlers(app: Application, state: BotState) -> None:
     app.add_handler(CommandHandler("services", handlers.services))
     app.add_handler(CommandHandler("position", handlers.position))
     app.add_handler(CommandHandler("risk", handlers.risk))
+    app.add_handler(CommandHandler("scanner", handlers.scanner))
     app.add_handler(CommandHandler("help", handlers.help_cmd))
