@@ -69,6 +69,7 @@ class LuldConfig:
 @dataclass
 class OrderExecutionConfig:
     pre_market_limit_offset: float
+    extended_exit_offset: float
     rth_order_type: str
     unfilled_cancel_sec: float
 
@@ -209,6 +210,7 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
         ),
         order_execution=OrderExecutionConfig(
             pre_market_limit_offset=raw["order_execution"]["pre_market_limit_offset"],
+            extended_exit_offset=raw["order_execution"]["extended_exit_offset"],
             rth_order_type=raw["order_execution"]["rth_order_type"],
             unfilled_cancel_sec=raw["order_execution"]["unfilled_cancel_sec"],
         ),

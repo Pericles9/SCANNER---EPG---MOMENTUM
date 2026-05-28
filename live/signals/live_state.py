@@ -21,7 +21,7 @@ from core.hawkes.forgetting import HawkesParams, fit_online
 from live.config import CFG
 from live.orders.risk import OrderRequest
 from live.signals.context_fetch import ContextFetchResult
-from backtest.setup_filter import SetupFilterResult, run_setup_filter
+from backtest.setup_filter import SUSTAIN_BARS, SetupFilterResult, run_setup_filter
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ class SignalResult:
     q_tilde: Optional[float]
     order_signal: Optional[str]   # 'ENTRY', 'EXIT_D', 'LULD', 'EPG_CLOSE', or None
     is_trade: bool
+    disqualify: bool = False      # True → SF failed SUSTAIN_BARS consecutive bars; remove from universe
     side: Optional[int] = None                          # Lee-Ready: 0=BUY, 1=SELL (trades only)
     signal_events: list = field(default_factory=list)   # per-transition only; tuples for batch writer
     hawkes_refit_record: Optional[tuple] = None         # set when a refit fires
@@ -107,6 +108,10 @@ class LiveSignalState:
         # Scanner context
         self._intraday_pct: float = scanner_context.get("pct_change", 0.0) / 100.0
         self._scanner_context: dict = scanner_context
+
+        # Setup filter disqualifier state
+        self._sf_fail_bars: int = 0
+        self._sf_disqualified: bool = False
 
         # LULD freeze state
         self._luld_frozen: bool = False
@@ -192,8 +197,12 @@ class LiveSignalState:
         # Hawkes update
         hawkes_state: HawkesState = self._engine.update(t_sec, side)
 
-        # EventAnchor
-        t_ev = self._anchor.update(hawkes_state.lambda_hat, t_sec)
+        # EventAnchor — feed Hawkes left-limit total intensity (lam_buy + lam_sell).
+        # Must match historical replay in context_fetch.py:252 (same quantity, same units).
+        # Do NOT use hawkes_state.lambda_hat — that is the Snyder/EKF estimate, hard-clamped
+        # at exp(20) ≈ 4.85e8 (ekf.py:53), which saturates on millisecond inter-arrivals
+        # and fires T_event trivially. Backtest also uses lam_buy + lam_sell (runner.py:440).
+        t_ev = self._anchor.update(hawkes_state.lambda_total, t_sec)
         if t_ev is not None and self._gate.t_event is None:
             self._gate.activate(t_ev)
             events.append((
@@ -293,6 +302,8 @@ class LiveSignalState:
 
         self._prev_gate_state = gate_state
 
+        should_disqualify = self._sf_disqualified and not self._in_position
+
         return SignalResult(
             sip_timestamp=ts_ns,
             lambda_buy=hawkes_state.lambda_buy,
@@ -305,21 +316,26 @@ class LiveSignalState:
             side=side,
             signal_events=events,
             hawkes_refit_record=refit_record,
+            disqualify=should_disqualify,
         )
 
     def _lee_ready(self, price: float) -> int:
-        """0 = BUY, 1 = SELL. Last known quote; tick test if quote unavailable."""
+        """Lee-Ready classification. Convention: 1 = BUY, -1 = SELL — matches
+        backtest/core/hawkes/engine.py:84 (side == 1 → R_buy, else → R_sell)
+        and backtest/core/ofi/trade_ofi.py:149-152.
+        Last known quote; tick test if quote unavailable; default BUY when neither resolves.
+        """
         if self._last_bid is not None and self._last_ask is not None:
             if price >= self._last_ask:
-                return 0
-            if price <= self._last_bid:
                 return 1
+            if price <= self._last_bid:
+                return -1
         # Tick test fallback
         if self._sf_prices and price > self._sf_prices[-1]:
-            return 0
-        if self._sf_prices and price < self._sf_prices[-1]:
             return 1
-        return 0
+        if self._sf_prices and price < self._sf_prices[-1]:
+            return -1
+        return 1
 
     def _recompute_setup_filter(self) -> None:
         if not self._sf_ts:
@@ -337,6 +353,16 @@ class LiveSignalState:
             )
             self._current_sf_passes = sf.passes
             self._current_q_tilde = float(sf.q_tilde[-1]) if len(sf.q_tilde) > 0 else None
+            if sf.passes:
+                self._sf_fail_bars = 0
+            else:
+                self._sf_fail_bars += 1
+                if self._sf_fail_bars >= SUSTAIN_BARS and not self._sf_disqualified:
+                    self._sf_disqualified = True
+                    log.warning(
+                        "%s: SF disqualified — q̃ < %.2f for %d consecutive bars",
+                        self._ticker, 0.65, self._sf_fail_bars,
+                    )
         except Exception:
             log.exception("%s: setup filter recompute failed", self._ticker)
 
@@ -413,10 +439,6 @@ class LiveSignalState:
         if self._intraday_pct < CFG.scanner.gap_threshold:
             return None
 
-        # Setup filter
-        if not self._current_sf_passes:
-            return None
-
         return "ENTRY"
 
     def _check_exits(
@@ -488,6 +510,16 @@ class LiveSignalState:
     @property
     def scanner_context(self) -> dict:
         return self._scanner_context
+
+    @property
+    def last_bid(self) -> Optional[float]:
+        """Last known bid from quote stream. None until first Q.{ticker} arrives."""
+        return self._last_bid
+
+    @property
+    def last_ask(self) -> Optional[float]:
+        """Last known ask from quote stream. None until first Q.{ticker} arrives."""
+        return self._last_ask
 
     def current_imbalance(self) -> float:
         """Last computed I(t) — called by signal_loop to record i_entry."""

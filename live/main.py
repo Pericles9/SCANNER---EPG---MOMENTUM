@@ -235,10 +235,30 @@ async def main() -> None:
     # Init DB pool
     pool = await init_pool()
 
-    # Init IBKR
+    # Init IBKR — retry with backoff so the container survives a slow Gateway start
     from live.orders.ibkr import IBKRClient
     ibkr = IBKRClient()
-    await ibkr.connect()
+    _IBKR_MAX_ATTEMPTS = 12
+    _IBKR_RETRY_DELAY_S = 10
+    for _attempt in range(1, _IBKR_MAX_ATTEMPTS + 1):
+        try:
+            await ibkr.connect()
+            break
+        except Exception as _exc:
+            if _attempt == _IBKR_MAX_ATTEMPTS:
+                log.critical(
+                    "IBKR connection failed after %d attempts — aborting. "
+                    "Make sure IB Gateway is running and API port %s is open.",
+                    _IBKR_MAX_ATTEMPTS,
+                    os.environ.get("IBKR_PORT", "4002"),
+                )
+                await close_pool()
+                sys.exit(1)
+            log.warning(
+                "IBKR connect attempt %d/%d failed (%s) — retrying in %ds",
+                _attempt, _IBKR_MAX_ATTEMPTS, _exc, _IBKR_RETRY_DELAY_S,
+            )
+            await asyncio.sleep(_IBKR_RETRY_DELAY_S)
 
     # Init risk state
     from live.orders.risk import RiskState
@@ -313,6 +333,7 @@ async def main() -> None:
         scanner_last_poll_t=scanner_last_poll_t,
         ws_last_msg_t=universe_mgr.ws_last_msg_t,
         worker_last_wake_t=worker_last_wake_t,
+        session_date=session_date,
     )
     telegram.register_bot_state(bot_state)
 
@@ -332,17 +353,11 @@ async def main() -> None:
             except Exception:
                 log.exception("Failed to refresh account equity from IBKR")
 
-    # Launch all tasks
-    tasks = [
-        asyncio.create_task(
-            __import__("live.scanner_monitor", fromlist=["scanner_loop"]).scanner_loop(
-                universe_queue,
-                os.environ["POLYGON_API_KEY"],
-                universe_mgr=universe_mgr,
-                closed_today=universe_mgr.closed_today,
-            ),
-            name="scanner_monitor",
-        ),
+    # ── Phase A: launch infrastructure that triage depends on ──
+    # universe_mgr.run() establishes the WS connection so resumed tickers
+    # receive live ticks. order_worker processes triage close requests.
+    # Scanner is held back until triage completes.
+    infra_tasks = [
         asyncio.create_task(
             universe_mgr.run(universe_queue),
             name="universe_manager",
@@ -354,18 +369,51 @@ async def main() -> None:
         asyncio.create_task(writer.run(), name="batch_writer"),
         asyncio.create_task(kill_flag_watcher(kill_callback), name="kill_watcher"),
         asyncio.create_task(telegram.start_polling(), name="telegram_bot"),
+        asyncio.create_task(equity_refresher(), name="equity_refresher"),
+        asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
+        asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
+    ]
+
+    # ── Phase B: startup position triage ──
+    # Must complete before scanner polling so EPG_FAIL/UNRESOLVABLE positions
+    # are flattened (and PASS/INACTIVE positions are picked up by signal loops)
+    # before new entries pile in.
+    from live.startup_triage import startup_position_triage
+    try:
+        await startup_position_triage(
+            pool=pool,
+            ibkr=ibkr,
+            order_queue=order_queue,
+            universe_mgr=universe_mgr,
+            telegram=telegram,
+            session_date=session_date,
+            hot_signal_events=hot_signal_events,
+            risk_state=risk_state,
+        )
+    except Exception:
+        log.exception("startup_position_triage raised — continuing into scanner")
+
+    # ── Phase C: launch scanner + remaining tasks ──
+    runtime_tasks = [
+        asyncio.create_task(
+            __import__("live.scanner_monitor", fromlist=["scanner_loop"]).scanner_loop(
+                universe_queue,
+                os.environ["POLYGON_API_KEY"],
+                universe_mgr=universe_mgr,
+                closed_today=universe_mgr.closed_today,
+            ),
+            name="scanner_monitor",
+        ),
         asyncio.create_task(
             hourly_pnl_alert(risk_state, telegram, universe_mgr._universe),
             name="pnl_reporter",
         ),
-        asyncio.create_task(equity_refresher(), name="equity_refresher"),
-        asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
-        asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
         asyncio.create_task(
             _session_close_scheduler(universe_mgr, order_queue, risk_state, telegram),
             name="session_close_scheduler",
         ),
     ]
+    tasks = infra_tasks + runtime_tasks
 
     await telegram.send_silent(
         f"EPG live system started — {session_date.isoformat()} — paper trading"

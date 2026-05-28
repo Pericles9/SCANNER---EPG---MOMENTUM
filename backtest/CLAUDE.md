@@ -44,12 +44,19 @@ Inherited from the parent project — apply here without exception:
 ## Entry Stack
 
 ```
-Setup Filter (4-signal composite: range, volume, thinness, body conviction)
-    ↓ PASS
+Scanner (todaysChangePerc ≥ 30%)
+    ↓
 EPG rising edge (k=5, tau=300s, p=0.65, warmup=300s)
     ↓ PASS AND gap ≥ 30% (backtest: intraday_pct)
 ENTRY (LONG)
+Re-entry: EPG rising edge AND setup_filter.passes == True
 ```
+
+Setup filter (4-signal composite: range, volume, thinness, body conviction) roles:
+
+- **Removed from initial entry gate.** Computed but does not block first entry.
+- **Re-entry gate:** SF must be passing before a re-entry after EXIT_D.
+- **Continuous disqualifier (live only):** q̃ < 0.65 for 15 consecutive bars → remove ticker from universe.
 
 ## Exit Stack (first wins)
 

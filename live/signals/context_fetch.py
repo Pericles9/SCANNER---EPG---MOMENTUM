@@ -107,13 +107,21 @@ async def _fetch_bars(
 
 
 def _classify_sides(prices: np.ndarray) -> np.ndarray:
-    """Tick-direction classification: price up → BUY (0), down → SELL (1), flat → carry."""
-    sides = np.zeros(len(prices), dtype=np.int32)
+    """Tick-direction classification: price up → BUY (1), down → SELL (-1), flat → carry.
+
+    Convention: 1 = BUY, -1 = SELL — matches backtest/core/hawkes/engine.py:84
+    (side == 1 → R_buy, else → R_sell) and backtest/core/ofi/trade_ofi.py:149-152.
+    First tick defaults to BUY since there is no prior price to compare.
+    """
+    sides = np.empty(len(prices), dtype=np.int32)
+    if len(prices) == 0:
+        return sides
+    sides[0] = 1
     for i in range(1, len(prices)):
         if prices[i] > prices[i - 1]:
-            sides[i] = 0
-        elif prices[i] < prices[i - 1]:
             sides[i] = 1
+        elif prices[i] < prices[i - 1]:
+            sides[i] = -1
         else:
             sides[i] = sides[i - 1]
     return sides
@@ -249,8 +257,11 @@ async def fetch_context(
 
     prev_gate_state = GateState.INACTIVE
     for i in range(N):
-        lambda_hat_i = lam_buy_out[i] + lam_sell_out[i]
-        t_ev = anchor.update(lambda_hat_i, float(t_sec[i]))
+        # Invariant: historical and live must feed the same quantity to EventAnchor.
+        # Here: Hawkes left-limit total intensity. Live mirror: live_state.py uses
+        # hawkes_state.lambda_total (= lambda_buy + lambda_sell). Backtest: runner.py:440.
+        lambda_total_i = lam_buy_out[i] + lam_sell_out[i]
+        t_ev = anchor.update(lambda_total_i, float(t_sec[i]))
         if t_ev is not None and gate.t_event is None:
             gate.activate(t_ev)
         if gate.t_event is not None:

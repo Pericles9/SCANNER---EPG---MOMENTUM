@@ -40,7 +40,7 @@
 | Alerting | Telegram bot | Simple, mobile-native, free |
 | Kill switch | File-watch + Telegram command | See Section 11 |
 | Paper trading exit criteria | Industry standard (see Section 12) | |
-| Scanner heat filter | Q3 and Q4 only | G2: cold_Q1 PF=1.46, Q2 PF=2.48 — not traded. Only enter when scanner_heat is in the top 50% of historical heat distribution. Requires calibrated Q2/Q3 boundary threshold from Phase G data. |
+| Scanner heat filter | All quartiles (Q1–Q4) | scanner_quartile is computed and stored as analysis field only. No entry gate on quartile — all tickers with ≥30% gap enter. |
 | EXIT_D pre-market regression | Treat as survivorship bias artifact, ignore | PF drop 1.73→0.90 is not a reason to disable |
 | Data source | Polygon (maxed plan) | Everything: scanner, context fetch, live feed |
 | IBKR market data subs | Pay for NYSE + NASDAQ | For order execution quotes only, not primary feed |
@@ -131,7 +131,7 @@ GET /v2/snapshot/locale/us/markets/stocks/gainers
 
 Additional entry filters (pending Phase H validation — **not yet implemented**): minimum price, minimum pre-market volume, maximum float, rank gate, midday TOD exclusion.
 
-> **Decided filter — Scanner Heat Q3/Q4 only (G2):** After computing `scanner_heat` for the snapshot, skip the trigger entirely if `scanner_heat` falls below the calibrated Q2/Q3 boundary from Phase G. cold_Q1 (PF=1.46) and Q2 (PF=2.48) are not traded. The boundary value must be derived from the Phase G heat distribution and stored in strategy config.
+> **Scanner quartile gate removed:** `scanner_quartile` is computed and stored as an analysis field. All Q1–Q4 tickers with ≥30% gap are admitted to the universe. No entry gate on quartile.
 
 ### Process 2 — Feed + Signal
 
@@ -1045,7 +1045,7 @@ Heat = 75th percentile `pct_change` across all qualifying names at snapshot time
 
 Cold scanners (low overall momentum) produce PF=1.46. Hot scanners produce PF=2.62. The cold→Q2 step is the largest gap (+1.0 PF).
 
-> **Decided: only trade Q3 and Q4 heat environments.** cold_Q1 and Q2 are skipped at the scanner level. The Q2/Q3 boundary threshold must be calibrated from the Phase G heat distribution and stored in `strategy.json` as `scanner_heat_min_threshold`. Applied in the scanner monitor before the ticker is added to the universe.
+> **Scanner quartile gate removed:** All Q1–Q4 tickers with ≥30% gap are admitted. `scanner_quartile` retained as an analysis-only field in `sessions` and `trades` tables.
 
 ---
 

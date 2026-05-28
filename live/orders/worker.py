@@ -156,16 +156,21 @@ async def _update_position(conn, fill: Fill, order_id: int, session_date: date) 
     filled_ns = _to_ns(fill.filled_at)
 
     if fill.is_entry:
-        # NOTE: entry is recorded in signal state optimistically before this fill confirms.
-        # If IBKR rejects, signal state briefly shows a phantom position until the
-        # next tick clears it (~IBKR round-trip latency, typically <1s).
-        # filled_qty is used (not qty) — partial fills get a smaller position.
+        # Aggregate on second+ BUY for same (strategy, ticker, session). Weighted-average
+        # entry price; first-fill open_ns is preserved. The prior `ON CONFLICT DO NOTHING`
+        # silently dropped follow-on fills, leaving the DB position stuck at the first
+        # fill's qty while IBKR accumulated the full amount.
         await conn.execute(
             """
             INSERT INTO positions
                 (strategy_id, ticker, session_date, qty, avg_entry_price, open_ns)
             VALUES ($1,$2,$3,$4,$5,$6)
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (strategy_id, ticker, session_date) DO UPDATE
+                SET qty = positions.qty + EXCLUDED.qty,
+                    avg_entry_price = (
+                        positions.qty * positions.avg_entry_price
+                        + EXCLUDED.qty * EXCLUDED.avg_entry_price
+                    ) / (positions.qty + EXCLUDED.qty)
             """,
             CFG.strategy_id, fill.ticker, session_date,
             fill.filled_qty, fill.fill_price, filled_ns,

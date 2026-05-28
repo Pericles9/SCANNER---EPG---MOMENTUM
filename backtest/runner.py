@@ -395,9 +395,6 @@ def _process_event(args: dict) -> dict:
             session_start_ns=start_ns,
             session_end_ns=end_ns,
         )
-        if not sf.passes:
-            return {**base, "status": "skipped", "reason": "setup_filter_fail"}
-
         N = td.n_trades
 
         # ── 2. Lee-Ready sides ──
@@ -645,6 +642,12 @@ def _process_event(args: dict) -> dict:
                                         })
                                         reentry_sig.reset()
                                         waiting_for_reentry = False
+
+                            if not re_blocked:
+                                if not sf.passes:
+                                    reentry_sig.reset()
+                                    waiting_for_reentry = False
+                                    re_blocked = True
 
                             if not re_blocked:
                                 entry_price = float(td.prices[min(i + 1, N - 1)])

@@ -88,9 +88,14 @@ class IBKRClient:
         contract = Stock(request.ticker, "SMART", "USD")
         await self._ib.qualifyContractsAsync(contract)
 
-        if request.session_bucket == "pre_market":
+        # Extended hours (pre/post market) require limit orders with tif=EXT +
+        # outsideRth=True. Market orders are rejected outside RTH on IBKR.
+        if request.session_bucket in ("pre_market", "post_market"):
             if request.limit_price is None:
-                log.error("%s: pre-market order missing limit_price", request.ticker)
+                log.error(
+                    "%s: %s order missing limit_price (extended hours requires LMT)",
+                    request.ticker, request.session_bucket,
+                )
                 return None
             order = LimitOrder(
                 request.side,
@@ -183,6 +188,27 @@ class IBKRClient:
 
     async def account_values(self) -> list:
         return self._ib.accountValues()
+
+    async def snapshot_quote(self, ticker: str) -> tuple[float, float]:
+        """Return (bid, ask) snapshot from IBKR — execution source of truth.
+
+        Used by startup_position_triage to validate that a recovered position
+        is still tradable (price != (0, 0)). Returns (0.0, 0.0) on any failure
+        — caller treats that as "halted/suspended" and launches a watcher.
+        """
+        try:
+            contract = Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+            tickers = await self._ib.reqTickersAsync(contract)
+            if not tickers:
+                return (0.0, 0.0)
+            t = tickers[0]
+            bid = float(t.bid) if t.bid is not None and t.bid > 0 else 0.0
+            ask = float(t.ask) if t.ask is not None and t.ask > 0 else 0.0
+            return (bid, ask)
+        except Exception:
+            log.exception("IBKR snapshot_quote failed for %s", ticker)
+            return (0.0, 0.0)
 
     async def flatten_all(self, risk_state) -> None:
         """Market-sell all open positions immediately."""

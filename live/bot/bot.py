@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from telegram.ext import Application, CommandHandler
@@ -22,6 +23,7 @@ class BotState:
     scanner_last_poll_t: list   # [float] — mutable box
     ws_last_msg_t: list         # [float] — mutable box
     worker_last_wake_t: list    # [float] — mutable box
+    session_date: date = None
 
 
 def setup_bot_handlers(app: Application, state: BotState) -> None:
@@ -31,7 +33,8 @@ def setup_bot_handlers(app: Application, state: BotState) -> None:
     app.add_handler(CommandHandler("trades", handlers.trades))
     app.add_handler(CommandHandler("status", handlers.status))
     app.add_handler(CommandHandler("services", handlers.services))
-    app.add_handler(CommandHandler("position", handlers.position))
+    app.add_handler(CommandHandler("positions", handlers.positions))
     app.add_handler(CommandHandler("risk", handlers.risk))
     app.add_handler(CommandHandler("scanner", handlers.scanner))
     app.add_handler(CommandHandler("help", handlers.help_cmd))
+    app.add_handler(CommandHandler("reconcile", handlers.reconcile))

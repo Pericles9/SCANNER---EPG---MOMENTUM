@@ -65,7 +65,20 @@ class RiskState:
     ) -> None:
         actual_qty = filled_qty if filled_qty is not None else qty
         if side == "BUY":
-            self.open_positions[ticker] = {"qty": actual_qty, "avg_cost": fill_price}
+            # Aggregate with existing position (weighted-average cost). Without this,
+            # a second BUY on the same ticker silently overwrites the first, leaving
+            # phantom shares at IBKR that risk_state doesn't know about — which then
+            # under-sells on the SELL exit, leaking a partial position into the next
+            # session.
+            existing = self.open_positions.get(ticker)
+            if existing is None:
+                self.open_positions[ticker] = {"qty": actual_qty, "avg_cost": fill_price}
+            else:
+                new_qty = existing["qty"] + actual_qty
+                new_avg = (
+                    (existing["qty"] * existing["avg_cost"]) + (actual_qty * fill_price)
+                ) / new_qty
+                self.open_positions[ticker] = {"qty": new_qty, "avg_cost": new_avg}
         elif side == "SELL":
             pos = self.open_positions.pop(ticker, None)
             if pos:

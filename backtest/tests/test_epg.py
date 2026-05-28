@@ -454,5 +454,127 @@ class TestEPGIntegration:
         assert result_active2 == 2.0, "Active stock should fire at lambda_hat=9.0 (threshold=8.25)"
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Asymmetric Hysteresis Tests (p_open / p_close)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestParticipationGateAsymmetric:
+    """Tests for the p_open / p_close asymmetric hysteresis extension."""
+
+    def test_symmetric_case_reproduces_original_behavior(self):
+        """p_open == p_close == peak_threshold_p gives identical PASS/FAIL sequences."""
+        tau = 60.0
+        p = 0.65
+        warmup = 10.0
+        dv_seq = [5000.0] * 20 + [0.0] * 200 + [5000.0] * 30
+
+        # Reference gate (original symmetric behavior)
+        ref = ParticipationGate(half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup)
+        ref.activate(0.0)
+
+        # Asymmetric gate with p_open == p_close
+        asym = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup,
+            p_open=p, p_close=p,
+        )
+        asym.activate(0.0)
+
+        for i, dv in enumerate(dv_seq):
+            t = float(i + 1)
+            s_ref = ref.update(dv, t)
+            s_asym = asym.update(dv, t)
+            assert s_ref == s_asym, (
+                f"Mismatch at t={t}: ref={s_ref}, asym={s_asym}"
+            )
+
+    def test_fail_to_pass_boundary_uses_p_open(self):
+        """FAIL→PASS transition fires at p_open × peak, not at p_close × peak.
+
+        Uses τ=60s so that 10 half-lives (600s) brings lv to ~0.1% of peak,
+        well below p_close=0.30.  Then feeds controlled volume to push lv to a
+        level between p_close and p_open and verifies the gate stays FAIL.
+        """
+        tau = 60.0
+        p_open = 0.65
+        p_close = 0.30
+        decay_rate = math.log(2) / tau
+
+        gate = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p_open, warmup_seconds=0.0,
+            p_open=p_open, p_close=p_close,
+        )
+        gate.activate(0.0)
+
+        # Build a known peak at t=0
+        gate.update(100000.0, 0.0)
+        peak = gate.lambda_v_peak
+
+        # After 10 half-lives (600s), lv ≈ peak × 2^-10 ≈ 0.001 × peak
+        gate.update(0.0, 600.0)
+        lv_decayed = gate.lambda_v
+        assert lv_decayed < p_close * peak, (
+            f"After 10 half-lives lv/peak={lv_decayed/peak:.4f} should be < p_close={p_close}"
+        )
+        # At this point gate was PASS (opened at t=0), then PASS→FAIL crossed p_close
+        # after decay; gate is now in FAIL state.
+        state_fail = gate.update(0.0, 600.001)
+        assert state_fail == GateState.FAIL, "Gate must be FAIL after decay below p_close"
+
+        # Feed exactly enough volume to push lv to ~45% of peak
+        # (between p_close=0.30 and p_open=0.65 → gate must stay FAIL)
+        target_ratio = 0.45
+        target_lv = target_ratio * peak
+        # lv_new ≈ lv_decayed × exp(-decay_rate × tiny_dt) + dv × decay_rate
+        # For near-zero dt: lv_new ≈ dv × decay_rate → dv = target_lv / decay_rate
+        dv_target = target_lv / decay_rate
+        gate.update(dv_target, 600.002)
+        ratio_after = gate.lambda_v / gate.lambda_v_peak
+        assert p_close < ratio_after < p_open, (
+            f"Expected lv/peak between {p_close} and {p_open}, got {ratio_after:.4f}"
+        )
+
+        # Gate is FAIL and lv/peak < p_open — must stay FAIL
+        state = gate.update(0.0, 600.003)
+        assert state == GateState.FAIL, (
+            f"Gate must stay FAIL when lv/peak={ratio_after:.4f} < p_open={p_open}"
+        )
+
+    def test_pass_to_fail_boundary_uses_p_close(self):
+        """PASS→FAIL transition fires at p_close × peak; gate stays PASS above p_close."""
+        tau = 300.0
+        p_open = 0.65
+        p_close = 0.30
+        warmup = 0.0
+
+        gate = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p_open, warmup_seconds=warmup,
+            p_open=p_open, p_close=p_close,
+        )
+        gate.activate(0.0)
+
+        # Push into PASS state with high volume
+        gate.update(100000.0, 0.0)
+        peak = gate.lambda_v_peak
+        state = gate.update(100000.0, 0.001)
+        assert state == GateState.PASS, "Gate should open with high volume"
+
+        # Decay to ~50% of peak (between p_close=0.30 and p_open=0.65)
+        gate.update(0.0, tau)  # one half-life
+        lv = gate.lambda_v
+        ratio = lv / gate.lambda_v_peak
+        assert 0.30 < ratio < 0.65, f"Expected 0.30 < lv/peak < 0.65, got {ratio:.4f}"
+
+        # Gate must REMAIN PASS (lv/peak > p_close=0.30)
+        state = gate.update(0.0, tau + 0.001)
+        assert state == GateState.PASS, (
+            f"Gate must stay PASS at lv/peak={ratio:.3f} (> p_close={p_close})"
+        )
+
+        # Decay further to below p_close (many half-lives)
+        state_failed = gate.update(0.0, tau * 20.0)
+        assert state_failed == GateState.FAIL, "Gate must close when lv/peak falls below p_close"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

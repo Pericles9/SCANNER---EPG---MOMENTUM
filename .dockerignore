@@ -1,0 +1,60 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALLOWLIST .dockerignore — ignore everything, then re-include only what the
+#  Dockerfile copies. This prevents Docker from ever traversing the multi-GB
+#  backtest/results/ tree (the cause of multi-minute / hanging builds).
+#
+#  Dockerfile copies exactly two trees:  COPY backtest/ ...   COPY live/ ...
+#  Goal: build context stays under ~2 MB no matter how large results/ grows.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 1. Ignore everything at the context root. Docker will NOT descend into any
+#    top-level dir (data/, docs/, research/, archive/, inbox/, .venv/, .git/, …)
+#    unless re-included below. This is what keeps the build fast permanently.
+*
+
+# 2. Re-include only the two trees the image actually needs.
+!backtest
+!live
+
+# 3. Inside backtest/, drop everything the live runtime never imports.
+#    backtest/results/ is the 24 GB+ offender — excluding it means Docker
+#    never walks into it.
+backtest/results
+backtest/logs
+backtest/tests
+backtest/tools
+backtest/charts.py
+backtest/signal_charts.py
+backtest/run_charts.py
+backtest/phase_b_charts.py
+backtest/epg_replay.py
+
+# 4. Inside live/, drop runtime-generated logs and local sample data.
+live/logs
+live/data
+
+# 5. Belt-and-suspenders: heavy / never-needed file types anywhere inside the
+#    re-included trees (in case new ones appear under backtest/ or live/).
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.numba_cache_hash
+**/*.parquet
+**/*.pkl
+**/*.npy
+**/*.npz
+**/*.h5
+**/*.hdf5
+**/*.feather
+**/*.csv
+**/*.db
+**/*.sqlite
+**/*.html
+**/*.pdf
+**/*.log
+**/*.bak
+**/*.backup*
+
+# 6. Never bake secrets into an image.
+**/.env

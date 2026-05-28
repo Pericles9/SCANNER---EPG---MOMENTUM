@@ -32,6 +32,7 @@ async def signal_loop(
     hot_hawkes_refits: list,
     heartbeat: "HeartbeatMonitor",
     session_date: date,
+    disqualify_callback=None,
 ) -> None:
     """Per-ticker asyncio task. Blocks until context fetch completes."""
     await ctx.state_ready.wait()
@@ -77,6 +78,12 @@ async def signal_loop(
                 raw_msg.get("as"),
                 bkt,
             ))
+
+        if result.disqualify:
+            log.info("%s: SF disqualified — removing from universe", ticker)
+            if disqualify_callback is not None:
+                await disqualify_callback()
+            return
 
         if result.order_signal:
             price = raw_msg.get("p", 0.0)
@@ -138,6 +145,18 @@ def _build_order_request(
         )
 
     if signal in ("EXIT_D", "LULD", "EPG_CLOSE"):
+        limit_price: Optional[float] = None
+        expected_price = price
+        # Extended hours (pre or post market) cannot use market orders — IBKR will
+        # reject them. Build a liberal marketable limit using the last known bid.
+        if bkt in ("pre_market", "post_market"):
+            bid = (
+                ctx.signal_state.last_bid
+                if ctx.signal_state.last_bid is not None
+                else price - CFG.order_execution.extended_exit_offset
+            )
+            limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
+            expected_price = limit_price
         return OrderRequest(
             ticker=ticker,
             side="SELL",
@@ -145,8 +164,9 @@ def _build_order_request(
             session_bucket=bkt,
             is_entry=False,
             exit_reason=signal,
+            limit_price=limit_price,
             intraday_pct=ctx.signal_state.intraday_pct,
-            expected_price=price,
+            expected_price=expected_price,
         )
 
     return None

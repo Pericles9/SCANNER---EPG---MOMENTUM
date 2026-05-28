@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -207,44 +208,54 @@ async def services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @authorised_only
-async def position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show ALL open positions. Renamed from /position (which only showed the first)."""
     state = _bot_state(context)
     open_pos = state.risk_state.open_positions
 
     if not open_pos:
-        await update.message.reply_text("No open position.")
+        await update.message.reply_text("No open positions.")
         return
 
-    ticker = next(iter(open_pos))
-    pos = open_pos[ticker]
-    ctx = state.universe.get(ticker)
+    blocks: list[str] = []
+    total_unreal = 0.0
+    for ticker in sorted(open_pos):
+        pos = open_pos[ticker]
+        ctx = state.universe.get(ticker)
 
-    cur_price = 0.0
-    epg_gate = "?"
-    lambda_hat = 0.0
-    lambda_ref = 0.0
-    sc = {}
-    if ctx and ctx.signal_state:
-        ss = ctx.signal_state
-        cur_price = ss.last_price
-        epg_gate = ss.epg_gate_state
-        lambda_hat = ss.last_lambda_hat
-        lambda_ref = ss.last_lambda_ref
-        sc = ss.scanner_context
+        cur_price = 0.0
+        epg_gate = "?"
+        lambda_hat = 0.0
+        lambda_ref = 0.0
+        sc: dict = {}
+        if ctx and ctx.signal_state:
+            ss = ctx.signal_state
+            cur_price = ss.last_price
+            epg_gate = ss.epg_gate_state
+            lambda_hat = ss.last_lambda_hat
+            lambda_ref = ss.last_lambda_ref
+            sc = ss.scanner_context
 
-    # Entry ns from DB is nice but adds latency; derive hold from position open if available
-    block = format_position_block(
-        ticker=ticker,
-        avg_cost=pos["avg_cost"],
-        qty=pos["qty"],
-        entry_ns=None,
-        current_price=cur_price,
-        epg_gate=epg_gate,
-        lambda_hat=lambda_hat,
-        lambda_ref=lambda_ref,
-        scanner_context=sc,
+        blocks.append(format_position_block(
+            ticker=ticker,
+            avg_cost=pos["avg_cost"],
+            qty=pos["qty"],
+            entry_ns=None,
+            current_price=cur_price,
+            epg_gate=epg_gate,
+            lambda_hat=lambda_hat,
+            lambda_ref=lambda_ref,
+            scanner_context=sc,
+        ))
+        if cur_price > 0:
+            total_unreal += (cur_price - pos["avg_cost"]) * pos["qty"]
+
+    header = f"*POSITIONS — {len(open_pos)} open*"
+    sign = "+" if total_unreal >= 0 else ""
+    footer = f"\nCombined unrealised: {sign}${total_unreal:.2f}"
+    await update.message.reply_text(
+        header + "\n\n" + "\n\n".join(blocks) + footer
     )
-    await update.message.reply_text(block)
 
 
 @authorised_only
@@ -280,18 +291,112 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @authorised_only
+async def reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Diff risk_state.open_positions against IBKR. Remove stale positions (manually closed in IBKR)."""
+    log = logging.getLogger(__name__)
+    state = _bot_state(context)
+    ibkr = state.ibkr
+    risk_state = state.risk_state
+    pool = state.pool
+    session_date: date = state.session_date or date.today()
+
+    from live.config import CFG
+
+    try:
+        ibkr_positions = ibkr.get_open_positions()  # {ticker: (qty, avg_cost)}
+    except Exception as exc:
+        await update.message.reply_text(f"RECONCILE: failed to query IBKR — {exc}")
+        return
+
+    our_tickers = set(risk_state.open_positions)
+    ibkr_tickers = set(ibkr_positions)
+
+    # Positions we hold in our system but IBKR no longer has — manually closed externally
+    stale = our_tickers - ibkr_tickers
+    # Positions IBKR has that we don't know about — external/other strategy, report only
+    unknown = ibkr_tickers - our_tickers
+
+    removed: list[str] = []
+    errors: list[str] = []
+
+    for ticker in sorted(stale):
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        """
+                        SELECT avg_entry_price, qty, open_ns
+                        FROM positions
+                        WHERE strategy_id=$1 AND ticker=$2 AND session_date=$3
+                        """,
+                        CFG.strategy_id, ticker, session_date,
+                    )
+                    if row:
+                        now_ns = time.time_ns()
+                        await conn.execute(
+                            "DELETE FROM positions WHERE strategy_id=$1 AND ticker=$2 AND session_date=$3",
+                            CFG.strategy_id, ticker, session_date,
+                        )
+                        await conn.execute(
+                            """
+                            INSERT INTO trades
+                                (strategy_id, ticker, session_date,
+                                 entry_ns, exit_ns, hold_sec,
+                                 entry_price, exit_price, qty,
+                                 pnl_pct, pnl_dollar, exit_reason)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                            """,
+                            CFG.strategy_id, ticker, session_date,
+                            row["open_ns"], now_ns,
+                            (now_ns - row["open_ns"]) / 1e9 if row["open_ns"] else None,
+                            row["avg_entry_price"], None,
+                            row["qty"],
+                            None, None,
+                            "MANUAL_CLOSE_IBKR",
+                        )
+
+            # Remove from live risk state
+            risk_state.open_positions.pop(ticker, None)
+            removed.append(ticker)
+            log.warning("RECONCILE: removed stale position %s (MANUAL_CLOSE_IBKR)", ticker)
+
+        except Exception as exc:
+            errors.append(f"{ticker}: {exc}")
+            log.exception("RECONCILE: failed to remove %s", ticker)
+
+    lines = [f"*RECONCILE* — {session_date.isoformat()}"]
+
+    if removed:
+        lines.append(f"\nCleaned {len(removed)} manually-closed position(s):")
+        for t in removed:
+            lines.append(f"  {t} ← removed (MANUAL\\_CLOSE\\_IBKR)")
+    if unknown:
+        lines.append(f"\n{len(unknown)} IBKR position(s) not in this strategy:")
+        for t in sorted(unknown):
+            qty, avg = ibkr_positions[t]
+            lines.append(f"  {t} qty={qty} avg=${avg:.2f}")
+    if not removed and not unknown:
+        lines.append("\nAll positions in sync ✓")
+    if errors:
+        lines.append(f"\nErrors: {'; '.join(errors)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@authorised_only
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*EPG Live Bot — Commands*\n"
         "/status    Session overview (≤25 lines)\n"
         "/universe  All tracked tickers and states\n"
         "/scanner   Scanner snapshot + universe\n"
-        "/position  Current open position detail\n"
+        "/positions All open positions with unrealised PnL\n"
         "/trades    Today's completed trades\n"
         "/risk      Risk state snapshot\n"
-        "/services  Full service health probe\n"
-        "/help      This message\n"
-        "/kill      Kill switch — flatten all positions"
+        "/services   Full service health probe\n"
+        "/reconcile  Sync positions against IBKR (clears manual closes)\n"
+        "/help       This message\n"
+        "/kill       Kill switch — flatten all positions"
     )
     await update.message.reply_text(text)
 

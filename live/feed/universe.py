@@ -7,9 +7,11 @@ import logging
 import os
 import time
 from datetime import date
+from typing import Optional
 
 import aiohttp
 
+from backtest.setup_filter import SUSTAIN_BARS
 from live.config import CFG
 from live.feed.context import TickerContext
 from live.feed.signal_loop import HeartbeatMonitor, signal_loop
@@ -21,6 +23,22 @@ log = logging.getLogger(__name__)
 
 _POLYGON_WS_URL = "wss://socket.polygon.io/stocks"
 _TICKER_QUEUE_SIZE = 1000
+
+# Polygon stocks WebSocket sends `t` (SIP timestamp) in MILLISECONDS, but the
+# entire downstream signal stack (live_state.update_trade/update_quote,
+# _infer_session_bucket, signal_events.event_ns, ticks.sip_timestamp) was built
+# against /v3/trades REST which returns sip_timestamp in NANOSECONDS. Without
+# this conversion at the dispatch boundary, t_sec arithmetic goes catastrophically
+# negative (mixing 1.78e12 with session_start_ns ≈ 1.78e18), the gate stays
+# stuck in WARMUP for the entire session, and every entry gate fails silently.
+_WS_MS_TO_NS = 1_000_000
+
+
+def _normalize_ws_timestamps(item: dict) -> dict:
+    """Convert Polygon WS event timestamps from ms → ns in-place. Returns item."""
+    if "t" in item:
+        item["t"] = int(item["t"]) * _WS_MS_TO_NS
+    return item
 
 
 class UniverseManager:
@@ -58,6 +76,9 @@ class UniverseManager:
         # Last WS message timestamp — mutable box for bot /status and /services
         self._ws_last_msg_t: list[float] = [0.0]
 
+        # Active WS connection — assigned by _ws_connect_and_run, read by close_ws
+        self._current_ws: Optional[aiohttp.ClientWebSocketResponse] = None
+
     async def run(self, universe_queue: asyncio.Queue) -> None:
         """Start WebSocket + process universe_queue in parallel."""
         ws_task = asyncio.create_task(self._ws_loop())
@@ -76,7 +97,23 @@ class UniverseManager:
             item = await q.get()
             yield item
 
-    async def _add_ticker(self, ticker: str, scanner_ctx: dict) -> None:
+    async def add_ticker(
+        self,
+        ticker: str,
+        scanner_ctx: dict,
+        existing_position: Optional[dict] = None,
+    ) -> None:
+        """Public entrypoint. Adds a ticker either from a scanner trigger (no
+        existing_position) or from startup triage resuming a recovered IBKR
+        position (existing_position is a {qty, avg_cost, open_ns} dict)."""
+        await self._add_ticker(ticker, scanner_ctx, existing_position)
+
+    async def _add_ticker(
+        self,
+        ticker: str,
+        scanner_ctx: dict,
+        existing_position: Optional[dict] = None,
+    ) -> None:
         if ticker in self._universe:
             log.debug("Universe: %s already tracked", ticker)
             return
@@ -84,14 +121,17 @@ class UniverseManager:
             log.debug("Universe: %s already closed today", ticker)
             return
 
-        log.info("Universe: adding %s", ticker)
+        tag = " (resumed)" if existing_position is not None else ""
+        log.info("Universe: adding %s%s", ticker, tag)
         state_ready = asyncio.Event()
         queue: asyncio.Queue = asyncio.Queue(maxsize=_TICKER_QUEUE_SIZE)
 
         # Create placeholder LiveSignalState — will be replaced after context fetch
         # We start with a stub and replace on context fetch completion
         task = asyncio.create_task(
-            self._context_fetch_and_start(ticker, scanner_ctx, queue, state_ready)
+            self._context_fetch_and_start(
+                ticker, scanner_ctx, queue, state_ready, existing_position,
+            )
         )
 
         # Subscribe WebSocket
@@ -106,6 +146,7 @@ class UniverseManager:
         scanner_ctx: dict,
         queue: asyncio.Queue,
         state_ready: asyncio.Event,
+        existing_position: Optional[dict] = None,
     ) -> None:
         try:
             ctx_result = await fetch_context(
@@ -128,6 +169,30 @@ class UniverseManager:
             session_date=self._session_date,
         )
 
+        # If resuming from an existing position (startup triage), mark the state
+        # in_position so the signal loop dispatches to _check_exits, not _check_entry.
+        if existing_position is not None:
+            from live.startup_triage import _current_session_bucket
+            live_state.record_entry(
+                session_bkt=_current_session_bucket(),
+                i_entry=0.5,  # neutral — original i_entry was lost across restart
+            )
+            log.info(
+                "%s: resumed with existing position (qty=%d avg_cost=%.4f)",
+                ticker, existing_position.get("qty", 0),
+                existing_position.get("avg_cost", 0.0),
+            )
+
+        async def _sf_disqualify_callback() -> None:
+            await self.remove_ticker(ticker, "sf_disqualified")
+            if self._telegram is not None:
+                try:
+                    await self._telegram.send_silent(
+                        f"{ticker}: SF disqualified after {SUSTAIN_BARS} consecutive failing bars — removed from universe"
+                    )
+                except Exception:
+                    pass
+
         loop_task = asyncio.create_task(
             signal_loop(
                 ctx=TickerContext(
@@ -146,6 +211,7 @@ class UniverseManager:
                 hot_hawkes_refits=self._hot_hawkes_refits,
                 heartbeat=self._heartbeat,
                 session_date=self._session_date,
+                disqualify_callback=_sf_disqualify_callback,
             )
         )
 
@@ -263,6 +329,7 @@ class UniverseManager:
         _reconnect_alerted = False
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(_POLYGON_WS_URL) as ws:
+                self._current_ws = ws
                 # Auth
                 await ws.send_str(json.dumps({"action": "auth", "params": self._api_key}))
 
@@ -280,6 +347,7 @@ class UniverseManager:
                             for item in json.loads(msg.data):
                                 ev = item.get("ev")
                                 if ev in ("T", "Q"):
+                                    _normalize_ws_timestamps(item)
                                     self._ws_last_msg_t[0] = time.monotonic()
                                     if disconnected[0] and not _reconnect_alerted:
                                         _reconnect_alerted = True
@@ -295,6 +363,7 @@ class UniverseManager:
                             break
                 finally:
                     sender_task.cancel()
+                    self._current_ws = None
 
     async def _ws_sender(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         while True:
@@ -318,8 +387,10 @@ class UniverseManager:
 
     async def close_ws(self) -> None:
         """Close the active Polygon WebSocket. _ws_loop will reconnect (idle if no tickers)."""
+        if self._current_ws is None:
+            return
         ws = self._current_ws
-        if ws is None or ws.closed:
+        if ws.closed:
             return
         try:
             await ws.close()
