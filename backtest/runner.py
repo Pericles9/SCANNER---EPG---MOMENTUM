@@ -537,6 +537,7 @@ def _process_event(args: dict) -> dict:
         intraday_pct_at_entry = None
         entry_drawdown_from_high = 0.0
         entry_cvd_at_entry = 0.0
+        position_max_price: Optional[float] = None
 
         # Per-position EXIT_D state
         exit_d_disabled = False
@@ -844,6 +845,10 @@ def _process_event(args: dict) -> dict:
 
             else:
                 # ── In position: check exits in priority order ──
+                position_max_price = max(
+                    position_max_price if position_max_price is not None else entry_price,
+                    float(td.prices[i]),
+                )
                 exit_fired = False
 
                 # Priority 1: EXIT_D
@@ -899,6 +904,7 @@ def _process_event(args: dict) -> dict:
                                 "drawdown_from_window_high": entry_dwh,
                                 "current_window_high_at_entry": entry_cwh,
                                 "prior_window_peak_at_entry": entry_pwp,
+                                "max_price_during_hold": float(position_max_price) if position_max_price is not None else float(entry_price),
                             })
                             in_position = False
                             entry_idx = entry_price = entry_t_sec = None
@@ -906,6 +912,7 @@ def _process_event(args: dict) -> dict:
                             exit_d_disabled = False
                             dump_timer_start_ns = None
                             entry_dwh = entry_cwh = entry_pwp = None
+                            position_max_price = None
                             if reentry_enabled:
                                 waiting_for_reentry = True
                                 reentry_sig.reset()
@@ -959,6 +966,7 @@ def _process_event(args: dict) -> dict:
                             "drawdown_from_window_high": entry_dwh,
                             "current_window_high_at_entry": entry_cwh,
                             "prior_window_peak_at_entry": entry_pwp,
+                            "max_price_during_hold": float(position_max_price) if position_max_price is not None else float(entry_price),
                         })
                         in_position = False
                         entry_idx = entry_price = entry_t_sec = None
@@ -966,6 +974,7 @@ def _process_event(args: dict) -> dict:
                         exit_d_disabled = False
                         dump_timer_start_ns = None
                         entry_dwh = entry_cwh = entry_pwp = None
+                        position_max_price = None
                         exit_fired = True
 
                 # Priority 3: EPG window close
@@ -1010,6 +1019,7 @@ def _process_event(args: dict) -> dict:
                         "drawdown_from_window_high": entry_dwh,
                         "current_window_high_at_entry": entry_cwh,
                         "prior_window_peak_at_entry": entry_pwp,
+                        "max_price_during_hold": float(position_max_price) if position_max_price is not None else float(entry_price),
                     })
                     in_position = False
                     entry_idx = entry_price = entry_t_sec = None
@@ -1017,6 +1027,7 @@ def _process_event(args: dict) -> dict:
                     exit_d_disabled = False
                     dump_timer_start_ns = None
                     entry_dwh = entry_cwh = entry_pwp = None
+                    position_max_price = None
 
             prev_state = cur
 
@@ -1057,6 +1068,7 @@ def _process_event(args: dict) -> dict:
                 "drawdown_from_window_high": entry_dwh,
                 "current_window_high_at_entry": entry_cwh,
                 "prior_window_peak_at_entry": entry_pwp,
+                "max_price_during_hold": float(position_max_price) if position_max_price is not None else float(entry_price),
             })
 
         max_intraday_pct = float(

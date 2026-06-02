@@ -12,6 +12,11 @@ where dv_i = price_i * size_i (dollar volume of the trade).
 
 The running peak is causal: lambda_V_peak at time t = max(lambda_V[T_event:t]).
 The threshold ratchets up with each new peak — it never decreases.
+
+Peak cooling: when the gate has been in FAIL for >= m_cool_sec seconds, the running
+peak decays with half-life tau_cool_sec. This prevents the ratchet from locking out
+re-entry after a multi-leg move. Set m_cool_sec=0 to disable (default, no change to
+existing behavior).
 """
 from __future__ import annotations
 
@@ -43,6 +48,8 @@ class ParticipationGate:
         *,
         p_open: Optional[float] = None,
         p_close: Optional[float] = None,
+        m_cool_sec: float = 0.0,
+        tau_cool_sec: float = 120.0,
     ):
         """
         Parameters
@@ -60,11 +67,21 @@ class ParticipationGate:
         p_close : float, optional
             PASS→FAIL closing threshold fraction. Defaults to p_open.
             Must satisfy p_close <= p_open.
+        m_cool_sec : float
+            Minimum continuous FAIL duration (seconds) before peak cooling
+            activates. Set to 0 to disable cooling entirely (default).
+        tau_cool_sec : float
+            Half-life (seconds) of peak decay once cooling is active.
+            Ignored when m_cool_sec=0.
         """
         if half_life_seconds <= 0:
             raise ValueError(f"half_life must be positive, got {half_life_seconds}")
         if not (0 < peak_threshold_p <= 1.0):
             raise ValueError(f"peak_threshold_p must be in (0, 1], got {peak_threshold_p}")
+        if m_cool_sec < 0:
+            raise ValueError(f"m_cool_sec must be >= 0, got {m_cool_sec}")
+        if m_cool_sec > 0 and tau_cool_sec <= 0:
+            raise ValueError(f"tau_cool_sec must be positive when cooling enabled, got {tau_cool_sec}")
 
         _p_open = p_open if p_open is not None else peak_threshold_p
         _p_close = p_close if p_close is not None else _p_open
@@ -80,6 +97,8 @@ class ParticipationGate:
         self.p_open = _p_open
         self.p_close = _p_close
         self.warmup_seconds = warmup_seconds
+        self.m_cool_sec = m_cool_sec
+        self.tau_cool_sec = tau_cool_sec
 
         # Precompute decay constant: ln2 / tau
         self._decay_rate = LN2 / half_life_seconds
@@ -91,6 +110,12 @@ class ParticipationGate:
         self._last_timestamp: Optional[float] = None
         self._active = False
         self._in_pass: bool = False
+
+        # Peak cooling state
+        self._fail_start_ts: Optional[float] = None
+        self._cooling_active: bool = False
+        self._peak_at_cool_start: float = 0.0
+        self._cool_start_ts: Optional[float] = None
 
     @property
     def lambda_v(self) -> float:
@@ -135,6 +160,10 @@ class ParticipationGate:
         self._lambda_v_peak = 0.0
         self._last_timestamp = t_event
         self._active = True
+        self._fail_start_ts = None
+        self._cooling_active = False
+        self._peak_at_cool_start = 0.0
+        self._cool_start_ts = None
 
     def update(self, dollar_vol: float, timestamp: float, side: int = 0) -> GateState:
         """
@@ -170,23 +199,59 @@ class ParticipationGate:
         self._lambda_v = self._lambda_v * decay + dollar_vol * self._decay_rate
         self._last_timestamp = timestamp
 
-        # Update running peak (causal)
-        if self._lambda_v > self._lambda_v_peak:
-            self._lambda_v_peak = self._lambda_v
-
         # Check warmup
         time_since_t_event = timestamp - self._t_event
         if time_since_t_event < self.warmup_seconds:
+            # Still accumulate peak during warmup (normal path)
+            if self._lambda_v > self._lambda_v_peak:
+                self._lambda_v_peak = self._lambda_v
             return GateState.WARMUP
+
+        # Peak update and cooling logic (post-warmup only)
+        if self._in_pass:
+            # PASS: update peak normally; clear any lingering cooling state
+            self._fail_start_ts = None
+            self._cooling_active = False
+            if self._lambda_v > self._lambda_v_peak:
+                self._lambda_v_peak = self._lambda_v
+        elif self.m_cool_sec > 0:
+            # FAIL with cooling enabled: manage the fail timer and peak decay
+            if self._fail_start_ts is None:
+                self._fail_start_ts = timestamp
+            fail_duration = timestamp - self._fail_start_ts
+            if not self._cooling_active and fail_duration >= self.m_cool_sec:
+                self._cooling_active = True
+                self._peak_at_cool_start = self._lambda_v_peak
+                self._cool_start_ts = timestamp
+            if self._cooling_active:
+                cool_elapsed = timestamp - self._cool_start_ts
+                self._lambda_v_peak = self._peak_at_cool_start * math.exp(
+                    -LN2 * cool_elapsed / self.tau_cool_sec
+                )
+            else:
+                # Cooling not yet active — peak updates normally
+                # (In FAIL, λ_V < p_open * peak ≤ peak, so this is only
+                # reachable when building from zero on the very first tick.)
+                if self._lambda_v > self._lambda_v_peak:
+                    self._lambda_v_peak = self._lambda_v
+        else:
+            # FAIL with cooling disabled: update peak normally
+            if self._lambda_v > self._lambda_v_peak:
+                self._lambda_v_peak = self._lambda_v
 
         # Asymmetric hysteresis: FAIL→PASS at p_open, PASS→FAIL at p_close.
         # Symmetric when p_open == p_close (reproduces original behavior exactly).
         if self._in_pass:
             if self._lambda_v < self.p_close * self._lambda_v_peak:
                 self._in_pass = False
+                if self.m_cool_sec > 0:
+                    self._fail_start_ts = timestamp
+                    self._cooling_active = False
         else:
             if self._lambda_v >= self.p_open * self._lambda_v_peak:
                 self._in_pass = True
+                self._fail_start_ts = None
+                self._cooling_active = False
         return GateState.PASS if self._in_pass else GateState.FAIL
 
     def reset(self) -> None:
@@ -202,3 +267,7 @@ class ParticipationGate:
         self._last_timestamp = None
         self._active = False
         self._in_pass = False
+        self._fail_start_ts = None
+        self._cooling_active = False
+        self._peak_at_cool_start = 0.0
+        self._cool_start_ts = None

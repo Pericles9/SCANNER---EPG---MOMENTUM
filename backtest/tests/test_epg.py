@@ -576,5 +576,155 @@ class TestParticipationGateAsymmetric:
         assert state_failed == GateState.FAIL, "Gate must close when lv/peak falls below p_close"
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Peak Cooling Tests
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestPeakCooling:
+    """Tests for ParticipationGate peak cooling (m_cool_sec / tau_cool_sec)."""
+
+    def _gate(self, m_cool_sec, tau_cool_sec=120.0, warmup=0.0, tau=60.0, p_open=0.65, p_close=0.30):
+        return ParticipationGate(
+            half_life_seconds=tau,
+            peak_threshold_p=p_open,
+            warmup_seconds=warmup,
+            p_open=p_open,
+            p_close=p_close,
+            m_cool_sec=m_cool_sec,
+            tau_cool_sec=tau_cool_sec,
+        )
+
+    def test_no_cooling_when_fail_duration_below_threshold(self):
+        """Peak is preserved if FAIL duration < m_cool_sec."""
+        gate = self._gate(m_cool_sec=60.0, tau_cool_sec=30.0)
+        gate.activate(0.0)
+
+        # Build peak
+        gate.update(100000.0, 0.0)
+        peak_initial = gate.lambda_v_peak
+        assert peak_initial > 0
+
+        # Let gate transition to FAIL (decay below p_close)
+        gate.update(0.0, 300.0)  # many half-lives, gate is FAIL
+        peak_before_cool = gate.lambda_v_peak
+
+        # Advance only 30s (< m_cool_sec=60s) — peak must NOT decay
+        gate.update(0.0, 330.0)
+        assert gate.lambda_v_peak == pytest.approx(peak_before_cool), (
+            "Peak should not decay before m_cool_sec threshold is reached"
+        )
+
+    def test_peak_decays_after_m_cool_sec(self):
+        """Peak decays with half-life tau_cool_sec once cooling activates."""
+        tau_cool = 30.0
+        m_cool = 10.0
+        gate = self._gate(m_cool_sec=m_cool, tau_cool_sec=tau_cool)
+        gate.activate(0.0)
+
+        # Build peak
+        gate.update(100000.0, 0.0)
+        peak_start = gate.lambda_v_peak
+
+        # Drive to FAIL
+        gate.update(0.0, 500.0)  # peak is preserved but gate is FAIL
+        peak_at_fail = gate.lambda_v_peak
+
+        # Advance past m_cool_sec — cooling activates at t ≈ 500 + 10 = 510
+        t_cool_start = 500.0 + m_cool
+        gate.update(0.0, t_cool_start + 0.001)  # cooling just activated, negligible decay
+
+        # Advance exactly one tau_cool after cooling started — peak should halve
+        gate.update(0.0, t_cool_start + tau_cool)
+        expected_peak = peak_at_fail * 0.5
+        assert gate.lambda_v_peak == pytest.approx(expected_peak, rel=1e-3), (
+            f"After 1 cooling half-life: expected {expected_peak:.4f}, got {gate.lambda_v_peak:.4f}"
+        )
+
+    def test_pass_to_fail_to_pass_resets_cooling(self):
+        """After cooling-assisted FAIL→PASS, normal peak accumulation resumes."""
+        tau_cool = 10.0
+        m_cool = 5.0
+        gate = self._gate(m_cool_sec=m_cool, tau_cool_sec=tau_cool, p_open=0.65, p_close=0.30)
+        gate.activate(0.0)
+
+        # Build a large peak at t=0
+        gate.update(1_000_000.0, 0.0)
+        peak_original = gate.lambda_v_peak
+        assert peak_original > 0, "Peak must be positive after large trade"
+
+        # Gate is in PASS. Decay λ_V below p_close*peak in three explicit ticks:
+        #   t=200: PASS→FAIL transition (λ_V ≈ peak * 0.10, below p_close=0.30)
+        #   t=210: cooling activates (fail_duration=10s > m_cool=5s); cool_start=210
+        #   t=410: cool_elapsed=200s = 20 half-lives → peak ≈ peak_original * 2^-20 ≈ 0
+        gate.update(0.0, 200.0)   # PASS→FAIL; _fail_start_ts=200
+        assert gate._in_pass is False
+        gate.update(0.0, 210.0)   # fail_duration=10 >= m_cool=5 → activates cooling; cool_start=210
+        assert gate._cooling_active is True
+        gate.update(0.0, 410.0)   # cool_elapsed=200s ≈ 20 τ_cool half-lives
+        cooled_peak = gate.lambda_v_peak
+        assert cooled_peak < 0.001 * peak_original, (
+            f"Peak should be nearly zero after 20 cooling half-lives, got {cooled_peak:.6f}"
+        )
+
+        # Now send new volume: gate should re-open (λ_V will exceed cooled peak * p_open)
+        gate.update(100.0, 410.001)
+        state = gate.update(0.0, 410.002)
+        assert state == GateState.PASS, "Gate should reopen after peak cooled to near zero"
+
+        # Peak tracking resumes from current λ_V — confirm peak updates
+        peak_after_reopen = gate.lambda_v_peak
+        assert peak_after_reopen > 0
+
+    def test_m_cool_sec_zero_behavior_identical_to_no_cooling(self):
+        """m_cool_sec=0 gives byte-for-byte identical results to a gate without cooling params."""
+        tau = 60.0
+        p = 0.65
+        warmup = 5.0
+        dv_seq = [5000.0] * 15 + [0.0] * 100 + [5000.0] * 20
+
+        ref = ParticipationGate(half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup)
+        ref.activate(0.0)
+
+        cooled = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup,
+            m_cool_sec=0.0, tau_cool_sec=60.0,
+        )
+        cooled.activate(0.0)
+
+        for i, dv in enumerate(dv_seq):
+            t = float(i + 1)
+            s_ref = ref.update(dv, t)
+            s_cool = cooled.update(dv, t)
+            assert s_ref == s_cool, (
+                f"Mismatch at t={t}: no-cooling={s_ref}, m_cool=0={s_cool}"
+            )
+            assert ref.lambda_v_peak == pytest.approx(cooled.lambda_v_peak), (
+                f"Peak mismatch at t={t}: {ref.lambda_v_peak} vs {cooled.lambda_v_peak}"
+            )
+
+    def test_cooling_not_active_during_pass(self):
+        """Cooling state is cleared when gate is in PASS."""
+        gate = self._gate(m_cool_sec=5.0, tau_cool_sec=10.0)
+        gate.activate(0.0)
+
+        gate.update(100000.0, 0.0)
+
+        # In PASS — feed volume to stay PASS
+        for t in range(1, 10):
+            gate.update(1000.0, float(t))
+            assert not gate._cooling_active, "Cooling must not activate while gate is in PASS"
+            assert gate._fail_start_ts is None, "_fail_start_ts must be None in PASS"
+
+    def test_invalid_cooling_params(self):
+        """Constructor rejects negative m_cool_sec and non-positive tau_cool_sec when enabled."""
+        with pytest.raises(ValueError):
+            ParticipationGate(300.0, 0.65, m_cool_sec=-1.0)
+        with pytest.raises(ValueError):
+            ParticipationGate(300.0, 0.65, m_cool_sec=30.0, tau_cool_sec=0.0)
+        with pytest.raises(ValueError):
+            ParticipationGate(300.0, 0.65, m_cool_sec=30.0, tau_cool_sec=-5.0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

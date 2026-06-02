@@ -1,7 +1,6 @@
 """
-Gate variants for Phase EPG-GRT.
+Gate variants for Phase EPG-GRT and EPG-OPT2.
 
-Four structurally distinct gate classes alongside the existing ParticipationGate.
 All implement the same interface: .activate(t_event), .update(dollar_vol, timestamp, side),
 .reset().  The side argument is +1=buy, -1=sell, 0=unknown.
 
@@ -10,12 +9,16 @@ Variants:
   HawkesCumulativeGate    (C) — slow arrival-rate kernel (buy+sell) vs μ_background
   HawkesBuySideGate       (D) — slow arrival-rate kernel (buy-only) vs μ_buy
   BurstRatioGate          (E) — fast/slow EMA ratio; fires at volume inflection point
+  SlopeGate               (F) — opens on λ_V acceleration; two sub-variants:
+                                 F_ss (slope open / slope close)
+                                 F_sl (slope open / level close)
 """
 from __future__ import annotations
 
 import logging
 import math
-from typing import List, Optional
+from collections import deque
+from typing import Deque, List, Optional, Tuple
 
 from core.epg.gate import GateState
 
@@ -398,3 +401,212 @@ class BurstRatioGate:
     @property
     def burst_ratio(self) -> float:
         return self._lambda_v_fast / max(self._lambda_v_slow, self._EPS)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Variant F — SlopeGate
+# ══════════════════════════════════════════════════════════════════════
+
+class SlopeGate:
+    """
+    Variant F: opens when λ_V is *accelerating* rather than when it crosses a level.
+
+    Core signal:
+        slope_V(t) = (λ_V(t) − λ_V(t − L_sec)) / L_sec
+        norm_slope(t) = slope_V(t) / λ_V_ref
+
+    λ_V_ref is the cold-start background dollar volume rate (mu_buy + mu_sell in
+    dollar-volume units). L_sec is the lookback distance in seconds.
+
+    Two sub-variants controlled by mode parameter:
+
+    F_ss (mode='ss') — slope open, slope close:
+        FAIL → PASS: norm_slope ≥ k_open
+        PASS → FAIL: norm_slope < k_close
+        Dead band: k_close ≤ norm_slope < k_open → hold current state
+
+    F_sl (mode='sl') — slope open, level close:
+        FAIL → PASS: norm_slope ≥ k_open
+        PASS → FAIL: λ_V(t) < p_close × running_peak
+        Running peak resets on each FAIL→PASS transition.
+        Dead band applies only to open transition.
+
+    In both modes, norm_slope is undefined (FAIL returned) until L_sec seconds of
+    history are available after activation. The lookback buffer holds (timestamp, λ_V)
+    pairs; stale entries are pruned on each update.
+    """
+
+    def __init__(
+        self,
+        tau_sec: float,
+        L_sec: float,
+        k_open: float,
+        mode: str = "ss",
+        k_close: float = -1.0,
+        p_close: float = 0.35,
+        lambda_v_ref: float = 1.0,
+        warmup_seconds: float = WARMUP_DURATION_SEC,
+    ):
+        """
+        Parameters
+        ----------
+        tau_sec : float
+            Half-life (seconds) for the underlying λ_V EMA.
+        L_sec : float
+            Lookback distance (seconds) for slope computation.
+        k_open : float
+            Normalised slope threshold for FAIL→PASS transition.
+        mode : str
+            'ss' = slope open / slope close; 'sl' = slope open / level close.
+        k_close : float
+            Normalised slope threshold for PASS→FAIL in mode='ss'. Must be < k_open.
+            Ignored when mode='sl'.
+        p_close : float
+            Level-close fraction of running peak in mode='sl'. Must be in (0, 1].
+            Ignored when mode='ss'.
+        lambda_v_ref : float
+            Background dollar volume rate used to normalise slope. Must be > 0.
+        warmup_seconds : float
+            Duration of WARMUP period after T_event.
+        """
+        if tau_sec <= 0:
+            raise ValueError(f"tau_sec must be positive, got {tau_sec}")
+        if L_sec <= 0:
+            raise ValueError(f"L_sec must be positive, got {L_sec}")
+        if mode not in ("ss", "sl"):
+            raise ValueError(f"mode must be 'ss' or 'sl', got {mode!r}")
+        if mode == "ss" and k_close >= k_open:
+            raise ValueError(
+                f"k_close ({k_close}) must be < k_open ({k_open}) in mode='ss'"
+            )
+        if mode == "sl" and not (0 < p_close <= 1.0):
+            raise ValueError(f"p_close must be in (0, 1], got {p_close}")
+        if lambda_v_ref <= 0:
+            raise ValueError(f"lambda_v_ref must be positive, got {lambda_v_ref}")
+
+        self.tau_sec = tau_sec
+        self.L_sec = L_sec
+        self.k_open = k_open
+        self.mode = mode
+        self.k_close = k_close
+        self.p_close = p_close
+        self.lambda_v_ref = lambda_v_ref
+        self.warmup_seconds = warmup_seconds
+
+        self._decay_rate = LN2 / tau_sec
+
+        # Gate state
+        self._lambda_v: float = 0.0
+        self._t_event: Optional[float] = None
+        self._last_timestamp: Optional[float] = None
+        self._active: bool = False
+        self._in_pass: bool = False
+
+        # Lookback buffer: deque of (timestamp, lambda_v)
+        self._buf: Deque[Tuple[float, float]] = deque()
+
+        # Level-close (F_sl) running peak
+        self._lambda_v_peak: float = 0.0
+
+    def activate(self, t_event: float) -> None:
+        self._t_event = t_event
+        self._last_timestamp = t_event
+        self._lambda_v = 0.0
+        self._lambda_v_peak = 0.0
+        self._active = True
+        self._in_pass = False
+        self._buf.clear()
+
+    def update(self, dollar_vol: float, timestamp: float, side: int = 0) -> GateState:
+        if not self._active or self._t_event is None:
+            return GateState.INACTIVE
+
+        dt = max(0.0, timestamp - self._last_timestamp)
+        decay = math.exp(-self._decay_rate * dt)
+        self._lambda_v = self._lambda_v * decay + dollar_vol * self._decay_rate
+        self._last_timestamp = timestamp
+
+        # Append current (timestamp, lambda_v) to lookback buffer
+        self._buf.append((timestamp, self._lambda_v))
+
+        # Prune: remove entries from the front as long as the SECOND entry also
+        # predates the cutoff. This always keeps buf[0] as the most recent entry
+        # with ts ≤ cutoff — necessary for computing lv_past with irregular ticks.
+        cutoff = timestamp - self.L_sec
+        while len(self._buf) > 1 and self._buf[1][0] <= cutoff:
+            self._buf.popleft()
+
+        # Check warmup
+        if timestamp - self._t_event < self.warmup_seconds:
+            return GateState.WARMUP
+
+        # buf[0] is the most recent entry at or before cutoff (after pruning).
+        # If it is still newer than cutoff, we don't have enough history.
+        if len(self._buf) == 0 or self._buf[0][0] > cutoff:
+            return GateState.FAIL
+        lv_past = self._buf[0][1]
+
+        norm_slope = (self._lambda_v - lv_past) / (self.L_sec * max(self.lambda_v_ref, 1e-9))
+
+        if self.mode == "ss":
+            return self._update_ss(norm_slope)
+        else:
+            return self._update_sl(norm_slope)
+
+    def _update_ss(self, norm_slope: float) -> GateState:
+        """slope open / slope close with dead band."""
+        if self._in_pass:
+            if norm_slope < self.k_close:
+                self._in_pass = False
+            # else: hold (dead band or above k_close)
+        else:
+            if norm_slope >= self.k_open:
+                self._in_pass = True
+            # else: hold (below k_open)
+        return GateState.PASS if self._in_pass else GateState.FAIL
+
+    def _update_sl(self, norm_slope: float) -> GateState:
+        """slope open / level close."""
+        if self._in_pass:
+            # Update running peak
+            if self._lambda_v > self._lambda_v_peak:
+                self._lambda_v_peak = self._lambda_v
+            # Level close: λ_V < p_close × running_peak
+            if self._lambda_v_peak > 0 and self._lambda_v < self.p_close * self._lambda_v_peak:
+                self._in_pass = False
+                self._lambda_v_peak = 0.0
+        else:
+            # Open on slope ≥ k_open
+            if norm_slope >= self.k_open:
+                self._in_pass = True
+                self._lambda_v_peak = self._lambda_v
+        return GateState.PASS if self._in_pass else GateState.FAIL
+
+    def reset(self) -> None:
+        self._lambda_v = 0.0
+        self._lambda_v_peak = 0.0
+        self._t_event = None
+        self._last_timestamp = None
+        self._active = False
+        self._in_pass = False
+        self._buf.clear()
+
+    @property
+    def lambda_v(self) -> float:
+        return self._lambda_v
+
+    @property
+    def lambda_v_peak(self) -> float:
+        """Running peak (used only in F_sl mode)."""
+        return self._lambda_v_peak
+
+    @property
+    def norm_slope(self) -> float:
+        """Most recently computed normalised slope (0.0 if buffer insufficient)."""
+        if not self._buf or self._last_timestamp is None:
+            return 0.0
+        cutoff = self._last_timestamp - self.L_sec
+        if self._buf[0][0] > cutoff:
+            return 0.0
+        lv_past = self._buf[0][1]
+        return (self._lambda_v - lv_past) / (self.L_sec * max(self.lambda_v_ref, 1e-9))
