@@ -91,13 +91,18 @@ async def signal_loop(
                 ctx, result.order_signal, price, bkt, raw_msg, risk_state
             )
             if req is not None:
+                if result.order_signal != "ENTRY":
+                    # Attach fill callbacks so order_worker can confirm exit state.
+                    # record_exit() flips _in_position=False only after broker confirms.
+                    # clear_exit_pending() re-arms exit signals if the order fails.
+                    req.on_fill_confirmed = ctx.signal_state.record_exit
+                    req.on_fill_failed = ctx.signal_state.clear_exit_pending
                 order_queue.put_nowait(req)
                 if result.order_signal == "ENTRY":
-                    # Optimistic: record entry before fill confirms (EXIT_D gating must start)
                     ctx.signal_state.record_entry(bkt, ctx.signal_state.current_imbalance())
                 else:
-                    # Optimistic exit reset: enables re-entry in a future EPG window
-                    ctx.signal_state.record_exit()
+                    # Mark exit in-flight: keeps _in_position=True, suppresses duplicate signals.
+                    ctx.signal_state.signal_exit()
 
         heartbeat.update(ticker)
 
@@ -126,13 +131,8 @@ def _build_order_request(
 
     if signal == "ENTRY":
         qty = risk_state.compute_position_size(price, bkt)
-        limit_price = None
-        if bkt == "pre_market":
-            ask = raw_msg.get("ap") or (price + CFG.order_execution.pre_market_limit_offset)
-            limit_price = round(ask + CFG.order_execution.pre_market_limit_offset, 2)
-            expected_price = limit_price
-        else:
-            expected_price = price  # market order — last trade is best estimate
+        ask = raw_msg.get("ap") or (price + CFG.order_execution.pre_market_limit_offset)
+        limit_price = round(ask + CFG.order_execution.pre_market_limit_offset, 2)
         return OrderRequest(
             ticker=ticker,
             side="BUY",
@@ -141,22 +141,16 @@ def _build_order_request(
             is_entry=True,
             limit_price=limit_price,
             intraday_pct=ctx.signal_state.intraday_pct,
-            expected_price=expected_price,
+            expected_price=limit_price,
         )
 
     if signal in ("EXIT_D", "LULD", "EPG_CLOSE"):
-        limit_price: Optional[float] = None
-        expected_price = price
-        # Extended hours (pre or post market) cannot use market orders — IBKR will
-        # reject them. Build a liberal marketable limit using the last known bid.
-        if bkt in ("pre_market", "post_market"):
-            bid = (
-                ctx.signal_state.last_bid
-                if ctx.signal_state.last_bid is not None
-                else price - CFG.order_execution.extended_exit_offset
-            )
-            limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
-            expected_price = limit_price
+        bid = (
+            ctx.signal_state.last_bid
+            if ctx.signal_state.last_bid is not None
+            else price - CFG.order_execution.extended_exit_offset
+        )
+        limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
         return OrderRequest(
             ticker=ticker,
             side="SELL",
@@ -166,7 +160,7 @@ def _build_order_request(
             exit_reason=signal,
             limit_price=limit_price,
             intraday_pct=ctx.signal_state.intraday_pct,
-            expected_price=expected_price,
+            expected_price=limit_price,
         )
 
     return None

@@ -147,10 +147,16 @@ async def startup_position_triage(
         elif outcome == "watching":
             watching.append(pos.ticker)
 
-    # Approximate unrealised P&L at triage time using IBKR mid (or avg cost if unknown)
+    # Approximate unrealised P&L — fire all snapshot_quote calls concurrently
+    quotes = await asyncio.gather(
+        *(ibkr.snapshot_quote(pos.ticker) for pos in positions),
+        return_exceptions=True,
+    )
     total_unreal = 0.0
-    for pos in positions:
-        bid, ask = await ibkr.snapshot_quote(pos.ticker)
+    for pos, q in zip(positions, quotes):
+        if isinstance(q, Exception):
+            continue
+        bid, ask = q
         if bid > 0 or ask > 0:
             mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else (bid or ask)
             total_unreal += (mid - pos.avg_entry_price) * pos.qty
@@ -517,15 +523,13 @@ def _build_close_request(
     from the positions table. For extended hours, set a liberal limit price
     so the order actually fills.
     """
-    limit_price: Optional[float] = None
-    expected_price = bid if bid > 0 else (ask if ask > 0 else pos.avg_entry_price)
-    if bkt in ("pre_market", "post_market"):
-        bid_ref = bid if bid > 0 else (
-            ask - CFG.order_execution.extended_exit_offset if ask > 0
-            else pos.avg_entry_price
-        )
-        limit_price = round(bid_ref - CFG.order_execution.extended_exit_offset, 2)
-        expected_price = limit_price
+    # Always use a limit price — submit() requires one for all session buckets.
+    bid_ref = bid if bid > 0 else (
+        ask - CFG.order_execution.extended_exit_offset if ask > 0
+        else pos.avg_entry_price
+    )
+    limit_price = round(max(0.01, bid_ref - CFG.order_execution.extended_exit_offset), 2)
+    expected_price = limit_price
     return OrderRequest(
         ticker=pos.ticker,
         side="SELL",

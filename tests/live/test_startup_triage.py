@@ -242,11 +242,12 @@ def test_build_close_request_post_market_sets_liberal_limit():
     assert req.limit_price == 9.90
 
 
-def test_build_close_request_regular_hours_uses_market_order():
+def test_build_close_request_regular_hours_sets_limit_active_outside_rth():
+    """All orders are limit orders active outside RTH — RTH closes set a limit too."""
     pos = _Position(ticker="X", qty=10, avg_entry_price=10.0, open_ns=0)
     req = _build_close_request(pos, "EPG_FAIL_ON_RESTART", "regular_hours",
                                 bid=9.95, ask=10.05)
-    assert req.limit_price is None  # RTH = MarketOrder
+    assert req.limit_price == 9.90  # bid - extended_exit_offset
 
 
 def test_build_close_request_falls_back_when_only_ask_available():

@@ -529,8 +529,8 @@ def test_bug8_sell_exit_post_market_has_limit_price():
     assert req.limit_price == 20.45
 
 
-def test_bug8_sell_exit_rth_uses_market_order_limit_price_none():
-    """RTH SELL exits use MarketOrder — limit_price stays None by design."""
+def test_bug8_sell_exit_rth_uses_limit_active_outside_rth():
+    """All orders are limit orders active outside RTH — RTH SELL exits set a limit too."""
     ctx, risk_state = _ticker_ctx_for_exit(last_bid=20.50)
     req = _build_order_request(
         ctx, "EPG_CLOSE", price=20.55, bkt="regular_hours",
@@ -538,7 +538,7 @@ def test_bug8_sell_exit_rth_uses_market_order_limit_price_none():
         risk_state=risk_state,
     )
     assert req is not None
-    assert req.limit_price is None  # RTH = MKT order
+    assert req.limit_price == 20.45  # bid - extended_exit_offset
 
 
 def test_bug8_sell_exit_fallback_when_no_bid():

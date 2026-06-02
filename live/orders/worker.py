@@ -72,8 +72,22 @@ async def order_worker(
 
         fill: Optional[Fill] = await ibkr.submit(request)
         if fill is None:
-            log.warning("order_worker: no fill for %s %s — order timed out with zero fills",
-                        request.side, request.ticker)
+            if not request.is_entry:
+                log.critical(
+                    "Exit order timed out: %s %s — adding to pending_close, escalating to FlattenAll",
+                    request.side, request.ticker,
+                )
+                risk_state.pending_close.add(request.ticker)
+                if request.on_fill_failed is not None:
+                    request.on_fill_failed()
+                await telegram.send_silent(
+                    f"EXIT TIMEOUT: {request.ticker} — escalating to FlattenAll"
+                )
+                await _execute_flatten_all(ibkr, risk_state, telegram,
+                                           f"exit_timeout_{request.ticker}")
+            else:
+                log.warning("Entry order timed out: %s %s — skipping",
+                            request.side, request.ticker)
             continue
 
         # Write fill records in explicit transaction (non-negotiable)
@@ -88,6 +102,9 @@ async def order_worker(
             fill.ticker, fill.side, fill.qty, fill.fill_price,
             filled_qty=fill.filled_qty,
         )
+        risk_state.pending_close.discard(fill.ticker)
+        if request.on_fill_confirmed is not None:
+            request.on_fill_confirmed()
 
         await _notify_fill(telegram, fill, risk_state)
 
@@ -230,6 +247,36 @@ async def _notify_fill(telegram, fill: Fill, risk_state: RiskState) -> None:
             f"| daily PnL: ${risk_state.daily_pnl:.2f}"
         )
     await telegram.send_silent(msg)
+
+
+async def pending_close_monitor(
+    risk_state: RiskState,
+    order_queue: asyncio.Queue,
+    telegram,
+    interval_s: float = 30.0,
+) -> None:
+    """Retry any position in pending_close that is still open.
+
+    pending_close is populated when an exit order times out. This task fires every
+    interval_s and re-queues a FlattenAll for each stuck ticker until IBKR confirms
+    flat (at which point record_fill removes the ticker from open_positions and the
+    next iteration discards it from pending_close).
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        for ticker in list(risk_state.pending_close):
+            if risk_state.has_position(ticker):
+                log.critical(
+                    "pending_close: %s still open after %.0fs — re-queuing FlattenAll",
+                    ticker, interval_s,
+                )
+                asyncio.create_task(
+                    telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenAll")
+                )
+                order_queue.put_nowait(FlattenAllRequest(reason=f"pending_close_retry_{ticker}"))
+            else:
+                log.info("pending_close: %s now flat — clearing", ticker)
+                risk_state.pending_close.discard(ticker)
 
 
 async def hourly_pnl_alert(

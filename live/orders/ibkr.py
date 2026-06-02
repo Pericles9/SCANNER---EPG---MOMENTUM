@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from ib_insync import IB, LimitOrder, MarketOrder, Stock, Trade
+from ib_insync import IB, LimitOrder, Stock, Trade
 
 from live.config import CFG
 from live.orders.risk import OrderRequest
@@ -88,26 +88,22 @@ class IBKRClient:
         contract = Stock(request.ticker, "SMART", "USD")
         await self._ib.qualifyContractsAsync(contract)
 
-        # Extended hours (pre/post market) require limit orders with tif=EXT +
-        # outsideRth=True. Market orders are rejected outside RTH on IBKR.
-        if request.session_bucket in ("pre_market", "post_market"):
-            if request.limit_price is None:
-                log.error(
-                    "%s: %s order missing limit_price (extended hours requires LMT)",
-                    request.ticker, request.session_bucket,
-                )
-                return None
-            order = LimitOrder(
-                request.side,
-                request.qty,
-                request.limit_price,
-                tif="EXT",
-                outsideRth=True,
+        # All orders are limit orders active outside RTH.
+        # Market orders are rejected by IBKR outside regular trading hours.
+        if request.limit_price is None:
+            log.error(
+                "%s: order missing limit_price — cannot submit without a limit",
+                request.ticker,
             )
-            order_type = "LMT"
-        else:
-            order = MarketOrder(request.side, request.qty, tif="DAY")
-            order_type = "MKT"
+            return None
+        order = LimitOrder(
+            request.side,
+            request.qty,
+            request.limit_price,
+            tif="DAY",
+            outsideRth=True,
+        )
+        order_type = "LMT"
 
         submitted_ns = time.time_ns()
         trade: Trade = self._ib.placeOrder(contract, order)
@@ -211,15 +207,23 @@ class IBKRClient:
             return (0.0, 0.0)
 
     async def flatten_all(self, risk_state) -> None:
-        """Market-sell all open positions immediately."""
+        """Limit-sell all open positions immediately, active outside RTH."""
         positions = self.get_open_positions()
-        for ticker, (qty, _avg_cost) in positions.items():
-            if qty > 0:
-                contract = Stock(ticker, "SMART", "USD")
-                await self._ib.qualifyContractsAsync(contract)
-                order = MarketOrder("SELL", qty, tif="DAY")
-                self._ib.placeOrder(contract, order)
-                log.critical("KILL: market sell %d %s", qty, ticker)
+        for ticker, (qty, avg_cost) in positions.items():
+            if qty <= 0:
+                continue
+            contract = Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+            # Use snapshot bid if available; fall back to 70% of avg_cost as a
+            # floor that fills in any normal market but avoids a $0 limit.
+            bid, _ask = await self.snapshot_quote(ticker)
+            if bid > 0:
+                limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
+            else:
+                limit_price = round(max(0.01, avg_cost * 0.70), 2)
+            order = LimitOrder("SELL", qty, limit_price, tif="DAY", outsideRth=True)
+            self._ib.placeOrder(contract, order)
+            log.critical("KILL: limit sell %d %s @ %.4f (outsideRth=True)", qty, ticker, limit_price)
 
     async def cancel_all_orders(self) -> None:
         open_orders = self._ib.openOrders()

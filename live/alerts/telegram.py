@@ -9,6 +9,7 @@ from typing import Callable, Optional
 
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler
+from telegram.request import HTTPXRequest
 
 from live.config import CFG
 
@@ -17,10 +18,27 @@ log = logging.getLogger(__name__)
 _KILL_FLAG_PATH = Path(__file__).parent.parent / "kill.flag"
 _KILL_CHECK_INTERVAL_S = 5.0
 
+# Outbound alert HTTP pool. PTB's default HTTPXRequest has connection_pool_size=1,
+# which serialises every concurrent send_silent() (order fills, hourly P&L, triage,
+# WS-disconnect, dead-man) through a single connection and causes pool-timeout
+# stalls under load. Size the pool for concurrent alerts and bound every call with
+# explicit timeouts so a slow Telegram API never hangs a hot-path coroutine.
+_ALERT_POOL_SIZE = 8
+_ALERT_TIMEOUT_S = 5.0
+
 
 class TelegramBot:
     def __init__(self, token: str, chat_id: str) -> None:
-        self._bot = Bot(token=token)
+        self._bot = Bot(
+            token=token,
+            request=HTTPXRequest(
+                connection_pool_size=_ALERT_POOL_SIZE,
+                connect_timeout=_ALERT_TIMEOUT_S,
+                read_timeout=_ALERT_TIMEOUT_S,
+                write_timeout=_ALERT_TIMEOUT_S,
+                pool_timeout=_ALERT_TIMEOUT_S,
+            ),
+        )
         self._chat_id = chat_id
         self._app: Optional[Application] = None
         self._kill_callback: Optional[Callable] = None

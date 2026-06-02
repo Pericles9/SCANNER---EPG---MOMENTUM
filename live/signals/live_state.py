@@ -99,6 +99,7 @@ class LiveSignalState:
 
         # Position tracking
         self._in_position: bool = False
+        self._exit_signaled: bool = False  # True while an exit order is in-flight; cleared on fill or failure
         self._session_bucket_at_entry: Optional[str] = None
 
         # Last known quote for Lee-Ready and LULD
@@ -133,18 +134,30 @@ class LiveSignalState:
         log.info("%s: signal state resumed", self._ticker)
 
     def record_entry(self, session_bkt: str, i_entry: float) -> None:
-        """Called by order_worker after entry fill confirms."""
+        """Called by signal_loop after entry is queued (optimistic — entry fills are expected)."""
         self._in_position = True
+        self._exit_signaled = False
         self._session_bucket_at_entry = session_bkt
         self._i_entry = i_entry
         self._exit_d_timer_start = None
 
+    def signal_exit(self) -> None:
+        """Called by signal_loop when an exit order is queued.
+        Keeps _in_position=True (fill not yet confirmed) and suppresses duplicate exit signals."""
+        self._exit_signaled = True
+
     def record_exit(self) -> None:
-        """Called by order_worker after exit fill confirms."""
+        """Called by order_worker after exit fill confirms. Single source of truth for exit."""
         self._in_position = False
+        self._exit_signaled = False
         self._session_bucket_at_entry = None
         self._i_entry = None
         self._exit_d_timer_start = None
+
+    def clear_exit_pending(self) -> None:
+        """Called by order_worker when an exit order fails. Clears suppression so a new
+        exit signal can fire on the next qualifying tick."""
+        self._exit_signaled = False
 
     def update_quote(self, quote: dict) -> SignalResult:
         """Process a quote message. Updates last bid/ask."""
@@ -449,6 +462,11 @@ class LiveSignalState:
         t_sec: float,
         bkt: str,
     ) -> Optional[str]:
+        # Suppress while an exit order is already in-flight (waiting for fill confirmation).
+        # clear_exit_pending() re-enables on fill failure; record_exit() clears on success.
+        if self._exit_signaled:
+            return None
+
         # EXIT_D (first priority)
         if self._check_exit_d(hawkes_state, t_sec, bkt):
             return "EXIT_D"

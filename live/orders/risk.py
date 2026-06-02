@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from live.config import CFG
 
@@ -21,6 +21,8 @@ class OrderRequest:
     limit_price: Optional[float] = None  # set for pre-market limit orders
     intraday_pct: float = 0.0           # for DB record
     expected_price: float = 0.0         # signal-time price estimate for slippage tracking
+    on_fill_confirmed: Optional[Callable] = field(default=None, repr=False)
+    on_fill_failed: Optional[Callable] = field(default=None, repr=False)
 
 
 @dataclass
@@ -33,6 +35,7 @@ class FlattenAllRequest:
 class RiskState:
     daily_pnl: float = 0.0
     open_positions: dict = field(default_factory=dict)  # ticker → {qty, avg_cost}
+    pending_close: set = field(default_factory=set)     # tickers with in-flight or failed exits
     max_daily_loss: float = field(default_factory=lambda: CFG.risk.max_daily_loss)
     max_concurrent: int = field(default_factory=lambda: CFG.risk.max_concurrent_positions)
     account_equity: float = 0.0       # refreshed from IBKR every 5 minutes
@@ -42,6 +45,8 @@ class RiskState:
     _trade_history: list = field(default_factory=list, init=False, repr=False)
 
     def allows(self, request: OrderRequest) -> bool:
+        if not request.is_entry:
+            return True  # exits are never blocked by risk limits
         if self._loss_limit_hit:
             return False
         if self.daily_pnl <= self.max_daily_loss:
@@ -49,7 +54,7 @@ class RiskState:
             log.warning("Daily loss limit hit: %.2f <= %.2f — blocking new entries",
                         self.daily_pnl, self.max_daily_loss)
             return False
-        if request.is_entry and len(self.open_positions) >= self.max_concurrent:
+        if len(self.open_positions) >= self.max_concurrent:
             log.warning("Max concurrent positions (%d) reached — blocking entry for %s",
                         self.max_concurrent, request.ticker)
             return False

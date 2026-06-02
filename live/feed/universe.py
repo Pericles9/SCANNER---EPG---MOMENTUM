@@ -230,17 +230,15 @@ class UniverseManager:
     async def remove_ticker(self, ticker: str, close_reason: str = "session_close") -> None:
         """Remove ticker from universe. Order: pop → cancel → unsubscribe → export.
 
-        scanner_dropoff removals do NOT add to closed_today so the ticker can re-enter
-        if it bounces back into the qualifying snapshot on a later poll. All other
-        close reasons (session_close, EPG_CLOSE, EXIT_D, LULD, EOD, KILL) lock the
-        ticker out for the rest of the session.
+        closed_today lockout is currently disabled: no close reason adds the ticker
+        to closed_today, so any removed ticker (scanner_dropoff, session_close,
+        EPG_CLOSE, EXIT_D, LULD, EOD) can re-enter the universe if it qualifies again.
+        The closed_today set is retained (kept empty) so gate checks and bot readouts
+        stay valid.
         """
         ctx = self._universe.pop(ticker, None)
         if ctx is None:
             return
-        if close_reason != "scanner_dropoff":
-            ctx.closed_today = True
-            self._closed_today.add(ticker)
         ctx.task.cancel()
         await self._ws_send_queue.put({
             "action": "unsubscribe",

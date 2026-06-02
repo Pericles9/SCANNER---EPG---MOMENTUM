@@ -102,8 +102,8 @@ def test_remove_scanner_dropoff_not_in_closed_today(monkeypatch):
     assert "MSTR" not in mgr._universe
 
 
-def test_remove_session_close_adds_to_closed_today(monkeypatch):
-    """session_close removal MUST add to closed_today."""
+def test_remove_session_close_not_in_closed_today(monkeypatch):
+    """closed_today lockout disabled: session_close removal must NOT add to closed_today."""
     _patch_export(monkeypatch)
     mgr = _build_mgr()
     ctx = MagicMock()
@@ -112,11 +112,11 @@ def test_remove_session_close_adds_to_closed_today(monkeypatch):
 
     asyncio.run(mgr.remove_ticker("MSTR", close_reason="session_close"))
 
-    assert "MSTR" in mgr._closed_today
+    assert "MSTR" not in mgr._closed_today
 
 
-def test_remove_epg_close_adds_to_closed_today(monkeypatch):
-    """EPG_CLOSE (real session end) adds to closed_today."""
+def test_remove_epg_close_not_in_closed_today(monkeypatch):
+    """closed_today lockout disabled: EPG_CLOSE removal must NOT add to closed_today."""
     _patch_export(monkeypatch)
     mgr = _build_mgr()
     ctx = MagicMock()
@@ -125,7 +125,7 @@ def test_remove_epg_close_adds_to_closed_today(monkeypatch):
 
     asyncio.run(mgr.remove_ticker("MSTR", close_reason="EPG_CLOSE"))
 
-    assert "MSTR" in mgr._closed_today
+    assert "MSTR" not in mgr._closed_today
 
 
 # ── Re-entry after drop-off ───────────────────────────────────────────────────

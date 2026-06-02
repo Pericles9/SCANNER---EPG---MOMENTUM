@@ -338,7 +338,7 @@ async def main() -> None:
     telegram.register_bot_state(bot_state)
 
     # Order worker (Process 3)
-    from live.orders.worker import hourly_pnl_alert, order_worker
+    from live.orders.worker import hourly_pnl_alert, order_worker, pending_close_monitor
 
     # Account equity refresher — updates every 5 minutes for Kelly sizing
     async def equity_refresher() -> None:
@@ -372,6 +372,10 @@ async def main() -> None:
         asyncio.create_task(equity_refresher(), name="equity_refresher"),
         asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
         asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
+        asyncio.create_task(
+            pending_close_monitor(risk_state, order_queue, telegram),
+            name="pending_close_monitor",
+        ),
     ]
 
     # ── Phase B: startup position triage ──
