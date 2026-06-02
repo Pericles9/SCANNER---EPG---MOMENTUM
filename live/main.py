@@ -94,11 +94,11 @@ async def _session_close_scheduler(universe_mgr, order_queue, risk_state, telegr
     _log = logging.getLogger(__name__)
     while True:
         now_et = datetime.now(_ET)
-        target_et = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
+        target_et = now_et.replace(hour=19, minute=45, second=0, microsecond=0)
         if now_et >= target_et:
             target_et += timedelta(days=1)
         secs = (target_et - now_et).total_seconds()
-        _log.info("Session close scheduler: sleeping %.0fs until 20:00 ET", secs)
+        _log.info("Session close scheduler: sleeping %.0fs until 19:45 ET", secs)
         await asyncio.sleep(secs)
         await universe_mgr.session_close(order_queue, risk_state, telegram)
 
@@ -373,7 +373,7 @@ async def main() -> None:
         asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
         asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
         asyncio.create_task(
-            pending_close_monitor(risk_state, order_queue, telegram),
+            pending_close_monitor(risk_state, order_queue, telegram, ibkr),
             name="pending_close_monitor",
         ),
     ]

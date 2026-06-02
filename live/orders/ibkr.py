@@ -206,42 +206,22 @@ class IBKRClient:
             log.exception("IBKR snapshot_quote failed for %s", ticker)
             return (0.0, 0.0)
 
-    async def flatten_all(self, risk_state) -> None:
-        """Limit-sell all open positions immediately, active outside RTH.
+    def has_open_order_for(self, ticker: str) -> bool:
+        """Return True if IBKR has a live (unfilled, uncancelled) order for this ticker.
 
-        Market-hours aware: when the market is closed, places no orders (selling
-        into a closed market only produces rejects/spam). Instead it registers
-        each open position in risk_state.pending_close so pending_close_monitor
-        flattens it on the next tradable cycle.
+        Uses openTrades() which only returns our client's active trades. Called by
+        pending_close_monitor before retrying a flatten so we don't pile additional
+        sell orders onto a position that already has one working.
         """
-        from live.feed import market_status
-        positions = self.get_open_positions()
-        if not market_status.is_tradable_now():
-            deferred = [t for t, (qty, _c) in positions.items() if qty > 0]
-            for t in deferred:
-                risk_state.pending_close.add(t)
-            if deferred:
-                log.warning(
-                    "flatten_all: market closed — deferring %d position(s) to "
-                    "pending_close (will flatten when market reopens): %s",
-                    len(deferred), deferred,
-                )
-            return
-        for ticker, (qty, avg_cost) in positions.items():
-            if qty <= 0:
-                continue
-            contract = Stock(ticker, "SMART", "USD")
-            await self._ib.qualifyContractsAsync(contract)
-            # Use snapshot bid if available; fall back to 70% of avg_cost as a
-            # floor that fills in any normal market but avoids a $0 limit.
-            bid, _ask = await self.snapshot_quote(ticker)
-            if bid > 0:
-                limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
-            else:
-                limit_price = round(max(0.01, avg_cost * 0.70), 2)
-            order = LimitOrder("SELL", qty, limit_price, tif="DAY", outsideRth=True)
-            self._ib.placeOrder(contract, order)
-            log.critical("KILL: limit sell %d %s @ %.4f (outsideRth=True)", qty, ticker, limit_price)
+        try:
+            for trade in self._ib.openTrades():
+                if trade.contract.symbol == ticker:
+                    status = trade.orderStatus.status
+                    if status not in ("Filled", "Cancelled", "Inactive"):
+                        return True
+        except Exception:
+            log.exception("has_open_order_for(%s): error querying openTrades", ticker)
+        return False
 
     async def cancel_all_orders(self) -> None:
         open_orders = self._ib.openOrders()
