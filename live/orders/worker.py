@@ -193,9 +193,19 @@ async def _execute_flatten_all(
         fill: Optional[Fill] = await ibkr.submit(req)
 
         if fill is None:
-            log.critical("FLATTEN ALL: %s — no fill within timeout, adding to pending_close", ticker)
+            fails = risk_state.pending_close_failures.get(ticker, 0) + 1
+            risk_state.pending_close_failures[ticker] = fails
             risk_state.pending_close.add(ticker)
             deferred_tickers.append(ticker)
+            log.critical(
+                "FLATTEN ALL: %s — no fill within timeout (attempt %d), adding to pending_close",
+                ticker, fails,
+            )
+            if fails == 3:
+                await telegram.send_silent(
+                    f"FLATTEN {ticker}: {fails} consecutive timeouts — likely illiquid "
+                    f"or halted. Switching to 5-min retry. May need manual close at RTH."
+                )
         else:
             pool = get_pool()
             async with pool.acquire() as conn:
@@ -207,6 +217,7 @@ async def _execute_flatten_all(
                 filled_qty=fill.filled_qty,
             )
             risk_state.pending_close.discard(fill.ticker)
+            risk_state.pending_close_failures.pop(fill.ticker, None)
             filled_count += 1
             log.critical("FLATTEN ALL: %s filled %d @ %.4f", ticker, fill.filled_qty, fill.fill_price)
             await _notify_fill(telegram, fill, risk_state)
@@ -356,29 +367,48 @@ async def pending_close_monitor(
     existing order already working it.
     """
     from live.feed import market_status
+    _last_attempt: dict[str, float] = {}   # ticker → monotonic time of last retry
+    _BACKOFF_THRESHOLD = 3                 # failures before switching to slow retry
+    _BACKOFF_INTERVAL_S = 300.0            # 5 minutes between retries once backed off
+
     while True:
         await asyncio.sleep(interval_s)
         if not market_status.is_tradable_now():
             continue
+        now = time.monotonic()
         for ticker in list(risk_state.pending_close):
             if not risk_state.has_position(ticker):
                 log.info("pending_close: %s now flat — clearing", ticker)
                 risk_state.pending_close.discard(ticker)
+                risk_state.pending_close_failures.pop(ticker, None)
+                _last_attempt.pop(ticker, None)
                 continue
-            # Position still open — check whether IBKR already has a live
-            # order working it before placing another one.
+
             if ibkr.has_open_order_for(ticker):
                 log.info(
                     "pending_close: %s still open but live order exists — waiting for fill",
                     ticker,
                 )
                 continue
-            log.critical(
-                "pending_close: %s open, no live order — re-queuing FlattenAll", ticker,
-            )
-            asyncio.create_task(
-                telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenAll")
-            )
+
+            failures = risk_state.pending_close_failures.get(ticker, 0)
+            retry_interval = _BACKOFF_INTERVAL_S if failures >= _BACKOFF_THRESHOLD else interval_s
+            if now - _last_attempt.get(ticker, 0.0) < retry_interval:
+                continue
+
+            _last_attempt[ticker] = now
+
+            if failures < _BACKOFF_THRESHOLD:
+                log.critical("pending_close: %s open, no live order — re-queuing FlattenAll", ticker)
+                asyncio.create_task(
+                    telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenAll")
+                )
+            else:
+                log.warning(
+                    "pending_close: %s open, attempt %d (5-min backoff) — re-queuing FlattenAll",
+                    ticker, failures + 1,
+                )
+
             order_queue.put_nowait(FlattenAllRequest(reason=f"pending_close_retry_{ticker}"))
 
 

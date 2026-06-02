@@ -35,7 +35,8 @@ class FlattenAllRequest:
 class RiskState:
     daily_pnl: float = 0.0
     open_positions: dict = field(default_factory=dict)  # ticker → {qty, avg_cost}
-    pending_close: set = field(default_factory=set)     # tickers with in-flight or failed exits
+    pending_close: set = field(default_factory=set)           # tickers with in-flight or failed exits
+    pending_close_failures: dict = field(default_factory=dict) # ticker → consecutive failed flatten attempts
     max_daily_loss: float = field(default_factory=lambda: CFG.risk.max_daily_loss)
     max_concurrent: int = field(default_factory=lambda: CFG.risk.max_concurrent_positions)
     account_equity: float = 0.0       # refreshed from IBKR every 5 minutes
