@@ -68,6 +68,46 @@ def get_upcoming_holidays() -> list[Holiday]:
     return upcoming_holidays
 
 
+# Tradable session window for the clock fallback: 04:00 (pre-market open) to
+# 20:00 ET (after-hours close) — matches Polygon's earlyHours/afterHours window.
+_TRADABLE_START_SEC = 4 * 3600
+_TRADABLE_END_SEC = 20 * 3600
+
+
+def is_tradable_now(
+    status: Optional[MarketStatus] = None,
+    now_et: Optional[datetime] = None,
+    holidays: Optional[list[Holiday]] = None,
+) -> bool:
+    """Best-effort "can we place orders right now?" check.
+
+    Prefers the cached Massive market status (authoritative once the scanner has
+    polled at least once). When it is unavailable — e.g. at startup before the
+    first scanner poll — falls back to a clock check: Mon-Fri, 04:00-20:00 ET,
+    excluding known full-closure holidays.
+
+    Used by every flatten/close path (flatten_all, pending_close_monitor, the
+    dead-man's switch, and startup triage) so none of them place sell orders or
+    retry into a closed market.
+    """
+    if status is None:
+        status = last_market_status
+    if status is not None:
+        return status.is_tradable
+
+    if now_et is None:
+        now_et = datetime.now(_ET)
+    if holidays is None:
+        holidays = upcoming_holidays
+
+    if now_et.weekday() >= 5:  # Saturday / Sunday
+        return False
+    if today_holiday_name(holidays, now_et.date()) is not None:
+        return False
+    sec = now_et.hour * 3600 + now_et.minute * 60 + now_et.second
+    return _TRADABLE_START_SEC <= sec < _TRADABLE_END_SEC
+
+
 # ── Fetchers ──────────────────────────────────────────────────────────────────
 
 async def fetch_market_status(

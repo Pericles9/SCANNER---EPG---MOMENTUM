@@ -262,8 +262,13 @@ async def pending_close_monitor(
     flat (at which point record_fill removes the ticker from open_positions and the
     next iteration discards it from pending_close).
     """
+    from live.feed import market_status
     while True:
         await asyncio.sleep(interval_s)
+        # Market-hours aware: hold pending_close tickers untouched while the
+        # market is closed (no orders, no Telegram spam); retry when it reopens.
+        if not market_status.is_tradable_now():
+            continue
         for ticker in list(risk_state.pending_close):
             if risk_state.has_position(ticker):
                 log.critical(

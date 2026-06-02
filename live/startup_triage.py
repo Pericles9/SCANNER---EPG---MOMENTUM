@@ -70,11 +70,18 @@ async def startup_position_triage(
     session_date: date,
     hot_signal_events: Optional[list] = None,
     risk_state=None,
+    market_tradable: bool = True,
 ) -> None:
     """Triage every open position. Blocks until each per-ticker decision is
     made; close-on-resume watchers continue as background tasks past return.
 
     Caller responsibility: do NOT start scanner_monitor until this returns.
+
+    market_tradable: when False (market closed at startup), positions that would
+    be closed are deferred to risk_state.pending_close instead of firing a sell
+    that can only reject or sit unfilled — pending_close_monitor flattens them
+    when the market reopens. Resumes proceed normally (the signal loop simply
+    waits for live ticks).
     """
     positions = await _load_open_positions(pool, session_date)
 
@@ -126,6 +133,8 @@ async def startup_position_triage(
                 session_date=session_date,
                 session_end_ns=session_end_ns,
                 hot_signal_events=hot_signal_events,
+                market_tradable=market_tradable,
+                risk_state=risk_state,
             )
             for pos in positions
         ),
@@ -135,6 +144,7 @@ async def startup_position_triage(
     closed: list[str] = []
     resumed: list[str] = []
     watching: list[str] = []
+    deferred: list[str] = []
     errored: list[str] = []
     for pos, outcome in zip(positions, results):
         if isinstance(outcome, Exception):
@@ -146,6 +156,8 @@ async def startup_position_triage(
             resumed.append(pos.ticker)
         elif outcome == "watching":
             watching.append(pos.ticker)
+        elif outcome == "deferred":
+            deferred.append(pos.ticker)
 
     # Approximate unrealised P&L — fire all snapshot_quote calls concurrently
     quotes = await asyncio.gather(
@@ -166,6 +178,7 @@ async def startup_position_triage(
         f"  Closed:   {len(closed)}{' (' + ', '.join(closed) + ')' if closed else ''}\n"
         f"  Resumed:  {len(resumed)}{' (' + ', '.join(resumed) + ')' if resumed else ''}\n"
         f"  Watching: {len(watching)}{' (' + ', '.join(watching) + ')' if watching else ''}"
+        + (f"\n  Deferred (market closed): {len(deferred)} ({', '.join(deferred)})" if deferred else "")
         + (f"\n  Errored:  {len(errored)} ({', '.join(errored)})" if errored else "")
         + f"\n  Unrealised P&L (approx): ${total_unreal:+.2f}"
     )
@@ -186,8 +199,10 @@ async def _triage_one(
     session_date: date,
     session_end_ns: int,
     hot_signal_events: Optional[list],
+    market_tradable: bool = True,
+    risk_state=None,
 ) -> str:
-    """Process a single position. Returns 'closed' | 'resumed' | 'watching'."""
+    """Process a single position. Returns 'closed' | 'resumed' | 'watching' | 'deferred'."""
     # Step 1 — IBKR price validity
     bid, ask = await ibkr.snapshot_quote(pos.ticker)
     if bid == 0.0 and ask == 0.0:
@@ -203,6 +218,7 @@ async def _triage_one(
             bid=pos.avg_entry_price, ask=pos.avg_entry_price,
             order_queue=order_queue, telegram=telegram,
             session_date=session_date, hot_signal_events=hot_signal_events,
+            market_tradable=market_tradable, risk_state=risk_state,
         )
 
     # Step 2 — resolve EPG state from DB
@@ -213,12 +229,14 @@ async def _triage_one(
         return await _queue_triage_close(
             pos, "EPG_FAIL_ON_RESTART", "TRIAGE_CLOSE_EPG_FAIL",
             bid, ask, order_queue, telegram, session_date, hot_signal_events,
+            market_tradable=market_tradable, risk_state=risk_state,
         )
 
     if outcome == EPGTriageOutcome.UNRESOLVABLE:
         return await _queue_triage_close(
             pos, "EPG_UNRESOLVABLE_ON_RESTART", "TRIAGE_CLOSE_UNRESOLVABLE",
             bid, ask, order_queue, telegram, session_date, hot_signal_events,
+            market_tradable=market_tradable, risk_state=risk_state,
         )
 
     # PASS or INACTIVE → resume monitoring
@@ -265,8 +283,33 @@ async def _queue_triage_close(
     telegram,
     session_date: date,
     hot_signal_events: Optional[list],
+    market_tradable: bool = True,
+    risk_state=None,
 ) -> str:
-    """Build and enqueue a SELL close for a triaged position. Returns 'closed'."""
+    """Build and enqueue a SELL close for a triaged position. Returns 'closed'.
+
+    When the market is closed, defers to risk_state.pending_close instead of
+    queueing a sell that can only reject or sit unfilled — returns 'deferred'.
+    """
+    if not market_tradable:
+        if risk_state is not None:
+            risk_state.pending_close.add(pos.ticker)
+        log.warning(
+            "Triage %s: market closed — deferring close (reason=%s, qty=%d) to "
+            "pending_close; will flatten when market reopens",
+            pos.ticker, reason, pos.qty,
+        )
+        if telegram is not None:
+            await telegram.send_silent(
+                f"Triage {pos.ticker}: market closed — deferring close "
+                f"({reason}, qty={pos.qty}) until open"
+            )
+        _record_event(
+            hot_signal_events, pos.ticker, session_date,
+            event_type, note=f"qty={pos.qty} reason={reason} deferred=market_closed",
+        )
+        return "deferred"
+
     bkt = _current_session_bucket()
     req = _build_close_request(pos, reason, bkt, bid, ask)
     order_queue.put_nowait(req)

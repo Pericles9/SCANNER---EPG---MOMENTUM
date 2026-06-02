@@ -190,8 +190,14 @@ async def heartbeat_monitor(
     heartbeat: HeartbeatMonitor,
 ) -> None:
     """Periodic dead man's switch check."""
+    from live.feed import market_status
     while True:
         await asyncio.sleep(_HEARTBEAT_CHECK_INTERVAL_S)
+        # The dead man's switch guards against a frozen feed during the session.
+        # When the market is closed there is legitimately no feed, so a stale
+        # heartbeat is expected — do not flatten (it can't fill and only spams).
+        if not market_status.is_tradable_now():
+            continue
         stale = heartbeat.stale_tickers(CFG.risk.dead_man_timeout_s)
         for ticker in stale:
             if risk_state.has_position(ticker):

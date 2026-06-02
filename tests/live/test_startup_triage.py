@@ -82,6 +82,14 @@ def _universe_mgr_mock() -> MagicMock:
     return mgr
 
 
+class _RiskStub:
+    """Minimal risk_state stand-in for triage: real pending_close set + empty
+    open_positions (so the SKIP_POSITION_CHECK merge loop is a no-op)."""
+    def __init__(self):
+        self.pending_close: set = set()
+        self.open_positions: dict = {}
+
+
 # ── startup_position_triage — no positions ──────────────────────────────────
 
 def test_triage_no_positions_is_a_noop():
@@ -160,6 +168,59 @@ def test_triage_unresolvable_no_refit_closes_position():
     assert req.is_entry is False
     assert req.exit_reason == "EPG_UNRESOLVABLE_ON_RESTART"
     assert any(e[4] == "TRIAGE_CLOSE_UNRESOLVABLE" for e in events)
+
+
+# ── Market closed → defer close to pending_close instead of queuing a sell ───
+
+def test_triage_defers_close_when_market_closed():
+    """UNRESOLVABLE position with market_tradable=False must NOT queue a sell;
+    it is deferred to risk_state.pending_close for later flatten."""
+    pos_row = {"ticker": "ABC", "qty": 50, "avg_entry_price": 12.0, "open_ns": 0}
+    pool = _FakePool(_FakeConn(positions=[pos_row], refit=None))  # UNRESOLVABLE → would close
+    ibkr = _ibkr_mock(11.95, 12.05)
+    order_queue: asyncio.Queue = asyncio.Queue()
+    universe = _universe_mgr_mock()
+    tg = _telegram_mock()
+    events: list = []
+    risk_state = _RiskStub()
+
+    asyncio.run(startup_position_triage(
+        pool=pool, ibkr=ibkr, order_queue=order_queue,
+        universe_mgr=universe, telegram=tg,
+        session_date=date(2026, 5, 27),
+        hot_signal_events=events,
+        risk_state=risk_state,
+        market_tradable=False,
+    ))
+
+    # No sell queued — deferred instead
+    assert order_queue.empty()
+    assert "ABC" in risk_state.pending_close
+    assert any(e[4] == "TRIAGE_CLOSE_UNRESOLVABLE" for e in events)
+
+
+def test_triage_defers_no_quote_close_when_market_closed():
+    """No-quote close path is also deferred when the market is closed."""
+    pos_row = {"ticker": "HALT1", "qty": 100, "avg_entry_price": 5.0, "open_ns": 0}
+    pool = _FakePool(_FakeConn(positions=[pos_row]))
+    ibkr = _ibkr_mock(0.0, 0.0)  # no quote
+    order_queue: asyncio.Queue = asyncio.Queue()
+    universe = _universe_mgr_mock()
+    tg = _telegram_mock()
+    events: list = []
+    risk_state = _RiskStub()
+
+    asyncio.run(startup_position_triage(
+        pool=pool, ibkr=ibkr, order_queue=order_queue,
+        universe_mgr=universe, telegram=tg,
+        session_date=date(2026, 5, 27),
+        hot_signal_events=events,
+        risk_state=risk_state,
+        market_tradable=False,
+    ))
+
+    assert order_queue.empty()
+    assert "HALT1" in risk_state.pending_close
 
 
 # ── Valid quote, INACTIVE (refit present, no ticks since) → resume ──────────

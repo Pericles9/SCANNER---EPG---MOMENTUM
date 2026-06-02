@@ -4,12 +4,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import pytest
 
 from live.feed import market_status as ms
+
+_ET = ZoneInfo("America/New_York")
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -44,6 +47,55 @@ def test_market_status_not_tradable_closed():
         server_time="", nyse="closed", nasdaq="closed",
     )
     assert s.is_tradable is False
+
+
+# ── is_tradable_now — cached status preferred, clock fallback otherwise ───────
+
+def test_is_tradable_now_prefers_cached_open():
+    s = ms.MarketStatus(market="open", early_hours=False, after_hours=False,
+                        server_time="", nyse="open", nasdaq="open")
+    # Even on a weekend clock, a cached "open" status wins.
+    sat = datetime(2026, 5, 30, 3, 0, tzinfo=_ET)
+    assert ms.is_tradable_now(status=s, now_et=sat, holidays=[]) is True
+
+
+def test_is_tradable_now_prefers_cached_closed():
+    s = ms.MarketStatus(market="closed", early_hours=False, after_hours=False,
+                        server_time="", nyse="closed", nasdaq="closed")
+    # Even at a weekday noon, a cached "closed" status wins.
+    wed = datetime(2026, 5, 27, 12, 0, tzinfo=_ET)
+    assert ms.is_tradable_now(status=s, now_et=wed, holidays=[]) is False
+
+
+def test_is_tradable_now_fallback_weekend(monkeypatch):
+    monkeypatch.setattr(ms, "last_market_status", None)
+    sat = datetime(2026, 5, 30, 12, 0, tzinfo=_ET)  # Saturday
+    assert ms.is_tradable_now(now_et=sat, holidays=[]) is False
+
+
+def test_is_tradable_now_fallback_weekday_daytime(monkeypatch):
+    monkeypatch.setattr(ms, "last_market_status", None)
+    wed = datetime(2026, 5, 27, 10, 0, tzinfo=_ET)  # Wednesday 10:00 ET
+    assert ms.is_tradable_now(now_et=wed, holidays=[]) is True
+
+
+def test_is_tradable_now_fallback_overnight_closed(monkeypatch):
+    monkeypatch.setattr(ms, "last_market_status", None)
+    wed_night = datetime(2026, 5, 27, 21, 0, tzinfo=_ET)  # 21:00 ET — after 20:00 close
+    assert ms.is_tradable_now(now_et=wed_night, holidays=[]) is False
+
+
+def test_is_tradable_now_fallback_premarket_open(monkeypatch):
+    monkeypatch.setattr(ms, "last_market_status", None)
+    wed_premarket = datetime(2026, 5, 27, 5, 0, tzinfo=_ET)  # 05:00 ET — pre-market
+    assert ms.is_tradable_now(now_et=wed_premarket, holidays=[]) is True
+
+
+def test_is_tradable_now_fallback_holiday(monkeypatch):
+    monkeypatch.setattr(ms, "last_market_status", None)
+    memorial_day = datetime(2026, 5, 25, 10, 0, tzinfo=_ET)  # Memorial Day Monday, daytime
+    holidays = [ms.Holiday(date="2026-05-25", exchange="NYSE", name="Memorial Day", status="closed")]
+    assert ms.is_tradable_now(now_et=memorial_day, holidays=holidays) is False
 
 
 def test_today_holiday_name_matches_nyse():

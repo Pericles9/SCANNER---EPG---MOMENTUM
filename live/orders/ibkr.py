@@ -207,8 +207,26 @@ class IBKRClient:
             return (0.0, 0.0)
 
     async def flatten_all(self, risk_state) -> None:
-        """Limit-sell all open positions immediately, active outside RTH."""
+        """Limit-sell all open positions immediately, active outside RTH.
+
+        Market-hours aware: when the market is closed, places no orders (selling
+        into a closed market only produces rejects/spam). Instead it registers
+        each open position in risk_state.pending_close so pending_close_monitor
+        flattens it on the next tradable cycle.
+        """
+        from live.feed import market_status
         positions = self.get_open_positions()
+        if not market_status.is_tradable_now():
+            deferred = [t for t, (qty, _c) in positions.items() if qty > 0]
+            for t in deferred:
+                risk_state.pending_close.add(t)
+            if deferred:
+                log.warning(
+                    "flatten_all: market closed — deferring %d position(s) to "
+                    "pending_close (will flatten when market reopens): %s",
+                    len(deferred), deferred,
+                )
+            return
         for ticker, (qty, avg_cost) in positions.items():
             if qty <= 0:
                 continue

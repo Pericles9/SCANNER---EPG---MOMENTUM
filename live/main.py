@@ -383,6 +383,11 @@ async def main() -> None:
     # are flattened (and PASS/INACTIVE positions are picked up by signal loops)
     # before new entries pile in.
     from live.startup_triage import startup_position_triage
+    from live.feed import market_status
+    # Scanner hasn't polled yet, so the status cache is empty — is_tradable_now()
+    # falls back to a clock/weekday check. When the market is closed, triage defers
+    # closes to pending_close instead of firing sells that can't fill.
+    market_tradable_at_startup = market_status.is_tradable_now()
     try:
         await startup_position_triage(
             pool=pool,
@@ -393,6 +398,7 @@ async def main() -> None:
             session_date=session_date,
             hot_signal_events=hot_signal_events,
             risk_state=risk_state,
+            market_tradable=market_tradable_at_startup,
         )
     except Exception:
         log.exception("startup_position_triage raised — continuing into scanner")
