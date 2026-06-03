@@ -41,7 +41,10 @@
 | Kill switch | File-watch + Telegram command | See Section 11 |
 | Paper trading exit criteria | Industry standard (see Section 12) | |
 | Scanner heat filter | All quartiles (Q1–Q4) | scanner_quartile is computed and stored as analysis field only. No entry gate on quartile — all tickers with ≥30% gap enter. |
-| EXIT_D pre-market regression | Treat as survivorship bias artifact, ignore | PF drop 1.73→0.90 is not a reason to disable |
+| EPG core gate (2026-06-03, HEURISTIC) | SlopeGate F_ss `s3_fss_t180_l30_ko5_kc0` | SUPERSEDES ParticipationGate. Opens FAIL→PASS at norm_slope ≥ 0.5, closes PASS→FAIL at norm_slope < 0.0. Sole strategy exit = PASS→FAIL. Val numbers heuristic, not a validated backtest of the full new core. |
+| Entry gate (2026-06-03, HEURISTIC) | SlopeGate rising edge AND setup-filter admission | Setup filter now gates ALL entries (first + re-entry) at 1-bar admission (Q̃ ≥ 0.65; 15-min persistence dropped). 15-bar de-qualification retained for hysteresis. |
+| EXIT_D / LULD (2026-06-03, HEURISTIC) | Disabled via config enable flags | `exit_d.enabled=false`, `luld.enabled=false`. Code retained and importable; evaluation blocks never run while disabled. |
+| EXIT_D pre-market regression | Treat as survivorship bias artifact, ignore | Historical note — EXIT_D is now disabled outright (see row above). PF drop 1.73→0.90 was not a reason to disable. |
 | Data source | Polygon (maxed plan) | Everything: scanner, context fetch, live feed |
 | IBKR market data subs | Pay for NYSE + NASDAQ | For order execution quotes only, not primary feed |
 | Database | PostgreSQL (Docker) | Single DB for all strategies. Native concurrent writes. Cloud = change one env var. See Section 9. |
@@ -71,7 +74,8 @@ The system is **local-first, Docker-containerised from day one** so cloud migrat
 │                       │ per-ticker asyncio.Queue             │
 │  ┌────────────────────▼────────────────────────────────┐    │
 │  │  Per-Ticker Signal Loop (one asyncio.Task each)     │    │
-│  │  Hawkes update → EPG gate → EXIT_D → LULD           │    │
+│  │  Hawkes update → SlopeGate (F_ss) → setup-filter    │    │
+│  │  gate. EXIT_D & LULD retained but disabled (flags). │    │
 │  └────────────────────┬────────────────────────────────┘    │
 │                       │ order_queue (single shared)          │
 └──────────────────────-┼─────────────────────────────────────┘
@@ -179,7 +183,7 @@ async def order_worker():
 class TickerContext:
     ticker: str
     queue: asyncio.Queue        # raw feed events, bounded (maxsize=5000)
-    signal_state: LiveSignalState  # EPG gate, Hawkes, EXIT_D — per-ticker
+    signal_state: LiveSignalState  # SlopeGate (F_ss), Hawkes, setup-filter gate — per-ticker
     task: asyncio.Task          # the running signal coroutine
     state_ready_event: asyncio.Event  # set once historical replay is complete
     subscribed_at: float
@@ -295,14 +299,24 @@ def build_context_from_history(historical_trades, historical_bars, config):
     if cold_start_params is not None:
         anchor.set_lambda_ref(cold_start_params.mu_buy + cold_start_params.mu_sell)
 
-    # Replay anchor + gate to find current EPG state
-    gate = ParticipationGate(...)
+    # Replay anchor + gate to find current EPG state.
+    # NOTE (2026-06-03, heuristic core swap): the gate is now SlopeGate (F_ss),
+    # config s3_fss_t180_l30_ko5_kc0, NOT ParticipationGate. lambda_v_ref is the
+    # cold-start reference (mu_buy + mu_sell, fitted or global) per the live
+    # architecture. SlopeGate has no public t_event, so activation is tracked with
+    # a wiring-level boolean. The live implementation is fetch_context() in
+    # live/signals/context_fetch.py.
+    gate = SlopeGate(tau_sec=180, L_sec=30, k_open=0.5, k_close=0.0, mode="ss",
+                     lambda_v_ref=cold_start_lref, warmup_seconds=300)
+    gate_activated = False
     for i in range(N):
-        t_ev = anchor.update(lambda_hat[i], historical_trades.t_sec[i])
-        if t_ev is not None:
+        t_ev = anchor.update(lambda_total[i], historical_trades.t_sec[i])
+        if t_ev is not None and not gate_activated:
             gate.activate(t_ev)
-        dv = float(historical_trades.prices[i]) * float(historical_trades.sizes[i])
-        gate.update(dv, historical_trades.t_sec[i])
+            gate_activated = True
+        if gate_activated:
+            dv = float(historical_trades.prices[i]) * float(historical_trades.sizes[i])
+            gate.update(dv, historical_trades.t_sec[i])
 
     return LiveSignalState(
         hawkes_engine=HawkesEngine.from_params(cold_start_params),

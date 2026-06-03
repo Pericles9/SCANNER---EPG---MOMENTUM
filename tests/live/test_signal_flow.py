@@ -26,7 +26,8 @@ import pytest
 
 from backtest.setup_filter import SetupFilterResult
 from core.epg.anchor import EventAnchor
-from core.epg.gate import GateState, ParticipationGate
+from core.epg.gate import GateState
+from core.epg.gate_variants import SlopeGate
 from core.hawkes.engine import HawkesEngine
 
 from live.feed.context import TickerContext
@@ -67,11 +68,11 @@ def _build_live_state(pct_change: float = 35.0) -> LiveSignalState:
     """Build a LiveSignalState with:
       - HawkesEngine at config defaults (mu_buy = mu_sell = 0.1)
       - EventAnchor pre-fired at t_event=0
-      - ParticipationGate pre-activated at t_event=0
-      - SetupFilterResult with passes=True
+      - SlopeGate (F_ss) pre-activated at t_event=0, gate_activated=True
+      - SetupFilterResult that admits (q_tilde above threshold)
       - No historical ticks (last_ts_ns = 0)
     """
-    lambda_ref = 0.2  # mu_buy + mu_sell
+    lambda_ref = 0.2  # mu_buy + mu_sell — also used as SlopeGate lambda_v_ref
     engine = HawkesEngine(
         beta_mle=0.1,
         alpha_self_buy=0.005,
@@ -88,9 +89,13 @@ def _build_live_state(pct_change: float = 35.0) -> LiveSignalState:
     anchor._t_event = 0.0
     anchor._fired = True
 
-    gate = ParticipationGate(
-        half_life_seconds=300.0,
-        peak_threshold_p=0.65,
+    gate = SlopeGate(
+        tau_sec=180.0,
+        L_sec=30.0,
+        k_open=0.5,
+        mode="ss",
+        k_close=0.0,
+        lambda_v_ref=lambda_ref,
         warmup_seconds=300.0,
     )
     gate.activate(0.0)
@@ -99,6 +104,7 @@ def _build_live_state(pct_change: float = 35.0) -> LiveSignalState:
         engine=engine,
         anchor=anchor,
         gate=gate,
+        gate_activated=True,
         prev_gate_state=GateState.INACTIVE,
         last_ts_ns=0,
         lambda_ref_global=lambda_ref,
@@ -133,10 +139,10 @@ def _build_live_state(pct_change: float = 35.0) -> LiveSignalState:
         scanner_context=scanner_ctx,
         session_date=date(2026, 5, 26),
     )
-    # Pin setup-filter passes True; the per-minute recompute would otherwise re-run
-    # over our tiny synthetic buffer and reset it to False (needs ≥15 sustained bars).
+    # Pin setup-filter admission True; the per-minute recompute would otherwise re-run
+    # over our tiny synthetic buffer and may reset it.
     state._recompute_setup_filter = lambda: None
-    state._current_sf_passes = True
+    state._sf_entry_ok = True
     return state
 
 
@@ -180,24 +186,34 @@ def test_bug1_lambda_total_is_not_ekf_saturation():
 
 
 def test_bug1_rising_edge_fires_after_warmup():
-    """Drive the gate from WARMUP → PASS and assert ENTRY signal fires."""
+    """Drive SlopeGate from WARMUP → PASS on an accelerating dollar-volume burst
+    and assert an ENTRY signal fires on the rising edge."""
     state = _build_live_state(pct_change=35.0)
 
     state.update_quote(_quote_msg(50.0, 9.99, 10.01))
 
-    # Tick during warmup (t_sec < 300) — sets prev_gate_state to WARMUP
+    # Tick during warmup (t_sec < 300) — sets prev_gate_state to WARMUP and seeds
+    # the SlopeGate lookback buffer with a low pre-burst lambda_V.
     r1 = state.update_trade(_trade_msg(100.0, 10.02, 100))
     assert r1.gate_state == GateState.WARMUP.value
     assert r1.order_signal is None
 
-    # Tick past warmup (t_sec > 300) — gate transitions to PASS, rising edge
-    r2 = state.update_trade(_trade_msg(310.0, 10.02, 100))
-    assert r2.gate_state == GateState.PASS.value, (
-        f"Expected gate PASS after warmup; got {r2.gate_state}"
-    )
-    assert r2.order_signal == "ENTRY", (
-        f"Expected ENTRY on rising edge; got {r2.order_signal}"
-    )
+    # Post-warmup accelerating burst (t > 300): rising dollar volume drives
+    # norm_slope past k_open=0.5 → FAIL/INACTIVE → PASS rising edge.
+    saw_pass = False
+    entry_fired = False
+    t = 305.0
+    for _ in range(40):
+        t += 1.0
+        r = state.update_trade(_trade_msg(t, 10.02, 500))
+        if r.gate_state == GateState.PASS.value:
+            saw_pass = True
+        if r.order_signal == "ENTRY":
+            entry_fired = True
+            break
+
+    assert saw_pass, "SlopeGate never reached PASS on accelerating volume"
+    assert entry_fired, "Expected ENTRY on SlopeGate rising edge"
 
 
 def test_bug1_signal_loop_pushes_to_order_queue():
@@ -235,10 +251,12 @@ def test_bug1_signal_loop_pushes_to_order_queue():
             session_date=date(2026, 5, 26),
         ))
         await ticker_queue.put(_quote_msg(50.0, 9.99, 10.01))
-        await ticker_queue.put(_trade_msg(100.0, 10.02, 100))    # WARMUP
-        await ticker_queue.put(_trade_msg(310.0, 10.02, 100))    # ENTRY
+        await ticker_queue.put(_trade_msg(100.0, 10.02, 100))    # WARMUP (seeds buffer)
+        # Post-warmup accelerating burst → SlopeGate rising edge → ENTRY
+        for i in range(40):
+            await ticker_queue.put(_trade_msg(306.0 + i, 10.02, 500))
         # Let the loop drain
-        for _ in range(20):
+        for _ in range(40):
             await asyncio.sleep(0.005)
             if not order_queue.empty():
                 break
@@ -610,3 +628,50 @@ def test_bug9_first_buy_unchanged_behaviour():
     rs = RiskState()
     rs.record_fill("AAPL", "BUY", qty=10, fill_price=150.00, filled_qty=10)
     assert rs.open_positions["AAPL"] == {"qty": 10, "avg_cost": 150.00}
+
+
+# ── Task 4 — setup filter is the entry gate (SlopeGate F_ss core swap) ────────
+#
+# An entry requires BOTH a SlopeGate rising edge AND setup-filter admission
+# (Q_tilde >= threshold on the current bar). With admission False, no ENTRY may
+# fire even when the gate opens.
+
+def test_sf_failing_blocks_entry_on_rising_edge():
+    """SlopeGate rising edge with setup-filter admission False → no ENTRY signal."""
+    state = _build_live_state(pct_change=35.0)
+    # Force setup-filter admission to fail; recompute is stubbed so it stays False.
+    state._sf_entry_ok = False
+
+    state.update_quote(_quote_msg(50.0, 9.99, 10.01))
+    state.update_trade(_trade_msg(100.0, 10.02, 100))  # WARMUP, seeds buffer
+
+    saw_pass = False
+    t = 305.0
+    for _ in range(40):
+        t += 1.0
+        r = state.update_trade(_trade_msg(t, 10.02, 500))
+        if r.gate_state == GateState.PASS.value:
+            saw_pass = True
+        assert r.order_signal != "ENTRY", "SF failing must block ENTRY on a rising edge"
+
+    assert saw_pass, "Gate should still reach PASS — only the SF gate blocks the entry"
+
+
+def test_sf_passing_allows_entry_on_rising_edge():
+    """Control: identical drive with setup-filter admission True DOES fire ENTRY."""
+    state = _build_live_state(pct_change=35.0)
+    state._sf_entry_ok = True
+
+    state.update_quote(_quote_msg(50.0, 9.99, 10.01))
+    state.update_trade(_trade_msg(100.0, 10.02, 100))
+
+    entry_fired = False
+    t = 305.0
+    for _ in range(40):
+        t += 1.0
+        r = state.update_trade(_trade_msg(t, 10.02, 500))
+        if r.order_signal == "ENTRY":
+            entry_fired = True
+            break
+
+    assert entry_fired, "Rising edge + SF admission must fire ENTRY"

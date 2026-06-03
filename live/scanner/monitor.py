@@ -93,11 +93,8 @@ async def _poll_once(
         ticker = item["ticker"]
         quartile = item["scanner_quartile"]
 
-        if quartile not in CFG.scanner.trade_quartiles:
-            log.debug("Scanner gate: %s Q%d rejected (trade_quartiles=%s)",
-                      ticker, quartile, CFG.scanner.trade_quartiles)
-            continue
-
+        # Quartile gate removed (SlopeGate F_ss core swap) — all quartiles admitted.
+        # NOTE: this module is an unused duplicate; the live scanner is live/scanner_monitor.py.
         if ticker in closed_today:
             log.debug("Scanner gate: %s already closed today", ticker)
             continue

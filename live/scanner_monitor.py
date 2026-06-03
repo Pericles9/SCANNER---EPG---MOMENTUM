@@ -16,7 +16,6 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
-from datetime import time as dtime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -50,13 +49,6 @@ def get_last_scanner_snapshot() -> list[dict]:
     return last_scanner_snapshot
 _GAINERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers"
 
-# Peak trading windows (ET). Bounds: [start, end).
-# Used when CFG.scanner.peak_hours_only is True.
-_PEAK_WINDOWS: list[tuple[dtime, dtime]] = [
-    (dtime(9, 30), dtime(11, 30)),
-    (dtime(14, 0), dtime(16, 0)),
-]
-
 
 @dataclass
 class ScannerContext:
@@ -81,35 +73,6 @@ class SnapshotRecord:
 def get_now_et() -> datetime:
     """Return current datetime in US/Eastern timezone."""
     return datetime.now(_ET)
-
-
-def is_peak_hours(dt: Optional[datetime] = None) -> bool:
-    """Return True if dt (default: now ET) falls in a peak trading window.
-
-    Peak windows: 09:30-11:30 ET and 14:00-16:00 ET. Start is inclusive, end is exclusive.
-    """
-    if dt is None:
-        dt = get_now_et()
-    t = dt.time()
-    return any(start <= t < end for start, end in _PEAK_WINDOWS)
-
-
-def _evaluate_entry_gate(quartile: int, dt: Optional[datetime] = None) -> bool:
-    """Admit tickers according to config.
-
-    When CFG.scanner.peak_hours_only is True: Q1+Q2 during peak hours only
-    (09:30-11:30 and 14:00-16:00 ET); all else rejected.
-    When False: all quartiles Q1–Q4 admitted at all hours.
-    """
-    if not CFG.scanner.peak_hours_only:
-        return True
-    if not is_peak_hours(dt):
-        log.debug("[scanner] gate: off-peak — rejecting all tickers")
-        return False
-    if quartile not in (1, 2):
-        log.debug("[scanner] gate: Q%d rejected (peak hours, but not Q1 or Q2)", quartile)
-        return False
-    return True
 
 
 async def build_snapshot_context(
@@ -271,10 +234,10 @@ async def _poll_once(
         qualifying_tickers = {ctx.ticker for ctx in contexts}
         await universe_mgr.handle_snapshot_dropoffs(qualifying_tickers)
 
-    now_et = get_now_et()
+    # Quartile gate removed (SlopeGate F_ss core swap): every eligible name clearing
+    # the gap threshold is admitted at all hours. Entry selection now belongs to the
+    # setup filter. scanner_quartile is still computed/stored as an analysis field.
     for ctx in contexts:
-        if not _evaluate_entry_gate(ctx.scanner_quartile, now_et):
-            continue
         if ctx.ticker in closed_today:
             log.debug("[scanner] gate: %s already closed today", ctx.ticker)
             continue

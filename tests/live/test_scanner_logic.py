@@ -18,7 +18,6 @@ import pytest
 
 from live.feed.universe import UniverseManager
 from live.scanner.context import compute_scanner_context
-from live.scanner_monitor import _evaluate_entry_gate
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -149,15 +148,6 @@ def test_quartile_user_spec_example():
 
 
 # ── Test 5 — all quartiles enter the universe (no quartile gate) ──────────────
-
-def test_all_quartiles_pass_entry_gate():
-    """With peak_hours_only=False (locked default), every quartile passes _evaluate_entry_gate."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    et = datetime(2026, 5, 26, 10, 0, 0, tzinfo=ZoneInfo("America/New_York"))
-    for q in (1, 2, 3, 4):
-        assert _evaluate_entry_gate(q, et) is True, f"Q{q} must not be blocked"
-
 
 def test_all_quartiles_enter_universe_via_reconciliation():
     """Mock 4 tickers (one per quartile) → add_ticker called for all 4."""

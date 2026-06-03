@@ -13,7 +13,8 @@ import numpy as np
 from backtest.runner import session_bucket
 
 from core.epg.anchor import EventAnchor
-from core.epg.gate import GateState, ParticipationGate
+from core.epg.gate import GateState
+from core.epg.gate_variants import SlopeGate
 from core.exits.luld_proximity import LuldProximityExit, ProximityState
 from core.hawkes.engine import HawkesEngine, HawkesState
 from core.hawkes.forgetting import HawkesParams, fit_online
@@ -21,7 +22,7 @@ from core.hawkes.forgetting import HawkesParams, fit_online
 from live.config import CFG
 from live.orders.risk import OrderRequest
 from live.signals.context_fetch import ContextFetchResult
-from backtest.setup_filter import SUSTAIN_BARS, SetupFilterResult, run_setup_filter
+from backtest.setup_filter import SetupFilterResult, run_setup_filter
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class SignalResult:
     q_tilde: Optional[float]
     order_signal: Optional[str]   # 'ENTRY', 'EXIT_D', 'LULD', 'EPG_CLOSE', or None
     is_trade: bool
-    disqualify: bool = False      # True → SF failed SUSTAIN_BARS consecutive bars; remove from universe
+    disqualify: bool = False      # True → SF failed removal_bars consecutive bars; remove from universe
     side: Optional[int] = None                          # Lee-Ready: 0=BUY, 1=SELL (trades only)
     signal_events: list = field(default_factory=list)   # per-transition only; tuples for batch writer
     hawkes_refit_record: Optional[tuple] = None         # set when a refit fires
@@ -48,9 +49,13 @@ class SignalResult:
 class LiveSignalState:
     """Per-ticker signal state machine.
 
-    Wraps HawkesEngine, EventAnchor, ParticipationGate, LuldProximityExit,
+    Wraps HawkesEngine, EventAnchor, SlopeGate (F_ss), LuldProximityExit,
     and the rolling setup filter. Returns SignalResult on each tick.
     Never touches DB or broker directly.
+
+    Entry = SlopeGate rising edge (FAIL/INACTIVE -> PASS) AND setup-filter admission
+    (Q_tilde >= threshold on the current bar). Sole strategy exit = SlopeGate PASS->FAIL.
+    EXIT_D and LULD are retained but gated on their config enable flags (both off).
     """
 
     def __init__(
@@ -63,7 +68,10 @@ class LiveSignalState:
         self._ticker = ticker
         self._engine: HawkesEngine = ctx.engine
         self._anchor: EventAnchor = ctx.anchor
-        self._gate: ParticipationGate = ctx.gate
+        self._gate: SlopeGate = ctx.gate
+        # SlopeGate has no public t_event; track activation in the wiring so we never
+        # reach into gate internals. True once EventAnchor has fired T_event.
+        self._gate_activated: bool = ctx.gate_activated
         self._luld = LuldProximityExit()
         self._session_date = session_date
 
@@ -77,11 +85,24 @@ class LiveSignalState:
         self._sf_sizes: list[int] = list(ctx.tick_sizes.astype(int))
         self._last_bar_minute: int = self._sf_ts[-1] // (_NS_PER_SEC * 60) if self._sf_ts else -1
 
+        # Setup-filter gate config (Task 4 — SF is now the live entry gate).
+        # 1-bar admission: Q_tilde[-1] >= q_threshold (warmup uses the provisional
+        # threshold for the first warmup_bars). 15-min persistence (sf.passes) is
+        # intentionally NOT used as the gate. De-qualification keeps removal_bars
+        # of hysteresis. setup_filter.py math is untouched — this is pure wiring.
+        self._sf_q_threshold: float = CFG.setup_filter.q_threshold
+        self._sf_warmup_threshold: float = CFG.setup_filter.warmup_provisional_threshold
+        self._sf_warmup_bars: int = CFG.setup_filter.warmup_bars
+        self._sf_removal_bars: int = CFG.setup_filter.removal_bars
+
         sf = ctx.setup_filter_result
         self._current_q_tilde: Optional[float] = (
             float(sf.q_tilde[-1]) if sf and len(sf.q_tilde) > 0 else None
         )
-        self._current_sf_passes: bool = sf.passes if sf else False
+        # Live entry-admission flag (Q_tilde >= threshold on the current bar).
+        self._sf_entry_ok: bool = (
+            self._sf_admit(sf.q_tilde) if sf and len(sf.q_tilde) > 0 else False
+        )
 
         # Hawkes refit tracking
         self._lambda_ref: float = ctx.lambda_ref_fitted or ctx.lambda_ref_global
@@ -216,8 +237,9 @@ class LiveSignalState:
         # at exp(20) ≈ 4.85e8 (ekf.py:53), which saturates on millisecond inter-arrivals
         # and fires T_event trivially. Backtest also uses lam_buy + lam_sell (runner.py:440).
         t_ev = self._anchor.update(hawkes_state.lambda_total, t_sec)
-        if t_ev is not None and self._gate.t_event is None:
+        if t_ev is not None and not self._gate_activated:
             self._gate.activate(t_ev)
+            self._gate_activated = True
             events.append((
                 CFG.strategy_id, self._ticker, self._session_date,
                 ts_ns, "T_EVENT_FIRE",
@@ -230,7 +252,7 @@ class LiveSignalState:
         dollar_vol = price * size
         gate_state: GateState = (
             self._gate.update(dollar_vol, t_sec)
-            if self._gate.t_event is not None
+            if self._gate_activated
             else GateState.INACTIVE
         )
 
@@ -350,6 +372,19 @@ class LiveSignalState:
             return -1
         return 1
 
+    def _sf_admit(self, q_tilde) -> bool:
+        """1-bar setup-filter admission on the current (last) bar.
+
+        Uses the provisional warmup threshold for the first warmup_bars, then the
+        normal q_threshold. This is the live entry gate (admission_bars=1); the
+        15-bar sf.passes persistence is deliberately not consulted.
+        """
+        n = len(q_tilde)
+        if n == 0:
+            return False
+        thr = self._sf_warmup_threshold if n < self._sf_warmup_bars else self._sf_q_threshold
+        return float(q_tilde[-1]) >= thr
+
     def _recompute_setup_filter(self) -> None:
         if not self._sf_ts:
             return
@@ -364,17 +399,22 @@ class LiveSignalState:
                 session_start_ns=self._session_start_ns,
                 session_end_ns=self._session_end_ns,
             )
-            self._current_sf_passes = sf.passes
-            self._current_q_tilde = float(sf.q_tilde[-1]) if len(sf.q_tilde) > 0 else None
-            if sf.passes:
+            q_last = float(sf.q_tilde[-1]) if len(sf.q_tilde) > 0 else None
+            self._current_q_tilde = q_last
+            # 1-bar admission gate (Task 4).
+            self._sf_entry_ok = self._sf_admit(sf.q_tilde)
+            # De-qualification hysteresis: q̃ < q_threshold for removal_bars consecutive
+            # bars removes the ticker from the universe. Uses q_threshold (not the warmup
+            # provisional threshold) per the removal_bars spec.
+            if q_last is not None and q_last >= self._sf_q_threshold:
                 self._sf_fail_bars = 0
             else:
                 self._sf_fail_bars += 1
-                if self._sf_fail_bars >= SUSTAIN_BARS and not self._sf_disqualified:
+                if self._sf_fail_bars >= self._sf_removal_bars and not self._sf_disqualified:
                     self._sf_disqualified = True
                     log.warning(
                         "%s: SF disqualified — q̃ < %.2f for %d consecutive bars",
-                        self._ticker, 0.65, self._sf_fail_bars,
+                        self._ticker, self._sf_q_threshold, self._sf_fail_bars,
                     )
         except Exception:
             log.exception("%s: setup filter recompute failed", self._ticker)
@@ -443,13 +483,18 @@ class LiveSignalState:
         price: float,
         bkt: str,
     ) -> Optional[str]:
-        # EPG rising edge: transition from non-PASS → PASS
+        # SlopeGate rising edge: transition from non-PASS (FAIL/INACTIVE) → PASS
         rising_edge = (gate_state == GateState.PASS and self._prev_gate_state != GateState.PASS)
         if not rising_edge:
             return None
 
         # Gap gate
         if self._intraday_pct < CFG.scanner.gap_threshold:
+            return None
+
+        # Setup-filter entry gate (Task 4) — required for BOTH first entry and re-entry.
+        # Admission = Q_tilde >= threshold on the current bar (1-bar admission).
+        if not self._sf_entry_ok:
             return None
 
         return "ENTRY"
@@ -467,16 +512,16 @@ class LiveSignalState:
         if self._exit_signaled:
             return None
 
-        # EXIT_D (first priority)
-        if self._check_exit_d(hawkes_state, t_sec, bkt):
+        # EXIT_D (retained but disabled via config flag — code never runs while off)
+        if CFG.exit_d.enabled and self._check_exit_d(hawkes_state, t_sec, bkt):
             return "EXIT_D"
 
-        # LULD proximity (RTH only per config)
-        if not CFG.luld.rth_only or bkt == "regular_hours":
+        # LULD proximity (retained but disabled via config flag; RTH only when enabled)
+        if CFG.luld.enabled and (not CFG.luld.rth_only or bkt == "regular_hours"):
             if luld_result.state == ProximityState.EXIT_HALT:
                 return "LULD"
 
-        # EPG window close: PASS → FAIL or INACTIVE
+        # Sole strategy exit: SlopeGate window close, PASS → FAIL or INACTIVE
         if self._prev_gate_state == GateState.PASS and gate_state in (
             GateState.FAIL, GateState.INACTIVE
         ):

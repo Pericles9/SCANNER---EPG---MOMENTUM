@@ -1,7 +1,7 @@
 # CLAUDE.md — Live System Build Instructions
 
-> This file is the authoritative instruction set for building the EPG live paper trading system.
-> You are implementing a fully designed, research-validated system. You are not making design decisions.
+> This file is the authoritative instruction set for the EPG live paper trading system.
+> The system is built and running. Read this before modifying anything.
 > When this file conflicts with any other document, this file wins.
 
 ---
@@ -10,543 +10,311 @@
 
 ```text
 repo/
-├── backtest/                  ← existing research + backtest code — READ ONLY
-├── live/                      ← you are building this
-│   └── signals/setup_filter.py  ← standalone setup filter — import, do not rebuild
-├── CLAUDE.md                  ← top-level project brief (read for strategy context)
-├── live_system_architecture.md   ← full architecture spec (read before starting)
-├── Schema.md                  ← backtest data schema reference
-└── Tradeable Setup Filter.md  ← setup filter math + design
+├── backtest/                  ← research + backtest code — READ ONLY
+├── live/                      ← the running system
+├── live_system_architecture.md   ← full architecture spec
+├── Tradeable Setup Filter.md  ← setup filter math + design
+└── Schema.md                  ← backtest data schema reference
 ```
 
-**Read before writing any code:**
+**Read before touching signal code:**
 
-1. `../live_system_architecture.md` — full architecture, PostgreSQL schemas, all locked decisions
-2. `../CLAUDE.md` — strategy overview, Phase G v2 gate, locked decisions list
-3. `../Tradeable Setup Filter.md` — setup filter spec
-4. `strategy.json` — config values (in this directory)
+1. `../live_system_architecture.md` — architecture, PostgreSQL schemas, locked decisions
+2. `strategy.json` — all config values (in this directory)
+3. `../Tradeable Setup Filter.md` — setup filter math
 
 ---
 
 ## What Exists in backtest/ — Do Not Rebuild
 
-Before writing any signal code, locate these in `backtest/` and confirm their exact import paths:
-
 | Component | File | Import Statement |
 | --- | --- | --- |
 | `_hawkes_replay_with_refit` | `backtest/runner.py` | `from backtest.runner import _hawkes_replay_with_refit` |
 | `EventAnchor` | `backtest/core/epg/anchor.py` | `from backtest.core.epg.anchor import EventAnchor` |
-| `ParticipationGate` | `backtest/core/epg/gate.py` | `from backtest.core.epg.gate import ParticipationGate, GateState` |
-| `LuldProximityExit` | `backtest/core/exits/luld_proximity.py` | `from backtest.core.exits.luld_proximity import LuldProximityExit, ProximityState` |
+| `SlopeGate` (live gate) | `backtest/core/epg/gate_variants.py` | `from core.epg.gate_variants import SlopeGate` |
+| `GateState` | `backtest/core/epg/gate.py` | `from core.epg.gate import GateState` |
+| `ParticipationGate` | `backtest/core/epg/gate.py` | retained in backtest — NOT the live gate |
+| `LuldProximityExit` | `backtest/core/exits/luld_proximity.py` | `from core.exits.luld_proximity import LuldProximityExit, ProximityState` |
 | `session_bucket()` | `backtest/runner.py` | `from backtest.runner import session_bucket` |
-| `_et_offset_ns()` | `backtest/data/loaders/trades.py` | `from backtest.data.loaders.trades import _et_offset_ns` |
-| `_session_ns_bounds()` | `backtest/data/loaders/trades.py` | `from backtest.data.loaders.trades import _session_ns_bounds` |
 | `SetupFilterResult` + `run_setup_filter` | `backtest/setup_filter.py` | `from backtest.setup_filter import SetupFilterResult, run_setup_filter` |
 
-**Important:** The canonical `setup_filter.py` lives at `backtest/setup_filter.py`. The original spec listed `SetupFilter` as the import target; no such class exists. The public API is `SetupFilterResult` (dataclass) and `run_setup_filter` (function). See `## Import Notes` for details.
+**The live EPG gate is `SlopeGate` (F_ss), not `ParticipationGate`.** `ParticipationGate` exists in backtest and is importable, but the live system does not use it. Do not import it into live code.
 
-**Do not reimplement any of these.** If you cannot locate a component, stop and report the path issue rather than writing a replacement.
+**`SetupFilter` class does not exist.** The public API is `SetupFilterResult` (dataclass) and `run_setup_filter` (function). `LiveSignalState` calls `run_setup_filter()` directly each minute and reads `q_tilde[-1]` for the entry gate.
+
+**`backtest/runner.py` imports trigger Numba JIT.** Cold import takes 10–30 seconds. The Dockerfile warms this at container start.
 
 ---
 
-## Target File Structure
-
-Build exactly this layout. Do not add files not listed here without flagging it first.
+## File Structure (as built)
 
 ```
 live/
 ├── CLAUDE.md                  ← this file
-├── strategy.json              ← config (already written — read it)
-├── docker-compose.yml         ← Step 1
-├── Dockerfile                 ← Step 1
-├── requirements.txt           ← Step 1
-├── init_db.sql                ← Step 1 — all PostgreSQL table definitions
-├── main.py                    ← entry point — launches all 3 processes
-├── config.py                  ← loads and validates strategy.json
+├── strategy.json              ← config
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── init_db.sql                ← all PostgreSQL table definitions
+├── main.py                    ← entry point
+├── config.py                  ← loads + validates strategy.json
 │
 ├── scanner/
 │   ├── __init__.py
-│   ├── monitor.py             ← Step 3 — Process 1, Polygon REST poller
-│   └── context.py            ← Step 3 — scanner_quartile + context field computation
+│   ├── monitor.py             ← stale duplicate, unused — live scanner is scanner_monitor.py
+│   └── context.py             ← scanner_quartile + context field computation
 │
 ├── feed/
 │   ├── __init__.py
-│   ├── universe.py            ← Step 5 — Universe manager
-│   ├── context.py            ← Step 5 — TickerContext dataclass
-│   └── signal_loop.py         ← Step 5 — per-ticker asyncio.Task
+│   ├── universe.py            ← Universe manager
+│   ├── context.py             ← TickerContext dataclass
+│   ├── signal_loop.py         ← per-ticker asyncio.Task
+│   └── market_status.py       ← Polygon market status + holiday cache
 │
 ├── signals/
 │   ├── __init__.py
-│   ├── live_state.py          ← Step 5 — LiveSignalState wrapping backtest components
-│   └── context_fetch.py       ← Step 4 — historical context fetch + Hawkes warmup
+│   ├── live_state.py          ← LiveSignalState — SlopeGate, Hawkes, SF gate
+│   └── context_fetch.py       ← cold-start context fetch + Hawkes + SlopeGate replay
+│
+├── scanner_monitor.py         ← Process 1 (the live scanner — not scanner/monitor.py)
+│
+├── ticker_classifier.py       ← CS-on-XNYS/XNAS filter
 │
 ├── orders/
 │   ├── __init__.py
-│   ├── worker.py              ← Step 6 — Process 3, single order_queue consumer
-│   ├── risk.py                ← Step 7 — RiskState
-│   └── ibkr.py               ← Step 6 — IBKR execution wrapper (ib_insync)
+│   ├── worker.py              ← Process 3, single order_queue consumer
+│   ├── risk.py                ← RiskState
+│   └── ibkr.py               ← IBKR execution wrapper (ib_insync)
 │
 ├── db/
 │   ├── __init__.py
-│   ├── pool.py                ← Step 1 — asyncpg connection pool setup
-│   ├── writer.py              ← Step 6 — async batch writer (1s flush, COPY protocol)
-│   └── models.py             ← Step 1 — Python-side table column definitions matching init_db.sql
+│   ├── pool.py                ← asyncpg connection pool
+│   ├── writer.py              ← async batch writer (1s flush, COPY protocol)
+│   └── models.py              ← Python-side column definitions
+│
+├── recovery/
+│   ├── __init__.py
+│   └── crash_recovery.py      ← startup position reconciliation + flatten
+│
+├── bot/
+│   ├── __init__.py
+│   ├── bot.py
+│   ├── handlers.py
+│   ├── formatters.py
+│   ├── probes.py
+│   ├── ratelimit.py
+│   └── auth.py
 │
 ├── alerts/
 │   ├── __init__.py
-│   └── telegram.py            ← Step 8 — Telegram bot + kill switch
+│   └── telegram.py            ← Telegram bot + kill switch
 │
 └── export/
     ├── __init__.py
-    └── session.py             ← Step 9 — end-of-session parquet export
+    └── session.py             ← end-of-session parquet export
 ```
 
 ---
 
-## Build Order — Follow This Exactly
+## Process 1 — Scanner Monitor (`scanner_monitor.py`)
 
-Do not start a step before the previous one is complete and tested.
+Polls `GET /v2/snapshot/locale/us/markets/stocks/gainers` every `poll_interval_s` seconds.
 
-### Step 1 — Infrastructure
+**Admission:** `todaysChangePerc >= gap_threshold (0.30)` AND ticker is common stock on XNYS/XNAS (`TickerClassifier`). **No quartile gate.** All Q1–Q4 names that clear the gap are admitted at all hours. Entry selection is the setup filter's job.
 
-Files: `docker-compose.yml`, `Dockerfile`, `requirements.txt`, `init_db.sql`, `db/pool.py`, `db/models.py`
+`scanner_quartile`, `scanner_rank`, `scanner_heat`, `scanner_n` are still **computed and stored** in `scanner_snapshots` and `sessions` as analysis fields — they do not gate anything.
 
-- `docker-compose.yml`: two services — `trading` and `db`. `trading` depends on `db`. All config via env vars.
-- `Dockerfile`: Python 3.11+. Install requirements. No hardcoded paths.
-- `requirements.txt`: `ib_insync`, `asyncpg`, `polygon-api-client`, `python-telegram-bot`, `numba`, `numpy`, `pandas`, `pyarrow`, `aiohttp`, `aiofiles`
-- `init_db.sql`: Create all tables. **Use the exact schemas from `../live_system_architecture.md` Section 9.** Do not alter column names, types, or constraints. Tables: `strategies`, `scanner_snapshots`, `ticks`, `quotes`, `positions`, `orders`, `trades`, `sessions`, `hawkes_refits`, `signal_events`.
-- `db/pool.py`: asyncpg connection pool. Single pool, shared across all consumers. `DB_URL` from env.
-- `db/models.py`: Python-side column lists matching each table — used by the batch writer's COPY calls.
+**`closed_today` set:** real session closes (EPG_CLOSE, EOD, session_close, crash recovery) lock the ticker out for the day. `scanner_dropoff` removals do NOT add to `closed_today` — a ticker that bounces back into the snapshot can re-enter.
 
-**Verify:** `docker-compose up` brings up both containers. DB init script runs clean. Python can connect to DB.
+Reconciliation runs both directions each poll: push every qualifying ticker to universe (idempotent), call `universe.handle_snapshot_dropoffs(qualifying_set)` to remove absent tickers with no open position.
 
 ---
 
-### Step 2 — Config
+## Process 2 — Historical Context Fetch (`signals/context_fetch.py`)
 
-Files: `config.py`
-
-- Load and validate `strategy.json`.
-- Expose a single `Config` dataclass. All other modules import from here — no module reads `strategy.json` directly.
-- Fail loudly on missing required fields. No silent defaults for trading parameters.
-- Check `strategy.json` for any fields marked `"REQUIRED_FROM_BACKTEST"` — if any remain unfilled, raise at startup with a clear message identifying which fields need backtest values.
-
----
-
-### Step 3 — Scanner Monitor (Process 1)
-
-Files: `scanner/monitor.py`, `scanner/context.py`
-
-**`scanner/context.py` — scanner_quartile algorithm:**
-
-```python
-def compute_scanner_context(qualifying: list[dict]) -> list[dict]:
-    """
-    qualifying: list of dicts with 'ticker' and 'pct_change' keys.
-    Returns each dict augmented with: scanner_rank, scanner_n, scanner_heat,
-    scanner_quartile, and the raw snapshot for storage.
-
-    scanner_quartile algorithm (Phase G v2 — momentum-weighted):
-      1. Sort descending by pct_change.
-      2. total = sum(pct_change for all qualifying names)
-      3. Walk accumulating running sum:
-         - running < total/4  → Q1
-         - running < total/2  → Q2
-         - running < 3*total/4 → Q3
-         - else               → Q4
-      Q1 = dominant movers. Q4 = secondary. Gate: only Q3 and Q4 enter.
-    """
+Fired per ticker at scanner admission. Two concurrent Polygon REST calls:
+```
+GET /v3/trades/{ticker}?timestamp.gte={4am_et_ns}&limit=25000   (paginated)
+GET /v2/aggs/ticker/{ticker}/range/1/minute/{date}/{date}
 ```
 
-**`scanner/monitor.py`:**
-- Poll `GET /v2/snapshot/locale/us/markets/stocks/gainers` every `config.scanner.poll_interval_s` seconds.
-- Filter: `todaysChangePerc >= config.scanner.gap_threshold` (0.30).
-- Capture the **full qualifying snapshot** — not just the triggered ticker. All context fields require the full picture.
-- Call `compute_scanner_context()` on the full list.
-- **No quartile gate — all Q1–Q4 tickers are passed to the universe manager.** `scanner_quartile` is still computed, stored in `scanner_snapshots`, and recorded at entry on `trades` (research field).
-- Write full snapshot JSON to `scanner_snapshots` table (one row per poll that has ≥1 qualifying name).
-- Reconcile the universe **in both directions** each poll: (1) push every qualifying ticker to the universe manager (idempotent), (2) call `universe.handle_snapshot_dropoffs(qualifying_set)` to remove tickers absent from the snapshot that have no open position.
-- `closed_today` set: real session closes (EPG_CLOSE, EXIT_D, LULD, EOD, session_close) lock the ticker out for the day. `scanner_dropoff` removals do NOT add to `closed_today` — a ticker that bounces back into the snapshot can re-enter the universe.
-- Refresh `last_scanner_snapshot` on every poll so the `/scanner` bot command can read it.
+**What it does:**
+1. Replay all historical trades through `_hawkes_replay_with_refit` (backtest code, unchanged).
+2. Set `lambda_v_ref` from the cold-start reference: `mu_buy + mu_sell` (fitted or global). **NOT equilibrium formula.** The offline `compute_lambda_ref_per_event` (parquet-catalog lookup) and `compute_global_fallback_ref` (training process-pool) are not usable in the live path.
+3. Construct `SlopeGate(tau_sec=180, L_sec=30, k_open=0.5, k_close=0.0, mode="ss", lambda_v_ref=..., warmup_seconds=300)`.
+4. Replay `EventAnchor` → `SlopeGate` through all historical ticks, populating the gate's 30s lookback buffer.
+5. Run `run_setup_filter()` on the full historical tick buffer so SF is warm at go-live.
+6. Pass the **gate instance** (not params) into `LiveSignalState` via `ContextFetchResult`. The `_in_pass` state and lookback buffer must survive the live/historical boundary.
+7. At handoff: drop any live tick with `sip_timestamp <= last_historical_ts`. Dedup is non-negotiable.
 
-**Verify:** Run against Polygon. Confirm context fields compute correctly. Confirm all quartiles pass. Confirm snapshot writes to DB. Confirm `/scanner` returns universe + snapshot block.
-
----
-
-### Step 4 — Historical Context Fetch
-
-Files: `signals/context_fetch.py`
-
-This step warms up the Hawkes model and EPG gate before live ticks arrive. It must complete in 2-4 seconds.
-
-```
-Two concurrent Polygon REST calls:
-  GET /v3/trades/{ticker}?timestamp.gte={4am_et_ns}&limit=50000
-  GET /v2/aggs/ticker/{ticker}/range/1/minute/{date}/{date}
-```
-
-**Exact behaviour:**
-
-1. Fire both REST calls concurrently with `asyncio.gather`.
-2. Replay all historical trades into `_hawkes_replay_with_refit` — reuse backtest code exactly.
-3. Set `lambda_ref` from cold-start: `mu_buy + mu_sell` — **NOT the equilibrium formula**.
-4. Replay `EventAnchor` + `ParticipationGate` through all historical ticks in timestamp order.
-5. The resulting gate instance (not its params) is passed into `LiveSignalState`. `prev_state` must survive the historical→live boundary intact.
-6. At handoff: drop any live tick with `sip_timestamp <= last_historical_ts`. Dedup is non-negotiable.
+**`gate_activated` flag:** `SlopeGate` has no public `t_event` property. Activation is tracked by a wiring boolean (`gate_activated` on `ContextFetchResult`, `_gate_activated` on `LiveSignalState`). Never reach into gate internals.
 
 **Fallback tiers:**
 
 | Historical trade count | Action |
 |---|---|
-| ≥ 1000 | Full replay — normal path |
-| 100–999 | Use global `lambda_ref` fallback. Log DEGRADED. EPG gate starts from zero state. |
+| ≥ 1000 | Full replay — normal path. `lambda_v_ref` from fitted params. |
+| 100–999 | Global `lambda_ref` fallback. Log DEGRADED. Gate starts from zero state. |
 | < 100 | Proceed with caution. Log DEGRADED with count. |
-| Timeout (> 10s) | Global `lambda_ref` fallback. EPG from zero. Log DEGRADED. |
-
-**Write to `sessions` table** on context fetch completion: `context_fetch_ms`, `cold_start_n`, `degraded_mode`, `lambda_ref_global`, `lambda_ref_fitted`, `mu_buy_fitted`, `mu_sell_fitted`.
-
-**Verify:** Time the fetch against a hot pre-market name. Target < 4 seconds total. Confirm dedup logic drops ticks at the boundary.
+| Timeout (> 10s) | Global `lambda_ref`. Gate from zero. Log DEGRADED. |
 
 ---
 
-### Step 5 — Feed + Signal Loop (Process 2)
+## Process 2 — Signal Loop and LiveSignalState
 
-Files: `feed/context.py`, `feed/universe.py`, `feed/signal_loop.py`, `signals/live_state.py`
+### Signal Stack (per tick)
 
-**`feed/context.py` — TickerContext dataclass:**
-```python
-@dataclass
-class TickerContext:
-    ticker: str
-    queue: asyncio.Queue          # bounded — drop on full, log WARNING
-    signal_state: LiveSignalState
-    task: asyncio.Task
-    state_ready: asyncio.Event    # set after context fetch completes
-    scanner_context: dict         # scanner fields at trigger time
-    closed_today: bool = False
+```
+Hawkes update (lambda_buy, lambda_sell)
+    → EventAnchor (fires T_event once)
+    → SlopeGate.update(dollar_vol, t_sec)
+    → Setup filter recompute (1-min boundary only)
+    → Entry / exit evaluation
 ```
 
-**`signals/live_state.py` — LiveSignalState:**
-- Wraps the backtest `EventAnchor`, `ParticipationGate`, and `SetupFilter` instances.
-- Exposes `update_trade(tick)` and `update_quote(quote)` methods.
-- Internally calls Hawkes update → EPG gate → EXIT_D → LULD check → setup filter update.
-- Returns `SignalResult` on each tick: includes `order_signal` (None or an OrderRequest), plus current state snapshot for batch writing.
-- **Never touches the DB or broker directly.** Returns data; caller decides what to do with it.
+### Entry Rule
 
-**Lee-Ready classification:**
-- Use last known quote (bid/ask). No buffering.
-- Trade at ask or above → BUY. Trade at bid or below → SELL. Between → tick test (sign of last price change).
-- Accept occasional stale classification. This is the locked decision.
+**Both conditions required** (first entry AND re-entry):
+1. **SlopeGate rising edge** — previous state was not PASS, current state is PASS.
+2. **Setup-filter admission** — `q_tilde[-1] >= q_threshold` on the current bar.
 
-**`feed/signal_loop.py` — per-ticker task:**
-```python
-async def signal_loop(ctx: TickerContext, order_queue: asyncio.Queue):
-    await ctx.state_ready.wait()   # block until context fetch done
-    async for raw_msg in ctx.queue:
-        if is_trade(raw_msg):
-            result = ctx.signal_state.update_trade(raw_msg)
-        else:
-            result = ctx.signal_state.update_quote(raw_msg)
+During the warmup phase (first `warmup_bars=65` bars), the provisional threshold `warmup_provisional_threshold=0.75` applies instead of `q_threshold=0.65`.
 
-        # Accumulate for batch writer
-        hot_ticks.append(...)
-        hot_signal_events.append(...)
+The 15-minute persistence requirement (`sf.passes`) is **not used as the live entry gate**. `run_setup_filter` is still called every minute and `sf.q_tilde[-1]` is read directly.
 
-        if result.order_signal:
-            order_queue.put_nowait(result.order_signal)
+### Exit Rule
 
-        heartbeat.update(ctx.ticker)   # dead man's switch
-```
+**Sole strategy exit:** SlopeGate PASS→FAIL or PASS→INACTIVE (`EPG_CLOSE`).
 
-**Dead man's switch:** If no heartbeat update for > 30 seconds while a position is open → `order_queue.put_nowait(FlattenAllRequest())` immediately.
+**EXIT_D** — code is present in `_check_exit_d()` but is **disabled** via `CFG.exit_d.enabled = False`. The evaluation block is gated on that flag and never runs.
 
-**LULD halts:** On halt detection, freeze signal state (stop processing ticks). Resume on first post-halt tick. Do not force-exit on halt alone.
+**LULD proximity** — code is present in `_check_exits()` but is **disabled** via `CFG.luld.enabled = False`. Same pattern.
 
-**Pre-market soft halt:** No quote update for > 30 seconds → pause processing. Do not force-exit.
+**Do not remove EXIT_D or LULD code.** Both must remain importable and their evaluation blocks must remain gated on their enable flags. Re-enabling is one config line.
 
-**Universe manager — ticker lifecycle:**
-1. Ticker arrives from scanner queue.
-2. Check `closed_today` — skip if true.
-3. Fire `context_fetch` as an asyncio task. Set `state_ready` event on completion.
-4. Create `TickerContext`. Start signal loop task.
-5. Subscribe `T.{ticker}` and `Q.{ticker}` on Polygon WebSocket.
+### Setup-Filter De-qualification (universe removal)
 
-On ticker removal (session close):
-1. Pop from universe dict.
-2. Cancel signal loop task.
-3. Unsubscribe from WebSocket.
-**That order. Not reversed.**
-
-**`feed/universe.py` — feed dispatch:**
-```python
-async def feed_dispatch(raw_message: dict):
-    ticker = raw_message.get("sym")
-    if ticker not in universe:
-        return   # late message after unsubscribe — safe to drop
-    ctx = universe[ticker]
-    try:
-        ctx.queue.put_nowait(raw_message)
-    except asyncio.QueueFull:
-        log.warning(f"{ticker}: queue full, dropping tick")
-```
-
-**Verify:** Feed dispatch drops late ticks cleanly. Heartbeat fires correctly. Dead man's switch triggers on simulated stall.
+When `q_tilde[-1] < q_threshold` for `removal_bars=15` **consecutive bars** (not the same 15-bar persistence as `sf.passes`), `_sf_disqualified` is set and `disqualify=True` is returned in `SignalResult`. The signal loop calls the disqualify callback → `universe.remove_ticker("sf_disqualified")`. This is hysteresis to prevent universe thrash.
 
 ---
 
-### Step 6 — Order Worker (Process 3)
+## Process 3 — Order Worker (`orders/worker.py`)
 
-Files: `orders/worker.py`, `orders/ibkr.py`, `db/writer.py`
+Single asyncio consumer. The only coroutine that writes to `RiskState` or touches the broker.
 
-**`orders/worker.py` — single asyncio consumer:**
-```python
-async def order_worker(order_queue: asyncio.Queue):
-    async for request in order_queue:
-        if not risk_state.allows(request):
-            log.warning(f"Risk check blocked: {request}")
-            continue
-        fill = await ibkr.submit(request)
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                await write_order(conn, fill)
-                await update_position(conn, fill)
-        await telegram.notify_fill(fill)
-```
-
-**Order types by session:**
-- Pre-market: marketable limit. Buy = ask + $0.01. Sell = bid - $0.01. `tif="EXT"`, `outside_rth=True`.
-- RTH: market order. `tif="DAY"`.
-- Cancel unfilled limit orders after 5 seconds. Do not chase. Do not resubmit.
-
-**`db/writer.py` — async batch writer:**
-- Wakes every 1 second.
-- Swaps hot/cold buffers atomically.
-- Uses `asyncpg` `copy_records_to_table` for ticks, quotes, and signal_events.
-- Fills (orders, positions, trades) are written in the order worker via explicit transactions — never batched.
+**Order types:**
+- Pre-market / post-market: marketable limit. Buy = ask + $0.01. Sell = bid - $0.05. `tif="EXT"`, `outside_rth=True`.
+- RTH: limit order (not market — IBKR paper trading quirk). `tif="DAY"`.
+- Cancel unfilled after 5 seconds. Do not chase. Do not resubmit.
 
 **Fills use explicit transactions — non-negotiable:**
 ```python
 async with conn.transaction():
     await conn.execute("INSERT INTO orders ...", *values)
     await conn.execute("UPDATE positions ...", *values)
-    # Raises on failure → auto rollback
 ```
-
-**Verify:** Batch writer flushes correctly. Fill transaction rolls back on simulated DB error. Order cancellation fires after 5s.
 
 ---
 
-### Step 7 — Risk Management
+## Startup — Crash Recovery (`recovery/crash_recovery.py`)
 
-Files: `orders/risk.py`
+Runs before any trading begins. A crash == dead man's switch scenario: cancel all open orders, flatten all open positions, reconcile DB to flat. No smart resume — EPG windows are 30–120s and always expire before a restart completes.
 
-```python
-@dataclass
-class RiskState:
-    daily_pnl: float = 0.0
-    open_positions: dict = field(default_factory=dict)
-    max_daily_loss: float = -500.0   # from config
-    max_concurrent: int = 1          # from config
-
-    def allows(self, request: OrderRequest) -> bool:
-        if self.daily_pnl <= self.max_daily_loss:
-            return False
-        if request.is_entry and len(self.open_positions) >= self.max_concurrent:
-            return False
-        return True
-```
-
-**`order_worker` is the only writer to `RiskState`.** Signal loops read it but never write it.
-
-**IBKR position reconciliation on startup:**
-1. Query IBKR for all open positions.
-2. Sum per-ticker across all strategies from DB.
-3. Compare. If any mismatch: log CRITICAL, halt, do not trade until manually reconciled.
-4. This check runs before any order processing begins.
-
-**Daily loss limit:** Once `daily_pnl <= max_daily_loss`, set a flag. Order worker rejects all new entries for the rest of the session. Log WARNING. Telegram alert.
-
-**Verify:** Reconciliation mismatch halts correctly. Daily loss limit blocks new entries but allows exits.
-
----
-
-### Step 8 — Alerting + Kill Switch
-
-Files: `alerts/telegram.py`
-
-**Telegram alerts — send for:**
-- Entry filled (ticker, side, price, qty, session_bucket, scanner_quartile)
-- Exit filled (ticker, exit reason, PnL %, PnL $)
-- Daily PnL update (every hour during session, and on session close)
-- Risk limit hit
-- Degraded mode activated
-- CRITICAL events (mismatch, dead man's switch, unhandled exception)
-
-**Kill switch — two triggers:**
-1. File watcher: if `live/kill.flag` exists at process startup or appears during runtime → execute kill sequence.
-2. Telegram command: `/kill` → execute kill sequence.
-
-**Kill sequence:**
-```
-1. Set kill flag in RiskState (blocks all new entries)
-2. Cancel all open orders via IBKR
-3. Flatten all open positions via market order
-4. Wait for confirms (max 10s)
-5. Log CRITICAL: KILL SWITCH ACTIVATED
-6. Telegram: "KILL SWITCH: all positions flat, system stopping"
-7. sys.exit(0)
-```
-
-**Verify:** Kill flag file triggers sequence. Telegram `/kill` triggers sequence. Sequence completes cleanly with no open positions.
-
----
-
-### Step 9 — Session Export
-
-Files: `export/session.py`
-
-On session close (end of day or ticker removal):
-- Query `ticks` and `quotes` tables for the session.
-- Export to:
-  ```
-  data/filtered/{TICKER}_{DATE}_{MOM_PCT}/trades.parquet
-  data/filtered/{TICKER}_{DATE}_{MOM_PCT}/quotes.parquet
-  ```
-- `MOM_PCT` = `intraday_pct_at_entry` from the session's first trade, formatted to 2dp (e.g. `0.42`).
-- Column schema must match `filtered/` catalog exactly — backtest pipeline reads these files.
-- Refer to `../Schema.md` for confirmed column names: `sip_timestamp`, `price`, `size`, `exchange`, `conditions` for trades; `sip_timestamp`, `bid_price`, `ask_price`, `bid_size`, `ask_size` for quotes.
-- If no trades were taken, still export ticks and quotes — the data is useful for analysis.
-
-**Verify:** Exported parquet files are readable by the backtest DuckDB ingest pipeline.
+- RTH: market order.
+- Pre/post-market: marketable EXT limit ladder (bid ∓ $0.01 → $0.05 → $0.10).
+- Outside hours: DEFERRED (position tracked, no order sent).
+- DB step: zeroes positions, cancels PENDING orders (`cancel_reason=CRASH_RECOVERY`), writes `CRASH_RECOVERY_CLOSE` audit rows to `signal_events`.
+- Idempotent: DB is zeroed even for stuck/deferred cases because IBKR is re-queried at each startup.
 
 ---
 
 ## Critical Concurrency Rules
 
-These are non-negotiable. Violating them introduces race conditions that are hard to debug in live trading.
-
 | Rule | Detail |
 |---|---|
-| Signal loops never touch broker or DB | They only call `order_queue.put_nowait()` and append to hot buffers |
+| Signal loops never touch broker or DB | `order_queue.put_nowait()` and hot buffers only |
 | `order_worker` is the only `RiskState` writer | Signal loops may read, never write |
-| `order_queue` is the single serialisation point | All order submissions go through it — no direct IBKR calls from signal loops |
+| `order_queue` is the single serialisation point | All order submissions go through it |
 | Universe lifecycle order on removal | Pop dict → cancel task → unsubscribe WS. Never reversed. |
-| Fills use explicit transactions | `async with conn.transaction()` — no bare INSERT for fill records |
+| Fills use explicit transactions | `async with conn.transaction()` — no bare INSERT for fills |
 | Batch writer uses COPY, not INSERT | For ticks, quotes, signal_events |
 
 ---
 
-## Locked Decisions — Do Not Revisit
-
-These are decided. If you think one is wrong, flag it — do not silently change it.
+## Locked Decisions
 
 | Decision | Value |
 |---|---|
-| Scanner entry gate | `todaysChangePerc >= 0.30` — all quartiles traded. One session per ticker per day (scanner_dropoff removals are re-eligible if the ticker bounces back). Reconciliation runs both directions each poll. Implemented in `scanner_monitor._poll_once` + `universe.handle_snapshot_dropoffs`. |
-| `scanner_heat` | Collected and stored. Not the entry gate. |
-| Setup filter threshold | Q̃ ≥ 0.65. Final. |
-| Warmup gate | Q̃ ≥ 0.75 for first 65 bars |
-| Lee-Ready | Last known quote, no buffering |
-| Position sizing (paper v1) | Flat $1,000 RTH / $500 pre-market |
-| EXIT_D pre-market | Disabled pre-market (`pre_market_override: false` in config) |
-| Unfilled limit cancel | 5 seconds — do not chase |
+| Scanner admission | `todaysChangePerc >= 0.30` AND CS on XNYS/XNAS. All quartiles admitted. No quartile gate. |
+| Entry gate | SlopeGate rising edge AND `q_tilde[-1] >= 0.65` (1-bar; 0.75 for first 65 bars). Both required. |
+| EPG gate variant | `SlopeGate` F_ss — `s3_fss_t180_l30_ko5_kc0` (tau=180s, L=30s, k_open=0.5, k_close=0.0, mode=ss, warmup=300s). **Heuristic / unvalidated.** |
+| Sole strategy exit | SlopeGate PASS→FAIL (`EPG_CLOSE`). EXIT_D and LULD disabled via config flags; code retained. |
+| lambda_v_ref (live) | `mu_buy + mu_sell` at cold start (fitted or global) — same as `lambda_ref`. NOT equilibrium formula. NOT the offline `compute_lambda_ref_per_event`. |
+| Setup filter re-entry gate | `q_tilde[-1] >= 0.65` on the current bar, checked in `live_state._sf_admit()`. `sf.passes` (15-bar persistence) is NOT the live gate. |
+| Setup filter de-qualification | 15 consecutive bars `q_tilde[-1] < 0.65` → remove from universe. Config: `removal_bars=15`. |
+| Crash recovery | Flatten all on startup if any open positions. No smart resume. |
+| `scanner_heat` / `scanner_quartile` | Computed and stored as analysis fields only. Neither gates anything. |
+| Lee-Ready | Last known quote, no buffering. Accept occasional stale classification. |
+| Position sizing (paper v1) | Flat $1,000 RTH / $500 pre-market. |
+| Unfilled limit cancel | 5 seconds — do not chase. |
 | Timestamps | All nanoseconds UTC throughout. No timezone assumptions in data layer. |
 | IBKR data | Execution quotes only. Not the primary feed. |
-| Context fetch lambda_ref | `mu_buy + mu_sell` at cold start — NOT equilibrium formula |
+| PDT Rule | Paper trading only until rule change. Do not remove paper trading constraints. |
 
 ---
 
-## Phase H — Do Not Implement
+## Phase H — Do Not Implement Without Explicit Approval
 
-These signals were identified in research but require explicit approval before any code:
+These were identified in research but are not active:
 - Multi-day runner gate
 - TOD midday exclusion (11:30–13:30 ET)
 - Rank × Heat combined filter
+- Quartile-based entry selection (Q3/Q4 preference)
 
-`multi_day_runner` is **collected and stored** in `sessions` and `scanner_snapshots`. It is not an entry gate.
+`multi_day_runner` is **collected and stored** in `sessions`. It is not a gate.
 
 ---
 
-## Known Failure Modes — Handle These
+## Known Failure Modes
 
 | Failure | Required Response |
 |---|---|
-| Context fetch timeout (> 5s) | Global `lambda_ref` fallback. EPG from zero state. Log DEGRADED. Continue. |
+| Context fetch timeout (> 10s) | Global `lambda_ref` fallback. SlopeGate from zero state. Log DEGRADED. Continue. |
 | LULD halt during position | Freeze signal state. Resume on first post-halt tick. Do not exit on halt alone. |
 | Pre-market — no quote > 30s | Soft halt. Pause processing. Do not force-exit. |
 | Queue full | `put_nowait` drops tick. Log WARNING. Bounded by design. |
-| IBKR position mismatch on startup | Log CRITICAL. Halt. Do not trade until manually reconciled. |
+| Open positions on startup | Crash recovery runs. Flattens all before trading begins. |
 | Dead man's switch | No heartbeat > 30s during open position → flatten all immediately. |
 | Unfilled limit order | Cancel after 5s. Do not chase. Do not resubmit. |
-| `dv=0` in setup filter | `τ_t = μ_τ(t-1)` — already handled in `setup_filter.py`. Do not add logic. |
+| `dv=0` in setup filter | `τ_t = μ_τ(t-1)` — handled in `setup_filter.py`. Do not add logic. |
 
 ---
 
-## Key Numbers (For Reference)
+## Key Numbers
 
 - Mean qualifying scanner names per poll: **12.5**
 - Typical hot pre-market tick volume (4am → 9:45am): **10,000–30,000 trades**
-- Context fetch target time: **< 4 seconds** (1-2s REST + < 200ms Numba replay)
+- Context fetch target time: **< 4 seconds**
 - EventAnchor fires **~30s before scanner trigger** — model is already mid-warmup at live handoff
+- SlopeGate lookback buffer: **30s**. Must be populated during replay, not built up from live ticks.
 - Phase G join rate: **94.6%**
-- Strategy ID for this system: `"epg_v1"` — used in all strategy-tagged DB tables
+- Strategy ID: `"epg_v1"` — used in all strategy-tagged DB tables
 
 ---
 
-## Environment Variables Required
+## Environment Variables
 
 ```bash
-# Database
 DB_URL=postgresql://epg:password@db:5432/epg_live
-
-# Polygon
 POLYGON_API_KEY=
-
-# IBKR
-IBKR_HOST=127.0.0.1
-IBKR_PORT=4002        # IB Gateway paper trading port
+IBKR_HOST=host.docker.internal   # Docker Desktop — TWS on host
+IBKR_PORT=4002                   # IB Gateway paper trading port
 IBKR_CLIENT_ID=1
-
-# Telegram
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
-
-# Data export (mirrors backtest DATA_ROOT)
 DATA_ROOT=/data
 ```
 
 ---
 
-## PDT Rule
-
-**Paper trading only until the PDT rule change.** The system is built for paper trading. Do not add live trading logic or remove paper trading constraints.
-
----
-
-*Last updated: May 2026. Build against this file. Do not modify it during the build.*
-
----
-
-## Import Notes
-
-Added during pre-build housekeeping (2026-05-20). Updated when `setup_filter.py` and `Tradeable Setup Filter.md` were placed at repo root (2026-05-20).
-
-**SetupFilter class does not exist.** The original spec listed `from setup_filter import SetupFilter, SetupFilterResult`. The public API exports only:
-- `SetupFilterResult` — dataclass with pass/fail decision and signal trajectories
-- `run_setup_filter(timestamps, prices, sizes, session_start_ns, session_end_ns, ...)` — the main entry point
-- No `SetupFilter` class. `LiveSignalState` should call `run_setup_filter()` directly and hold the result.
-
-**Canonical `setup_filter.py` lives at `backtest/setup_filter.py`.** Import from anywhere in the project as:
-
-```python
-from backtest.setup_filter import SetupFilterResult, run_setup_filter
-```
-
-`NS_PER_SECOND` is inlined as `1_000_000_000` in this file — no dependency on `data.schemas.mom_db`.
-
-**sys.path requirements.** With repo root as working directory (Docker default, pytest default):
-
-- `from backtest.setup_filter import ...` — works directly (repo root on path, `backtest/` is a package)
-- No additional `sys.path` manipulation needed.
-
-**backtest/runner.py imports trigger Numba JIT compilation.** `_hawkes_replay_with_refit` calls into `core.hawkes.engine` which uses Numba. Cold import takes 10–30 seconds the first time. Plan accordingly for live startup time.
+*Last updated: June 2026.*

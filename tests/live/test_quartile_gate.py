@@ -1,56 +1,129 @@
-"""Tests for quartile-gate removal — all Q1–Q4 tickers must pass the entry gate.
+"""Tests for quartile-gate REMOVAL (SlopeGate F_ss core swap).
 
-Locked decision: `todaysChangePerc >= 0.30` — all quartiles traded.
-peak_hours_only=False in strategy.json (default). Gate returns True for every quartile.
+The scanner quartile gate — both the original Q3/Q4 gate and the Q1/Q2
+peak-hours override (`_evaluate_entry_gate` / `peak_hours_only`) — has been
+removed. Entry selection now belongs to the setup filter. Every eligible name
+clearing the gap threshold is admitted at all hours, regardless of quartile.
+scanner_quartile is still computed and stored as an analysis field.
 """
 from __future__ import annotations
 
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
+import asyncio
+from datetime import date
+from unittest.mock import AsyncMock
 
 import pytest
 
+import live.scanner_monitor as sm
 from live.config import CFG
-from live.scanner_monitor import _evaluate_entry_gate, ScannerContext
-
-_ET = ZoneInfo("America/New_York")
+from live.scanner_monitor import ScannerContext, SnapshotRecord, _poll_once
 
 
-def _et(hour: int, minute: int = 0) -> datetime:
-    d = date.today()
-    return datetime(d.year, d.month, d.day, hour, minute, 0, tzinfo=_ET)
+# ── The quartile gate and its config are gone ─────────────────────────────────
+
+def test_quartile_gate_function_removed():
+    """_evaluate_entry_gate / is_peak_hours no longer exist — gate is removed."""
+    assert not hasattr(sm, "_evaluate_entry_gate")
+    assert not hasattr(sm, "is_peak_hours")
 
 
-# ── All quartiles admitted when peak_hours_only is False (current locked default) ──
-
-def test_q1_admitted_when_peak_hours_only_false():
-    assert CFG.scanner.peak_hours_only is False, "Default must be peak_hours_only=False"
-    assert _evaluate_entry_gate(1, _et(10, 0)) is True
-
-
-def test_q2_admitted_when_peak_hours_only_false():
-    assert _evaluate_entry_gate(2, _et(10, 0)) is True
+def test_quartile_config_keys_removed():
+    """trade_quartiles and peak_hours_only are no longer part of the scanner config."""
+    assert not hasattr(CFG.scanner, "trade_quartiles")
+    assert not hasattr(CFG.scanner, "peak_hours_only")
 
 
-def test_q3_admitted_when_peak_hours_only_false():
-    """Previously blocked — now admitted (Fix 2: quartile gate removed)."""
-    assert _evaluate_entry_gate(3, _et(10, 0)) is True
+# ── Q1/Q2 names clearing the gap are admitted (task acceptance test) ──────────
+
+def test_q1_q2_admitted_after_quartile_gate_removed(monkeypatch):
+    """A Q1 and a Q2 ticker that clear the gap are admitted to the universe.
+
+    Previously, with the Q1/Q2 peak-hours override active, these would have been
+    rejected outside peak windows. Now they are queued regardless of quartile.
+    """
+    q1 = ScannerContext("Q1T", 187.0, 1, 12, 0.42, 1, 1_000_000_000)
+    q2 = ScannerContext("Q2T", 95.0, 2, 12, 0.30, 2, 1_000_000_000)
+    # n_qualifying=0 short-circuits the DB write so we need no DB pool.
+    record = SnapshotRecord(1_000_000_000, date.today(), 0, None, "[]")
+
+    async def _fake_snapshot(http, api_key):
+        return [q1, q2], record
+
+    monkeypatch.setattr(sm, "build_snapshot_context", _fake_snapshot)
+    monkeypatch.setattr(sm.market_status, "refresh", AsyncMock())
+
+    universe_queue: asyncio.Queue = asyncio.Queue()
+    asyncio.run(_poll_once(
+        http=None,
+        universe_queue=universe_queue,
+        api_key="x",
+        closed_today=set(),
+        universe_mgr=None,
+    ))
+
+    queued = []
+    while not universe_queue.empty():
+        ticker, _ctx = universe_queue.get_nowait()
+        queued.append(ticker)
+
+    assert "Q1T" in queued, "Q1 ticker clearing the gap must be admitted"
+    assert "Q2T" in queued, "Q2 ticker clearing the gap must be admitted"
 
 
-def test_q4_admitted_when_peak_hours_only_false():
-    """Previously blocked — now admitted (Fix 2: quartile gate removed)."""
-    assert _evaluate_entry_gate(4, _et(10, 0)) is True
+def test_all_quartiles_admitted_regardless_of_hour(monkeypatch):
+    """One ticker per quartile, all admitted — no quartile filter, no hours cap."""
+    contexts = [
+        ScannerContext("Q1T", 100.0, 1, 8, 0.5, 1, 1_000_000_000),
+        ScannerContext("Q2T", 80.0, 2, 8, 0.4, 2, 1_000_000_000),
+        ScannerContext("Q3T", 60.0, 3, 8, 0.3, 3, 1_000_000_000),
+        ScannerContext("Q4T", 40.0, 4, 8, 0.2, 4, 1_000_000_000),
+    ]
+    record = SnapshotRecord(1_000_000_000, date.today(), 0, None, "[]")
+
+    async def _fake_snapshot(http, api_key):
+        return contexts, record
+
+    monkeypatch.setattr(sm, "build_snapshot_context", _fake_snapshot)
+    monkeypatch.setattr(sm.market_status, "refresh", AsyncMock())
+
+    universe_queue: asyncio.Queue = asyncio.Queue()
+    asyncio.run(_poll_once(
+        http=None,
+        universe_queue=universe_queue,
+        api_key="x",
+        closed_today=set(),
+        universe_mgr=None,
+    ))
+
+    queued = set()
+    while not universe_queue.empty():
+        ticker, _ctx = universe_queue.get_nowait()
+        queued.add(ticker)
+
+    assert queued == {"Q1T", "Q2T", "Q3T", "Q4T"}
 
 
-def test_all_quartiles_admitted_off_peak():
-    """No hours cap when peak_hours_only=False — admit all quartiles at all hours."""
-    for q in (1, 2, 3, 4):
-        # Pre-market
-        assert _evaluate_entry_gate(q, _et(7, 0)) is True
-        # Midday lull
-        assert _evaluate_entry_gate(q, _et(12, 30)) is True
-        # Post-market
-        assert _evaluate_entry_gate(q, _et(18, 0)) is True
+def test_closed_today_still_blocks_admission(monkeypatch):
+    """Removing the quartile gate must NOT disturb the closed_today lockout."""
+    q1 = ScannerContext("DONE", 120.0, 1, 4, 0.6, 1, 1_000_000_000)
+    record = SnapshotRecord(1_000_000_000, date.today(), 0, None, "[]")
+
+    async def _fake_snapshot(http, api_key):
+        return [q1], record
+
+    monkeypatch.setattr(sm, "build_snapshot_context", _fake_snapshot)
+    monkeypatch.setattr(sm.market_status, "refresh", AsyncMock())
+
+    universe_queue: asyncio.Queue = asyncio.Queue()
+    asyncio.run(_poll_once(
+        http=None,
+        universe_queue=universe_queue,
+        api_key="x",
+        closed_today={"DONE"},
+        universe_mgr=None,
+    ))
+
+    assert universe_queue.empty(), "Ticker in closed_today must not be re-admitted"
 
 
 # ── ScannerContext still carries quartile (research field) ────────────────────
@@ -72,22 +145,3 @@ def test_scanner_quartile_still_stored_q4():
         scanner_quartile=4, snapshot_ns=1_000_000_000,
     )
     assert ctx.scanner_quartile == 4
-
-
-# ── Legacy peak-hours mode still works when explicitly enabled ────────────────
-
-def test_legacy_peak_hours_mode_rejects_q3(monkeypatch):
-    """When peak_hours_only is toggled True (legacy mode), Q3 is rejected during peak."""
-    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
-    assert _evaluate_entry_gate(3, _et(10, 0)) is False
-
-
-def test_legacy_peak_hours_mode_admits_q1_peak(monkeypatch):
-    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
-    assert _evaluate_entry_gate(1, _et(10, 0)) is True
-
-
-def test_legacy_peak_hours_mode_rejects_off_peak(monkeypatch):
-    """Even Q1 is rejected outside peak windows when legacy mode is active."""
-    monkeypatch.setattr(CFG.scanner, "peak_hours_only", True)
-    assert _evaluate_entry_gate(1, _et(12, 0)) is False

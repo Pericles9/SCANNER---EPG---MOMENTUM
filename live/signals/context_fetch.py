@@ -17,7 +17,8 @@ import numpy as np
 from backtest.runner import _hawkes_replay_with_refit, session_bucket
 
 from core.epg.anchor import EventAnchor
-from core.epg.gate import GateState, ParticipationGate
+from core.epg.gate import GateState
+from core.epg.gate_variants import SlopeGate
 from core.hawkes.engine import HawkesEngine, HawkesState
 from core.hawkes.forgetting import HawkesParams
 
@@ -38,7 +39,8 @@ _BARS_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{date
 class ContextFetchResult:
     engine: HawkesEngine
     anchor: EventAnchor
-    gate: ParticipationGate
+    gate: SlopeGate
+    gate_activated: bool                 # True if EventAnchor fired T_event during replay
     prev_gate_state: GateState
     last_ts_ns: int                      # dedup boundary
     lambda_ref_global: float
@@ -245,27 +247,42 @@ async def fetch_context(
     for i in range(len(tail_t)):
         engine.update(float(tail_t[i]), int(tail_sides[i]))
 
-    # Replay EventAnchor + ParticipationGate through all historical ticks
+    # Replay EventAnchor + SlopeGate (F_ss) through all historical ticks.
+    # SlopeGate normalises its dollar-volume slope by lambda_v_ref. Per the live
+    # architecture, we use the cold-start reference (mu_buy+mu_sell, fitted or
+    # global) — the same quantity fed to EventAnchor/HawkesEngine — rather than the
+    # offline parquet-catalog compute_lambda_ref_per_event, which is not available
+    # for a live gapper. Heuristic/unvalidated; see strategy.json epg_gate._comment.
     anchor = EventAnchor(
         lambda_ref=lambda_ref_for_engine,
         k_multiplier=CFG.epg.t_event_threshold,
     )
-    gate = ParticipationGate(
-        half_life_seconds=CFG.epg.window_close_sec,
-        peak_threshold_p=CFG.epg.lambda_v_threshold,
+    gate = SlopeGate(
+        tau_sec=CFG.epg_gate.tau_sec,
+        L_sec=CFG.epg_gate.L_sec,
+        k_open=CFG.epg_gate.k_open,
+        mode=CFG.epg_gate.mode,
+        k_close=CFG.epg_gate.k_close,
+        lambda_v_ref=lambda_ref_for_engine,
+        warmup_seconds=CFG.epg_gate.warmup_seconds,
     )
 
     prev_gate_state = GateState.INACTIVE
+    gate_activated = False
     for i in range(N):
         # Invariant: historical and live must feed the same quantity to EventAnchor.
         # Here: Hawkes left-limit total intensity. Live mirror: live_state.py uses
         # hawkes_state.lambda_total (= lambda_buy + lambda_sell). Backtest: runner.py:440.
         lambda_total_i = lam_buy_out[i] + lam_sell_out[i]
         t_ev = anchor.update(lambda_total_i, float(t_sec[i]))
-        if t_ev is not None and gate.t_event is None:
+        if t_ev is not None and not gate_activated:
             gate.activate(t_ev)
-        if gate.t_event is not None:
+            gate_activated = True
+        if gate_activated:
             dollar_vol = float(prices[i]) * float(sizes[i])
+            # SlopeGate's 30s lookback buffer and prev_state are populated here so the
+            # gate is not blind for the first L_sec of live ticks. The instance (not its
+            # params) is passed into LiveSignalState to survive the historical->live boundary.
             prev_gate_state = gate.update(dollar_vol, float(t_sec[i]))
 
     # Run setup filter on full historical tick buffer
@@ -284,6 +301,9 @@ async def fetch_context(
     fetch_ms = int((time.monotonic() - t0) * 1000)
     log.info("%s: context fetch complete in %dms, N=%d, degraded=%s",
              ticker, fetch_ms, N, degraded_mode)
+    log.info("%s: gate=%s (F_ss) lambda_v_ref=%.6f (%s) activated=%s",
+             ticker, type(gate).__name__, lambda_ref_for_engine,
+             "per-event/fitted" if lambda_ref_fitted else "global fallback", gate_activated)
 
     alpha_buy_fitted = fitted_params.alpha_buy_self if fitted_params is not None else None
     alpha_sell_fitted = fitted_params.alpha_sell_self if fitted_params is not None else None
@@ -339,6 +359,7 @@ async def fetch_context(
         engine=engine,
         anchor=anchor,
         gate=gate,
+        gate_activated=gate_activated,
         prev_gate_state=prev_gate_state,
         last_ts_ns=int(ts_ns[-1]) if N > 0 else 0,
         lambda_ref_global=lambda_ref_global,
@@ -378,14 +399,20 @@ def _zero_state_result(
         alpha_cross_sell=0.0,
     )
     anchor = EventAnchor(lambda_ref=lambda_ref_global, k_multiplier=CFG.epg.t_event_threshold)
-    gate = ParticipationGate(
-        half_life_seconds=CFG.epg.window_close_sec,
-        peak_threshold_p=CFG.epg.lambda_v_threshold,
+    gate = SlopeGate(
+        tau_sec=CFG.epg_gate.tau_sec,
+        L_sec=CFG.epg_gate.L_sec,
+        k_open=CFG.epg_gate.k_open,
+        mode=CFG.epg_gate.mode,
+        k_close=CFG.epg_gate.k_close,
+        lambda_v_ref=lambda_ref_global,
+        warmup_seconds=CFG.epg_gate.warmup_seconds,
     )
     return ContextFetchResult(
         engine=engine,
         anchor=anchor,
         gate=gate,
+        gate_activated=False,
         prev_gate_state=GateState.INACTIVE,
         last_ts_ns=0,
         lambda_ref_global=lambda_ref_global,

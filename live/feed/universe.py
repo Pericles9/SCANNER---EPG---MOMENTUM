@@ -11,7 +11,6 @@ from typing import Optional
 
 import aiohttp
 
-from backtest.setup_filter import SUSTAIN_BARS
 from live.config import CFG
 from live.feed.context import TickerContext
 from live.feed.signal_loop import HeartbeatMonitor, signal_loop
@@ -188,7 +187,7 @@ class UniverseManager:
             if self._telegram is not None:
                 try:
                     await self._telegram.send_silent(
-                        f"{ticker}: SF disqualified after {SUSTAIN_BARS} consecutive failing bars — removed from universe"
+                        f"{ticker}: SF disqualified after {CFG.setup_filter.removal_bars} consecutive failing bars — removed from universe"
                     )
                 except Exception:
                     pass

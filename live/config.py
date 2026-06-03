@@ -13,9 +13,7 @@ _SENTINEL = "REQUIRED_FROM_BACKTEST"
 class ScannerConfig:
     gap_threshold: float
     poll_interval_s: int
-    trade_quartiles: list
     collect_scanner_heat: bool
-    peak_hours_only: bool
 
 
 @dataclass
@@ -48,14 +46,28 @@ class EpgConfig:
 
 
 @dataclass
+class EpgGateConfig:
+    variant: str
+    tau_sec: float
+    L_sec: float
+    k_open: float
+    k_close: float
+    mode: str
+    warmup_seconds: float
+
+
+@dataclass
 class SetupFilterConfig:
-    q_tilde_threshold: float
+    q_threshold: float
+    admission_bars: int
+    removal_bars: int
+    warmup_provisional_threshold: float
     warmup_bars: int
-    warmup_q_tilde: float
 
 
 @dataclass
 class ExitDConfig:
+    enabled: bool
     theta: float
     tau_min_sec: float
     pre_market_override: bool
@@ -63,6 +75,7 @@ class ExitDConfig:
 
 @dataclass
 class LuldConfig:
+    enabled: bool
     rth_only: bool
 
 
@@ -123,6 +136,7 @@ class Config:
     context_fetch: ContextFetchConfig
     hawkes: HawkesConfig
     epg: EpgConfig
+    epg_gate: EpgGateConfig
     setup_filter: SetupFilterConfig
     exit_d: ExitDConfig
     luld: LuldConfig
@@ -159,6 +173,20 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
             "Fill from backtest calibration results before running live."
         )
 
+    # EPG gate validation — fail loudly on a malformed SlopeGate F_ss config.
+    eg = raw.get("epg_gate")
+    if eg is None:
+        raise RuntimeError("strategy.json missing required 'epg_gate' block.")
+    if eg.get("mode") not in ("ss", "sl"):
+        raise RuntimeError(f"epg_gate.mode must be 'ss' or 'sl', got {eg.get('mode')!r}.")
+    if eg["mode"] == "ss" and not (eg["k_close"] < eg["k_open"]):
+        raise RuntimeError(
+            f"epg_gate.k_close ({eg['k_close']}) must be < k_open ({eg['k_open']}) in mode='ss'."
+        )
+    for _k in ("tau_sec", "L_sec", "warmup_seconds"):
+        if eg[_k] <= 0:
+            raise RuntimeError(f"epg_gate.{_k} must be positive, got {eg[_k]}.")
+
     cf = raw["context_fetch"]
     ft = cf["fallback_tiers"]
 
@@ -168,9 +196,7 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
         scanner=ScannerConfig(
             gap_threshold=raw["scanner"]["gap_threshold"],
             poll_interval_s=raw["scanner"]["poll_interval_s"],
-            trade_quartiles=raw["scanner"]["trade_quartiles"],
             collect_scanner_heat=raw["scanner"]["collect_scanner_heat"],
-            peak_hours_only=raw["scanner"]["peak_hours_only"],
         ),
         context_fetch=ContextFetchConfig(
             session_start_et_hour=cf["session_start_et_hour"],
@@ -195,17 +221,30 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
             lambda_v_threshold=raw["epg"]["lambda_v_threshold"],
             window_close_sec=raw["epg"]["window_close_sec"],
         ),
+        epg_gate=EpgGateConfig(
+            variant=raw["epg_gate"]["variant"],
+            tau_sec=raw["epg_gate"]["tau_sec"],
+            L_sec=raw["epg_gate"]["L_sec"],
+            k_open=raw["epg_gate"]["k_open"],
+            k_close=raw["epg_gate"]["k_close"],
+            mode=raw["epg_gate"]["mode"],
+            warmup_seconds=raw["epg_gate"]["warmup_seconds"],
+        ),
         setup_filter=SetupFilterConfig(
-            q_tilde_threshold=raw["setup_filter"]["q_tilde_threshold"],
+            q_threshold=raw["setup_filter"]["q_threshold"],
+            admission_bars=raw["setup_filter"]["admission_bars"],
+            removal_bars=raw["setup_filter"]["removal_bars"],
+            warmup_provisional_threshold=raw["setup_filter"]["warmup_provisional_threshold"],
             warmup_bars=raw["setup_filter"]["warmup_bars"],
-            warmup_q_tilde=raw["setup_filter"]["warmup_q_tilde"],
         ),
         exit_d=ExitDConfig(
+            enabled=raw["exit_d"]["enabled"],
             theta=raw["exit_d"]["theta"],
             tau_min_sec=raw["exit_d"]["tau_min_sec"],
             pre_market_override=raw["exit_d"]["pre_market_override"],
         ),
         luld=LuldConfig(
+            enabled=raw["luld"]["enabled"],
             rth_only=raw["luld"]["rth_only"],
         ),
         order_execution=OrderExecutionConfig(
