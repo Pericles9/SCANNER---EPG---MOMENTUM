@@ -5,7 +5,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 
@@ -13,7 +13,7 @@ import numpy as np
 from backtest.runner import session_bucket
 
 from core.epg.anchor import EventAnchor
-from core.epg.gate import GateState
+from core.epg.gate import GateState, ParticipationGate
 from core.epg.gate_variants import SlopeGate
 from core.exits.luld_proximity import LuldProximityExit, ProximityState
 from core.hawkes.engine import HawkesEngine, HawkesState
@@ -68,7 +68,7 @@ class LiveSignalState:
         self._ticker = ticker
         self._engine: HawkesEngine = ctx.engine
         self._anchor: EventAnchor = ctx.anchor
-        self._gate: SlopeGate = ctx.gate
+        self._gate: Union[SlopeGate, ParticipationGate] = ctx.gate
         # SlopeGate has no public t_event; track activation in the wiring so we never
         # reach into gate internals. True once EventAnchor has fired T_event.
         self._gate_activated: bool = ctx.gate_activated

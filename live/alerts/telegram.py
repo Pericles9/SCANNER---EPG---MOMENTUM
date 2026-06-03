@@ -68,7 +68,13 @@ class TelegramBot:
         if not self._kill_callback:
             return
 
-        self._app = Application.builder().token(self._bot.token).build()
+        # Reuse self._bot (pool_size=8, explicit timeouts) instead of letting
+        # Application.builder().token() create a second Bot with pool_size=1.
+        # With a separate Bot, the single connection is shared between the long-poll
+        # getUpdates (holds the socket open for ~30s) and every reply_text() from
+        # command handlers — replies queue behind the active poll and appear slow.
+        # Sharing the same Bot instance eliminates that contention.
+        self._app = Application.builder().bot(self._bot).build()
 
         async def kill_handler(update: Update, context) -> None:
             if str(update.effective_chat.id) != self._chat_id:

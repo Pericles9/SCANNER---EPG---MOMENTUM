@@ -173,19 +173,28 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
             "Fill from backtest calibration results before running live."
         )
 
-    # EPG gate validation — fail loudly on a malformed SlopeGate F_ss config.
+    # EPG gate validation.
     eg = raw.get("epg_gate")
     if eg is None:
         raise RuntimeError("strategy.json missing required 'epg_gate' block.")
-    if eg.get("mode") not in ("ss", "sl"):
-        raise RuntimeError(f"epg_gate.mode must be 'ss' or 'sl', got {eg.get('mode')!r}.")
-    if eg["mode"] == "ss" and not (eg["k_close"] < eg["k_open"]):
+    variant = eg.get("variant")
+    if variant not in ("participation_gate", "slope_gate_fss"):
         raise RuntimeError(
-            f"epg_gate.k_close ({eg['k_close']}) must be < k_open ({eg['k_open']}) in mode='ss'."
+            f"epg_gate.variant must be 'participation_gate' or 'slope_gate_fss', got {variant!r}."
         )
-    for _k in ("tau_sec", "L_sec", "warmup_seconds"):
-        if eg[_k] <= 0:
-            raise RuntimeError(f"epg_gate.{_k} must be positive, got {eg[_k]}.")
+    if eg.get("warmup_seconds", 0) <= 0:
+        raise RuntimeError(f"epg_gate.warmup_seconds must be positive, got {eg.get('warmup_seconds')}.")
+    # SlopeGate-specific constraints — only checked when that variant is active.
+    if variant == "slope_gate_fss":
+        if eg.get("mode") not in ("ss", "sl"):
+            raise RuntimeError(f"epg_gate.mode must be 'ss' or 'sl', got {eg.get('mode')!r}.")
+        if eg["mode"] == "ss" and not (eg["k_close"] < eg["k_open"]):
+            raise RuntimeError(
+                f"epg_gate.k_close ({eg['k_close']}) must be < k_open ({eg['k_open']}) in mode='ss'."
+            )
+        for _k in ("tau_sec", "L_sec"):
+            if eg[_k] <= 0:
+                raise RuntimeError(f"epg_gate.{_k} must be positive, got {eg[_k]}.")
 
     cf = raw["context_fetch"]
     ft = cf["fallback_tiers"]

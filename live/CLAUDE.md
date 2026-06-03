@@ -116,6 +116,26 @@ live/
 
 ---
 
+## Telegram Bot Commands
+
+| Command | Description |
+|---|---|
+| `/summary` | Account equity, realised/unrealised/combined P&L, today's win rate and notional, open positions |
+| `/status` | Session overview: bucket, position, daily P&L, feed ages |
+| `/universe` | All tracked tickers and their states |
+| `/scanner` | Scanner snapshot + universe |
+| `/positions` | Open positions with unrealised P&L |
+| `/trades` | Today's completed trades (full detail) |
+| `/risk` | Risk state snapshot |
+| `/services` | Full service health probe |
+| `/reconcile` | Sync positions against IBKR (clears manual closes) |
+| `/kill` | Kill switch — flatten all positions |
+| `/help` | Command list |
+
+**Bot architecture note:** The `Application` (polling) reuses the same `Bot` instance as outbound alerts (`send_silent`). Both share `connection_pool_size=8`. Using `.token()` instead of `.bot()` when building the Application would create a second Bot with `pool_size=1`, where the long-poll `getUpdates` (holds the socket open ~30s) and every `reply_text()` compete for the single connection, causing slow command responses.
+
+---
+
 ## Process 1 — Scanner Monitor (`scanner_monitor.py`)
 
 Polls `GET /v2/snapshot/locale/us/markets/stocks/gainers` every `poll_interval_s` seconds.
@@ -247,7 +267,7 @@ Runs before any trading begins. A crash == dead man's switch scenario: cancel al
 |---|---|
 | Scanner admission | `todaysChangePerc >= 0.30` AND CS on XNYS/XNAS. All quartiles admitted. No quartile gate. |
 | Entry gate | SlopeGate rising edge AND `q_tilde[-1] >= 0.65` (1-bar; 0.75 for first 65 bars). Both required. |
-| EPG gate variant | `SlopeGate` F_ss — `s3_fss_t180_l30_ko5_kc0` (tau=180s, L=30s, k_open=0.5, k_close=0.0, mode=ss, warmup=300s). **Heuristic / unvalidated.** |
+| EPG gate variant | `ParticipationGate` (half_life=300s, peak_threshold_p=0.65, warmup=300s). Gate class is config-driven via `epg_gate.variant` — switch to `"slope_gate_fss"` to activate SlopeGate F_ss (heuristic/unvalidated). |
 | Sole strategy exit | SlopeGate PASS→FAIL (`EPG_CLOSE`). EXIT_D and LULD disabled via config flags; code retained. |
 | lambda_v_ref (live) | `mu_buy + mu_sell` at cold start (fitted or global) — same as `lambda_ref`. NOT equilibrium formula. NOT the offline `compute_lambda_ref_per_event`. |
 | Setup filter re-entry gate | `q_tilde[-1] >= 0.65` on the current bar, checked in `live_state._sf_admit()`. `sf.passes` (15-bar persistence) is NOT the live gate. |

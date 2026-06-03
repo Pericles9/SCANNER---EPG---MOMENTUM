@@ -17,10 +17,11 @@ import numpy as np
 from backtest.runner import _hawkes_replay_with_refit, session_bucket
 
 from core.epg.anchor import EventAnchor
-from core.epg.gate import GateState
+from core.epg.gate import GateState, ParticipationGate
 from core.epg.gate_variants import SlopeGate
 from core.hawkes.engine import HawkesEngine, HawkesState
 from core.hawkes.forgetting import HawkesParams
+from typing import Union
 
 from live.config import CFG
 from live.db.pool import get_pool
@@ -35,11 +36,34 @@ _TRADES_URL = "https://api.polygon.io/v3/trades/{ticker}"
 _BARS_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{date}/{date}"
 
 
+def _build_gate(lambda_v_ref: float) -> Union[SlopeGate, ParticipationGate]:
+    """Construct the EPG gate from config. Switching variants is one config line."""
+    variant = CFG.epg_gate.variant
+    if variant == "participation_gate":
+        return ParticipationGate(
+            half_life_seconds=CFG.epg.window_close_sec,
+            peak_threshold_p=CFG.epg.lambda_v_threshold,
+            warmup_seconds=CFG.epg_gate.warmup_seconds,
+        )
+    elif variant == "slope_gate_fss":
+        return SlopeGate(
+            tau_sec=CFG.epg_gate.tau_sec,
+            L_sec=CFG.epg_gate.L_sec,
+            k_open=CFG.epg_gate.k_open,
+            mode=CFG.epg_gate.mode,
+            k_close=CFG.epg_gate.k_close,
+            lambda_v_ref=lambda_v_ref,
+            warmup_seconds=CFG.epg_gate.warmup_seconds,
+        )
+    else:
+        raise ValueError(f"Unknown epg_gate.variant: {variant!r}")
+
+
 @dataclass
 class ContextFetchResult:
     engine: HawkesEngine
     anchor: EventAnchor
-    gate: SlopeGate
+    gate: Union[SlopeGate, ParticipationGate]
     gate_activated: bool                 # True if EventAnchor fired T_event during replay
     prev_gate_state: GateState
     last_ts_ns: int                      # dedup boundary
@@ -257,15 +281,7 @@ async def fetch_context(
         lambda_ref=lambda_ref_for_engine,
         k_multiplier=CFG.epg.t_event_threshold,
     )
-    gate = SlopeGate(
-        tau_sec=CFG.epg_gate.tau_sec,
-        L_sec=CFG.epg_gate.L_sec,
-        k_open=CFG.epg_gate.k_open,
-        mode=CFG.epg_gate.mode,
-        k_close=CFG.epg_gate.k_close,
-        lambda_v_ref=lambda_ref_for_engine,
-        warmup_seconds=CFG.epg_gate.warmup_seconds,
-    )
+    gate = _build_gate(lambda_ref_for_engine)
 
     prev_gate_state = GateState.INACTIVE
     gate_activated = False
@@ -301,9 +317,9 @@ async def fetch_context(
     fetch_ms = int((time.monotonic() - t0) * 1000)
     log.info("%s: context fetch complete in %dms, N=%d, degraded=%s",
              ticker, fetch_ms, N, degraded_mode)
-    log.info("%s: gate=%s (F_ss) lambda_v_ref=%.6f (%s) activated=%s",
+    log.info("%s: gate=%s lambda_v_ref=%.6f (%s) activated=%s",
              ticker, type(gate).__name__, lambda_ref_for_engine,
-             "per-event/fitted" if lambda_ref_fitted else "global fallback", gate_activated)
+             "fitted" if lambda_ref_fitted else "global fallback", gate_activated)
 
     alpha_buy_fitted = fitted_params.alpha_buy_self if fitted_params is not None else None
     alpha_sell_fitted = fitted_params.alpha_sell_self if fitted_params is not None else None
@@ -399,15 +415,7 @@ def _zero_state_result(
         alpha_cross_sell=0.0,
     )
     anchor = EventAnchor(lambda_ref=lambda_ref_global, k_multiplier=CFG.epg.t_event_threshold)
-    gate = SlopeGate(
-        tau_sec=CFG.epg_gate.tau_sec,
-        L_sec=CFG.epg_gate.L_sec,
-        k_open=CFG.epg_gate.k_open,
-        mode=CFG.epg_gate.mode,
-        k_close=CFG.epg_gate.k_close,
-        lambda_v_ref=lambda_ref_global,
-        warmup_seconds=CFG.epg_gate.warmup_seconds,
-    )
+    gate = _build_gate(lambda_ref_global)
     return ContextFetchResult(
         engine=engine,
         anchor=anchor,

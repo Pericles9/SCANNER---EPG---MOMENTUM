@@ -384,15 +384,92 @@ async def reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @authorised_only
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Account summary: equity, PnL, open positions, today's trade stats."""
+    state = _bot_state(context)
+    now_et = datetime.now(_ET)
+    today = now_et.date()
+    rs = state.risk_state
+
+    # Unrealised PnL across all open positions
+    unreal = 0.0
+    pos_lines: list[str] = []
+    for ticker, pos in rs.open_positions.items():
+        ctx = state.universe.get(ticker)
+        if ctx and ctx.signal_state:
+            cur = ctx.signal_state.last_price
+            u = (cur - pos["avg_cost"]) * pos["qty"]
+            unreal += u
+            s = "+" if u >= 0 else ""
+            pos_lines.append(
+                f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → ${cur:.2f} ({s}${u:.2f})"
+            )
+        else:
+            pos_lines.append(f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f}")
+
+    combined = rs.daily_pnl + unreal
+    runway = rs.daily_pnl - rs.max_daily_loss
+
+    # Today's closed trades from DB
+    try:
+        async with state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT pnl_dollar, qty, entry_price, exit_reason
+                FROM trades
+                WHERE strategy_id=$1 AND session_date=$2
+                """,
+                "epg_v1", today,
+            )
+    except Exception:
+        rows = []
+
+    n = len(rows)
+    wins = sum(1 for r in rows if (r["pnl_dollar"] or 0.0) > 0)
+    losses = n - wins
+    win_rate = wins / n * 100 if n else 0.0
+    total_notional = sum((r["qty"] or 0) * (r["entry_price"] or 0.0) for r in rows)
+
+    def _s(v: float) -> str:
+        return "+" if v >= 0 else ""
+
+    lines = [f"*SUMMARY — {now_et.strftime('%H:%M ET')}  {today}*", ""]
+
+    equity = rs.account_equity
+    if equity > 0:
+        lines.append(f"Equity:      ${equity:,.2f}")
+    lines.append(f"Realised:    {_s(rs.daily_pnl)}${rs.daily_pnl:.2f}")
+    lines.append(f"Unrealised:  {_s(unreal)}${unreal:.2f}")
+    lines.append(f"Combined:    {_s(combined)}${combined:.2f}")
+    lines.append(f"Runway:      ${runway:.2f} to limit")
+    lines.append("")
+
+    if n:
+        lines.append(f"Trades:      {n}  ({wins}W / {losses}L  {win_rate:.0f}% win)")
+        if total_notional:
+            lines.append(f"Notional:    ${total_notional:,.0f} traded today")
+    else:
+        lines.append("Trades:      none today")
+
+    if pos_lines:
+        lines.append("")
+        lines.append(f"Open ({len(pos_lines)}):")
+        lines.extend(pos_lines)
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@authorised_only
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*EPG Live Bot — Commands*\n"
-        "/status    Session overview (≤25 lines)\n"
-        "/universe  All tracked tickers and states\n"
-        "/scanner   Scanner snapshot + universe\n"
-        "/positions All open positions with unrealised PnL\n"
-        "/trades    Today's completed trades\n"
-        "/risk      Risk state snapshot\n"
+        "/summary    Account equity, P&L, today's trade stats\n"
+        "/status     Session overview\n"
+        "/universe   All tracked tickers and states\n"
+        "/scanner    Scanner snapshot + universe\n"
+        "/positions  All open positions with unrealised P&L\n"
+        "/trades     Today's completed trades (full detail)\n"
+        "/risk       Risk state snapshot\n"
         "/services   Full service health probe\n"
         "/reconcile  Sync positions against IBKR (clears manual closes)\n"
         "/help       This message\n"

@@ -29,6 +29,7 @@ class BotState:
 def setup_bot_handlers(app: Application, state: BotState) -> None:
     """Register all bot command handlers on the Application."""
     app.bot_data["state"] = state
+    app.add_handler(CommandHandler("summary", handlers.summary))
     app.add_handler(CommandHandler("universe", handlers.universe))
     app.add_handler(CommandHandler("trades", handlers.trades))
     app.add_handler(CommandHandler("status", handlers.status))

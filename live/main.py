@@ -152,12 +152,18 @@ async def main() -> None:
     _check_numba_cache()
     log = logging.getLogger(__name__)
     log.info("EPG live system starting — strategy_id=%s", CFG.strategy_id)
-    # EPG core config banner (2026-06-03 SlopeGate F_ss swap — heuristic/unvalidated).
-    log.info(
-        "EPG gate: %s (mode=%s tau=%.0fs L=%.0fs k_open=%.2f k_close=%.2f warmup=%.0fs)",
-        CFG.epg_gate.variant, CFG.epg_gate.mode, CFG.epg_gate.tau_sec, CFG.epg_gate.L_sec,
-        CFG.epg_gate.k_open, CFG.epg_gate.k_close, CFG.epg_gate.warmup_seconds,
-    )
+    if CFG.epg_gate.variant == "participation_gate":
+        log.info(
+            "EPG gate: participation_gate (half_life=%.0fs peak_threshold_p=%.2f warmup=%.0fs)",
+            CFG.epg.window_close_sec, CFG.epg.lambda_v_threshold, CFG.epg_gate.warmup_seconds,
+        )
+    else:
+        log.info(
+            "EPG gate: %s (mode=%s tau=%.0fs L=%.0fs k_open=%.2f k_close=%.2f warmup=%.0fs) "
+            "[HEURISTIC/UNVALIDATED]",
+            CFG.epg_gate.variant, CFG.epg_gate.mode, CFG.epg_gate.tau_sec, CFG.epg_gate.L_sec,
+            CFG.epg_gate.k_open, CFG.epg_gate.k_close, CFG.epg_gate.warmup_seconds,
+        )
     log.info(
         "Setup filter is the entry gate: q_threshold=%.2f admission_bars=%d removal_bars=%d "
         "warmup_provisional=%.2f/%d bars",
@@ -165,7 +171,7 @@ async def main() -> None:
         CFG.setup_filter.warmup_provisional_threshold, CFG.setup_filter.warmup_bars,
     )
     log.info(
-        "Exits: EXIT_D enabled=%s, LULD enabled=%s — sole strategy exit is SlopeGate PASS->FAIL",
+        "Exits: EXIT_D enabled=%s, LULD enabled=%s — strategy exit is EPG_CLOSE",
         CFG.exit_d.enabled, CFG.luld.enabled,
     )
     log.info("Scanner: quartile gate removed — gap >= %.0f%% admits all quartiles",
