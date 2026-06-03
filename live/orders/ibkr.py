@@ -179,6 +179,13 @@ class IBKRClient:
 
         return None
 
+    @property
+    def ib(self) -> IB:
+        """Underlying ib_insync IB handle — used by crash_recovery for the
+        low-level reqAllOpenOrders / reqPositions / market-order operations the
+        all-limit submit() wrapper deliberately can't express."""
+        return self._ib
+
     def is_connected(self) -> bool:
         return self._ib.isConnected()
 

@@ -108,6 +108,23 @@ def is_tradable_now(
     return _TRADABLE_START_SEC <= sec < _TRADABLE_END_SEC
 
 
+def current_session_bucket(now_et: Optional[datetime] = None) -> str:
+    """Current session bucket ('pre_market' | 'regular_hours' | 'post_market').
+
+    Delegates to backtest.runner.session_bucket, which measures seconds from the
+    4 AM ET session start (RTH_START_SEC=19800 = 9:30 AM = 5.5h after 4 AM). We
+    convert the ET wall clock to seconds-since-4 AM before calling it so the
+    timezone/boundary logic lives in exactly one place (per the build spec).
+    Imported lazily because backtest.runner triggers Numba JIT on first import.
+    """
+    from backtest.runner import session_bucket
+
+    if now_et is None:
+        now_et = datetime.now(_ET)
+    sec_since_4am = now_et.hour * 3600 + now_et.minute * 60 + now_et.second - 4 * 3600
+    return session_bucket(sec_since_4am)
+
+
 # ── Fetchers ──────────────────────────────────────────────────────────────────
 
 async def fetch_market_status(

@@ -146,69 +146,6 @@ def _setup_logging() -> None:
     )
 
 
-async def _reconcile_positions(ibkr, risk_state, pool) -> bool:
-    """Compare IBKR positions to DB. Return False if mismatch (halt signal).
-
-    Set SKIP_POSITION_CHECK=true to downgrade halt to a warning — use only on
-    initial setup or after manually reconciling stale paper-account positions.
-    """
-    skip = os.environ.get("SKIP_POSITION_CHECK", "").lower() in ("1", "true", "yes")
-
-    ibkr_positions = ibkr.get_open_positions()
-    session_date = date.today()
-
-    async with pool.acquire() as conn:
-        db_rows = await conn.fetch(
-            """
-            SELECT ticker, qty FROM positions
-            WHERE strategy_id=$1 AND session_date=$2
-            """,
-            CFG.strategy_id, session_date,
-        )
-
-    db_positions = {r["ticker"]: r["qty"] for r in db_rows}
-
-    all_tickers = set(ibkr_positions) | set(db_positions)
-    mismatches: list[str] = []
-    for ticker in all_tickers:
-        ibkr_qty, _ = ibkr_positions.get(ticker, (0, 0.0))
-        db_qty = db_positions.get(ticker, 0)
-        if ibkr_qty != db_qty:
-            logging.critical(
-                "POSITION MISMATCH: %s IBKR=%d DB=%d", ticker, ibkr_qty, db_qty
-            )
-            mismatches.append(ticker)
-
-    if mismatches:
-        ibkr_summary = {t: ibkr_positions.get(t, (0, 0.0))[0] for t in mismatches}
-        db_summary = {t: db_positions.get(t, 0) for t in mismatches}
-        logging.critical(
-            "POSITION MISMATCH DETECTED\n"
-            "  Mismatched tickers : %s\n"
-            "  IBKR qty           : %s\n"
-            "  DB qty             : %s\n"
-            "  Resolution         : reconcile manually, then restart with SKIP_POSITION_CHECK=true\n"
-            "  Runbook            : docs/STARTUP_RECONCILIATION.md",
-            ", ".join(mismatches),
-            ibkr_summary,
-            db_summary,
-        )
-        if skip:
-            logging.warning(
-                "SKIP_POSITION_CHECK=true — %d mismatch(es) ignored, seeding IBKR as truth. "
-                "Resolve stale positions before next live session.",
-                len(mismatches),
-            )
-        else:
-            return False
-
-    # Seed risk_state with IBKR positions (source of truth on startup)
-    for ticker, (qty, avg_cost) in ibkr_positions.items():
-        risk_state.open_positions[ticker] = {"qty": qty, "avg_cost": avg_cost}
-
-    return True
-
-
 async def main() -> None:
     validate_config()
     _setup_logging()
@@ -264,13 +201,58 @@ async def main() -> None:
     from live.orders.risk import RiskState
     risk_state = RiskState()
 
-    # Reconcile positions
-    if not await _reconcile_positions(ibkr, risk_state, pool):
-        log.critical("IBKR position mismatch — halting. Reconcile manually before restarting.")
+    # Init Telegram (constructed early so crash recovery can alert; kill/bot
+    # callbacks are registered later once the order_queue exists).
+    from live.alerts.telegram import TelegramBot, execute_kill_sequence, kill_flag_watcher
+    telegram = TelegramBot(
+        token=os.environ["TELEGRAM_BOT_TOKEN"],
+        chat_id=os.environ["TELEGRAM_CHAT_ID"],
+    )
+
+    session_date = date.today()
+
+    # ── Crash recovery — the single startup path back to a flat state ──
+    # Runs after IBKR connects but before any signal loops / scanner polling.
+    # A crash is functionally a dead man's switch trigger: cancel all open
+    # orders, flatten all open positions, reconcile the DB to flat. No smart
+    # resume — EPG windows are 30-120s and any restart outlives them.
+    from live.recovery import run_crash_recovery
+    try:
+        recovery = await run_crash_recovery(ibkr.ib, pool, telegram, session_date)
+    except Exception:
+        log.critical("Crash recovery raised — halting startup", exc_info=True)
+        await telegram.send_silent("🔴 STARTUP HALTED — crash recovery raised an exception.")
         await close_pool()
+        await ibkr.disconnect()
         sys.exit(1)
 
-    # Seed account equity (theoretical equity starts equal to account equity)
+    if recovery.stuck_tickers or recovery.error_tickers:
+        log.critical(
+            "Crash recovery could not reach flat — stuck=%s errors=%s. HALTING startup; "
+            "manual intervention required.",
+            recovery.stuck_tickers, recovery.error_tickers,
+        )
+        await telegram.send_silent(
+            "🔴 STARTUP HALTED — crash recovery left open positions "
+            f"(stuck={recovery.stuck_tickers}, errors={recovery.error_tickers}). "
+            "Manual intervention required."
+        )
+        await close_pool()
+        await ibkr.disconnect()
+        sys.exit(1)
+    if recovery.deferred_tickers:
+        log.warning(
+            "Crash recovery deferred (market closed): %s — flagged for manual review",
+            recovery.deferred_tickers,
+        )
+        risk_state.manual_review_required.update(recovery.deferred_tickers)
+    elif recovery.closed_tickers:
+        log.warning("Crash recovery closed %d position(s): %s",
+                    len(recovery.closed_tickers), recovery.closed_tickers)
+    elif not recovery.had_open_positions:
+        log.info("Crash recovery: no open positions found — clean start")
+
+    # Seed account equity (theoretical equity starts equal to account equity).
     risk_state.account_equity = await ibkr.get_account_equity()
     if risk_state.account_equity > 0:
         risk_state.theoretical_equity = risk_state.account_equity
@@ -278,15 +260,7 @@ async def main() -> None:
     else:
         log.warning("Account equity unavailable at startup — Kelly sizing will use flat fallback")
 
-    # Init Telegram
-    from live.alerts.telegram import TelegramBot, execute_kill_sequence, kill_flag_watcher
-    telegram = TelegramBot(
-        token=os.environ["TELEGRAM_BOT_TOKEN"],
-        chat_id=os.environ["TELEGRAM_CHAT_ID"],
-    )
-
     # Shared state
-    session_date = date.today()
     universe_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     order_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 
@@ -378,30 +352,8 @@ async def main() -> None:
         ),
     ]
 
-    # ── Phase B: startup position triage ──
-    # Must complete before scanner polling so EPG_FAIL/UNRESOLVABLE positions
-    # are flattened (and PASS/INACTIVE positions are picked up by signal loops)
-    # before new entries pile in.
-    from live.startup_triage import startup_position_triage
-    from live.feed import market_status
-    # Scanner hasn't polled yet, so the status cache is empty — is_tradable_now()
-    # falls back to a clock/weekday check. When the market is closed, triage defers
-    # closes to pending_close instead of firing sells that can't fill.
-    market_tradable_at_startup = market_status.is_tradable_now()
-    try:
-        await startup_position_triage(
-            pool=pool,
-            ibkr=ibkr,
-            order_queue=order_queue,
-            universe_mgr=universe_mgr,
-            telegram=telegram,
-            session_date=session_date,
-            hot_signal_events=hot_signal_events,
-            risk_state=risk_state,
-            market_tradable=market_tradable_at_startup,
-        )
-    except Exception:
-        log.exception("startup_position_triage raised — continuing into scanner")
+    # Startup position triage is gone — crash recovery (above) already flattened
+    # everything and reconciled the DB to flat before any of these tasks started.
 
     # ── Phase C: launch scanner + remaining tasks ──
     runtime_tasks = [

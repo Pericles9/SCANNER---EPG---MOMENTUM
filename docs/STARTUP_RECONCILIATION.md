@@ -1,113 +1,100 @@
-# Startup Position Reconciliation — Runbook
+# Startup Crash Recovery — Runbook
+
+> **Superseded:** the old DB-vs-IBKR mismatch *halt* (`_reconcile_positions`) and the
+> `startup_position_triage` resume/watch logic have been removed. There is now **one**
+> startup path: `live/recovery/crash_recovery.py`. The `SKIP_POSITION_CHECK` env var is
+> gone — there is nothing to skip.
 
 ## What It Is
 
-At startup, `live/main.py` calls `_reconcile_positions()` before any trading begins.
-It compares IBKR open positions to the `positions` table in the DB for today's session.
-A mismatch halts the system immediately.
+At startup, after IBKR connects but before any signal loops or scanner polling begin,
+`live/main.py` calls `run_crash_recovery(ib, pool, telegram, session_date)`.
 
-## Why It Halts
+A PC / process crash is functionally identical to a dead man's switch trigger, so the
+recovery posture is the same: **cancel everything, flatten everything, start clean.**
 
-The DB is the authoritative record of trades taken this session. If IBKR shows positions
-that the DB doesn't know about (or vice versa), trading on stale state risks adding to a
-position we think is flat, or exiting a position we think doesn't exist.
+There is deliberately **no smart resume**. EPG windows are 30–120s; Docker + IBKR +
+Polygon reconnect time almost always outlives any live window, and resuming a position
+with stale Hawkes state is more dangerous than taking the loss.
 
-The halt is non-negotiable by default. The escape hatch is `SKIP_POSITION_CHECK=true`,
-which downgrades the halt to a warning and seeds IBKR positions as truth.
+## What It Does
+
+1. **Cancel all open orders** at IBKR (`reqAllOpenOrders` → per-order `cancelOrder` with
+   5s confirmation; `reqGlobalCancel` as a backstop). The DB is not trusted for order
+   state after a crash.
+2. **Fetch live IBKR positions** (`reqPositions`, equities, non-zero) — the ground truth.
+3. **Flatten every position:**
+   - `regular_hours` → market order, `tif=DAY`.
+   - `pre_market` / `post_market` → marketable limit, `tif=EXT`, `outsideRth=True`,
+     crossing the spread (`bid-0.01` long / `ask+0.01` short), widening to `0.05` then
+     `0.10` on each failed 30s/30s/60s attempt.
+   - **Outside trading hours** (market closed) → no order; ticker is **DEFERRED** for
+     manual review and an alert fires immediately.
+   - Never fills after the full ladder → **STUCK**; an exception → **ERROR**.
+4. **Reconcile the DB to flat** in one transaction: zero every `positions` row for the
+   strategy, mark dangling `PENDING` orders `CANCELLED` (`cancel_reason='CRASH_RECOVERY'`).
+5. **Audit row** per affected ticker in `signal_events`
+   (`event_type='CRASH_RECOVERY_CLOSE'`, JSON notes with qty / fill / order_type /
+   session_bucket / reprice_count / final_status). IBKR orphans (no DB row) are recorded
+   with `strategy_id='UNKNOWN'`.
+6. **One summary Telegram alert** (🟡 clean, 🔴 if anything deferred/stuck/errored).
+   Clean starts (nothing open) send nothing.
+
+## Caller Behaviour (`main.py`)
+
+| Result | Action |
+|---|---|
+| `stuck_tickers` or `error_tickers` non-empty | Log CRITICAL, alert, **halt startup** (`sys.exit(1)`). Manual resolution required. |
+| `deferred_tickers` non-empty | Log WARNING, continue; tickers added to `risk_state.manual_review_required`. |
+| `closed_tickers` only | Log WARNING, continue normally. |
+| `had_open_positions = False` | Log INFO "clean start", continue. |
+
+> **Idempotency:** DB rows are zeroed even for DEFERRED/STUCK positions still held at
+> IBKR. That's intentional — the automated system disclaims them (alert + manual-review
+> flag), and on the next restart IBKR (the ground truth) re-surfaces the position and
+> recovery flattens it. Zeroing the DB never loses a position because the broker is
+> re-queried on every startup.
 
 ---
 
-## Interpreting the Log
+## Manual Resolution (STUCK / ERROR halt, or DEFERRED review)
 
-A mismatch produces a CRITICAL block like:
-
-```
-CRITICAL  live.main: POSITION MISMATCH DETECTED
-  Mismatched tickers : TSLA, NVDA
-  IBKR qty           : {'TSLA': 100, 'NVDA': 0}
-  DB qty             : {'TSLA': 0, 'NVDA': 50}
-  Resolution         : reconcile manually, then restart with SKIP_POSITION_CHECK=true
-  Runbook            : docs/STARTUP_RECONCILIATION.md
-```
-
-- **IBKR qty > 0, DB qty = 0** — IBKR holds a position the DB has no record of.
-  Likely cause: yesterday's position was not closed, or a manual trade was placed.
-- **IBKR qty = 0, DB qty > 0** — DB shows a position that IBKR no longer holds.
-  Likely cause: IBKR filled an exit that wasn't recorded (process crashed mid-fill),
-  or the position was manually closed in TWS.
-
----
-
-## Resolution Procedures
-
-### Case A — Stale paper positions from a prior session
-
-The paper account has leftover positions that were never closed (e.g., the process
-crashed before market close yesterday).
-
-1. Open TWS / IB Gateway.
-2. Manually close all open positions in the paper account.
-3. Verify the `positions` table is empty for today's date:
-   ```sql
-   SELECT * FROM positions WHERE session_date = CURRENT_DATE;
-   ```
-4. If DB rows exist for today, delete them:
-   ```sql
-   DELETE FROM positions WHERE session_date = CURRENT_DATE;
-   ```
-5. Restart the container normally (no flag needed).
-
-### Case B — Process crashed mid-fill (DB behind IBKR)
-
-IBKR executed a fill but the DB transaction did not complete before the crash.
-
-1. Identify the ticker(s) in the mismatch log.
-2. Check IBKR execution history for today's fills on those tickers.
-3. Manually insert the missing position row:
-   ```sql
-   INSERT INTO positions (strategy_id, ticker, session_date, qty, avg_entry_price, open_ns)
-   VALUES ('epg_v1', 'TSLA', CURRENT_DATE, 100, 245.50, extract(epoch from now()) * 1e9);
-   ```
-   Use the actual fill price and qty from IBKR execution history.
-4. Restart normally.
-
-### Case C — Minor discrepancy, need to trade now
-
-If you have verified the IBKR position is correct and simply want to proceed:
-
-1. Set `SKIP_POSITION_CHECK=true` in the `.env` file or docker-compose environment.
-2. Restart: `docker compose up -d trading`
-3. The system will log a WARNING, seed IBKR positions as truth, and continue.
-4. **Remove `SKIP_POSITION_CHECK` after the session.** It must not persist across sessions.
+1. Open TWS / IB Gateway and inspect the flagged ticker(s).
+2. **STUCK / ERROR:** the broker still holds the position. Either close it manually in
+   TWS, or — if the market is open and liquidity has returned — simply restart the
+   container; crash recovery will retry the flatten automatically.
+3. **DEFERRED:** the market was closed at startup. When it next opens, restart the
+   container (recovery re-runs and flattens), or close manually in TWS.
+4. There is no DB surgery required: crash recovery already reconciled the DB to flat.
 
 ---
 
 ## Prevention
 
-- Always use the kill switch (`/kill` or `live/kill.flag`) to stop the system.
-  This flattens all positions before exit.
-- Do not manually close positions in TWS while the live system is running.
-- Do not kill the container with `docker kill` or `docker stop` while a fill is in flight.
-  Use `/kill` first, wait for "all positions flat" confirmation, then stop the container.
+- Prefer the kill switch (`/kill` or `live/kill.flag`) to stop the system — it flattens
+  before exit. But an unclean stop (`docker kill`, power loss) is now safe: crash
+  recovery handles it on the next start.
+- Avoid manually closing positions in TWS while the live system is running.
 
 ---
 
 ## DB Queries for Diagnosis
 
 ```sql
--- All open positions for today
-SELECT * FROM positions WHERE session_date = CURRENT_DATE;
+-- Positions (should all be qty=0 after recovery)
+SELECT * FROM positions WHERE strategy_id = 'epg_v1' AND qty != 0;
 
--- Recent fills
-SELECT ticker, side, fill_price, filled_qty, status, filled_ns
-FROM orders
-WHERE session_date = CURRENT_DATE
-ORDER BY filled_ns DESC
+-- Crash recovery audit trail
+SELECT ticker, event_ns, notes
+FROM signal_events
+WHERE event_type = 'CRASH_RECOVERY_CLOSE'
+ORDER BY event_ns DESC
 LIMIT 20;
 
--- Any trades closed today
-SELECT ticker, entry_price, exit_price, pnl_dollar, exit_reason
-FROM trades
-WHERE session_date = CURRENT_DATE
-ORDER BY exit_ns DESC;
+-- Orders cancelled by crash recovery
+SELECT ticker, side, status, cancel_reason
+FROM orders
+WHERE cancel_reason = 'CRASH_RECOVERY'
+ORDER BY submitted_ns DESC
+LIMIT 20;
 ```

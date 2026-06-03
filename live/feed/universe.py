@@ -172,9 +172,9 @@ class UniverseManager:
         # If resuming from an existing position (startup triage), mark the state
         # in_position so the signal loop dispatches to _check_exits, not _check_entry.
         if existing_position is not None:
-            from live.startup_triage import _current_session_bucket
+            from live.feed.market_status import current_session_bucket
             live_state.record_entry(
-                session_bkt=_current_session_bucket(),
+                session_bkt=current_session_bucket(),
                 i_entry=0.5,  # neutral — original i_entry was lost across restart
             )
             log.info(

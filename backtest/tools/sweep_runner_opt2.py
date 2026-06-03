@@ -1,5 +1,5 @@
 """
-Shared sweep infrastructure for Phase EPG-OPT2.
+Shared sweep infrastructure for Phase EPG-OPT2 and EPG-OPT2-SF.
 
 Provides:
   build_stage1_configs()          — 84 Stage 1 level-gate configs (no cooling)
@@ -9,6 +9,11 @@ Provides:
   aggregate_config_metrics_opt2() — new metrics: capture_fraction, capture_rate
   dq_and_rank(rows)               — DQ + Borda ranking
 
+  # SF additions (EPG-OPT2-SF):
+  precompute_sf_trajectory(td, session_start_ns, session_end_ns) → SFTrajectory
+  _run_gate_opt2_sf(cfg, td, sides, t_event, sf)  — gate replay with SF entry gate
+  _sweep_worker_opt2_sf(args)     — SF-aware worker
+
 All Stage 1 configs use variant 'a' (ParticipationGate) with m_cool_sec=0 (no cooling).
 Stage 2 configs extend Stage 1 with m_cool_sec > 0 and tau_cool_sec.
 """
@@ -17,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -557,9 +563,434 @@ def dq_and_rank(rows: list[dict]) -> list[dict]:
     def _sort_key(r):
         if r["disqualified"]:
             return (1, 9999, -9999, 9999)
-        tau = r.get("tau", 0)
-        gap = r.get("p_open", 0) - r.get("p_close", 0)
+        tau = r.get("tau") or 0
+        # F_ss/F_sl configs have no p_open/p_close — coerce None to 0 for tiebreak
+        gap = (r.get("p_open") or 0) - (r.get("p_close") or 0)
         return (0, r["borda_score"], -tau, gap)
 
     rows.sort(key=_sort_key)
     return rows
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  EPG-OPT2-SF: Setup Filter Integration
+# ══════════════════════════════════════════════════════════════════════
+
+from core.filters.setup_filter import (
+    _build_1min_bars,
+    _compute_setup_signals,
+    _check_sustained,
+    Q_THRESHOLD,
+    SUSTAIN_BARS,
+    WARMUP_BARS,
+    WARMUP_THRESHOLD,
+)
+from data.loaders.trades import _session_ns_bounds
+
+_BAR_NS = 60 * NS_PER_SECOND
+
+
+@dataclass
+class SFTrajectory:
+    """Precomputed setup filter trajectory for one event."""
+    bar_starts_ns: np.ndarray       # int64, shape (n_bars,) — bar start timestamps
+    q_tilde: np.ndarray             # float64, shape (n_bars,)
+    qualified: np.ndarray           # bool, shape (n_bars,) — True when entry allowed
+    first_qualify_bar: int          # -1 if never qualified
+    n_bars: int
+    mean_q_tilde: float
+    psi_passes: bool
+
+
+def precompute_sf_trajectory(
+    td,
+    session_start_ns: int,
+    session_end_ns: int,
+) -> SFTrajectory:
+    """
+    Precompute setup filter Q_tilde trajectory and per-bar qualification array.
+
+    qualified[i] is True iff Q_tilde[i] >= threshold (0.75 during warmup bars,
+    0.65 after). Current-bar check only — no sustain requirement.
+
+    Parameters
+    ----------
+    td : TradeData (has .timestamps int64 ns, .prices, .sizes)
+    session_start_ns : int — session start in nanoseconds
+    session_end_ns : int — session end in nanoseconds
+    """
+    opens, highs, lows, closes, volumes, dvols, bar_starts_ns = _build_1min_bars(
+        td.timestamps, td.prices, td.sizes, session_start_ns, session_end_ns
+    )
+    n_bars = len(opens)
+
+    if n_bars < SUSTAIN_BARS:
+        empty_bool = np.zeros(0, dtype=bool)
+        empty_f = np.zeros(0, dtype=np.float64)
+        empty_i = np.zeros(0, dtype=np.int64)
+        return SFTrajectory(
+            bar_starts_ns=empty_i, q_tilde=empty_f, qualified=empty_bool,
+            first_qualify_bar=-1, n_bars=0, mean_q_tilde=0.0, psi_passes=True,
+        )
+
+    _, _, _, _, _, q_tilde = _compute_setup_signals(
+        opens, highs, lows, closes, volumes, dvols
+    )
+
+    _, first_qualify, _, _ = _check_sustained(
+        q_tilde, Q_THRESHOLD, SUSTAIN_BARS, WARMUP_BARS, WARMUP_THRESHOLD
+    )
+
+    # Build per-bar qualification array.
+    # The setup filter checks CURRENT Q_tilde only — qualified[i] is True whenever
+    # Q_tilde[i] >= threshold (warmup-aware: 0.75 for first 65 bars, 0.65 after).
+    # There is NO 15-bar sustain requirement. first_qualify_bar is retained below
+    # only as a diagnostic field; it plays no role in entry decisions.
+    qualified = np.zeros(n_bars, dtype=bool)
+    for i in range(n_bars):
+        bar_session_idx = int((bar_starts_ns[i] - session_start_ns) / _BAR_NS)
+        thr = WARMUP_THRESHOLD if bar_session_idx < WARMUP_BARS else Q_THRESHOLD
+        if q_tilde[i] >= thr:
+            qualified[i] = True
+
+    return SFTrajectory(
+        bar_starts_ns=bar_starts_ns,
+        q_tilde=q_tilde,
+        qualified=qualified,
+        first_qualify_bar=first_qualify,
+        n_bars=n_bars,
+        mean_q_tilde=float(np.mean(q_tilde)) if n_bars > 0 else 0.0,
+        psi_passes=True,  # ψ handled separately in T3 reporting
+    )
+
+
+def sf_is_qualified_at(sf: SFTrajectory, tick_ns: int) -> bool:
+    """Return True if the setup filter is qualified (Q_tilde >= threshold) at the
+    most recent completed bar for the given timestamp. No sustain requirement."""
+    if sf.n_bars == 0 or len(sf.bar_starts_ns) == 0:
+        return False
+    # Find the most recent bar that started at or before tick_ns
+    bar_pos = int(np.searchsorted(sf.bar_starts_ns, tick_ns, side="right")) - 1
+    if bar_pos < 0 or bar_pos >= len(sf.qualified):
+        return False
+    return bool(sf.qualified[bar_pos])
+
+
+def _build_gate_for_cfg(cfg: dict, lambda_v_ref: float = 1.0):
+    """Construct the appropriate gate object for a config (variant-aware)."""
+    variant = cfg.get("variant", "a")
+    if variant in ("f_ss", "f_sl"):
+        from core.epg.gate_variants import SlopeGate
+        # Derive mode from variant if not explicitly stored
+        mode = cfg.get("mode") or ("ss" if variant == "f_ss" else "sl")
+        return SlopeGate(
+            tau_sec=cfg["tau"],
+            L_sec=cfg["L_sec"],
+            k_open=cfg["k_open"],
+            mode=mode,
+            k_close=cfg.get("k_close") if cfg.get("k_close") is not None else -1.0,
+            p_close=cfg.get("p_close") if cfg.get("p_close") is not None else 0.35,
+            lambda_v_ref=max(lambda_v_ref, 1e-9),
+            warmup_seconds=EPG_WARMUP,
+        )
+    # Default: ParticipationGate (variant 'a')
+    return ParticipationGate(
+        half_life_seconds=cfg["tau"],
+        peak_threshold_p=cfg["p_open"],
+        warmup_seconds=EPG_WARMUP,
+        p_open=cfg["p_open"],
+        p_close=cfg["p_close"],
+        m_cool_sec=cfg.get("m_cool_sec", 0.0) or 0.0,
+        tau_cool_sec=cfg.get("tau_cool_sec", 120.0) or 120.0,
+    )
+
+
+def _run_gate_opt2_sf(
+    cfg: dict,
+    td,
+    sides: np.ndarray,
+    t_event: float,
+    sf: Optional[SFTrajectory] = None,
+    lambda_v_ref: float = 1.0,
+) -> dict:
+    """
+    Gate replay with optional setup filter entry gate. Variant-aware: builds a
+    ParticipationGate (variant 'a') or SlopeGate (variant 'f_ss'/'f_sl').
+
+    When sf is provided (use_setup_filter=True), a PASS rising edge is blocked
+    if the setup filter is not currently qualified at that tick.
+
+    Returns the same per-event metrics dict as _run_gate_opt2, plus:
+      n_entries_blocked_by_sf: int
+    """
+    use_sf = sf is not None and sf.n_bars > 0
+
+    gate = _build_gate_for_cfg(cfg, lambda_v_ref=lambda_v_ref)
+    gate.activate(t_event)
+
+    N = td.n_trades
+    prev_state = GateState.INACTIVE
+    in_position = False
+    entry_t_sec: Optional[float] = None
+    entry_price: Optional[float] = None
+    position_max_price: Optional[float] = None
+
+    pnl_list: list[float] = []
+    hold_list: list[float] = []
+    max_price_list: list[float] = []
+    entry_price_list: list[float] = []
+    pass_windows: list[float] = []
+    window_start: Optional[float] = None
+    first_entry_delay: Optional[float] = None
+    n_pass_ticks = 0
+    n_postwarm_ticks = 0
+    n_entries_blocked_by_sf = 0
+
+    for i in range(N):
+        dv = float(td.prices[i]) * float(td.sizes[i])
+        t = td.t_sec[i]
+
+        state = gate.update(dv, t)
+
+        if t >= t_event + EPG_WARMUP and state in (GateState.PASS, GateState.FAIL):
+            n_postwarm_ticks += 1
+            if state == GateState.PASS:
+                n_pass_ticks += 1
+
+        if state == GateState.PASS and prev_state != GateState.PASS:
+            window_start = t
+        elif state != GateState.PASS and prev_state == GateState.PASS:
+            if window_start is not None:
+                pass_windows.append(t - window_start)
+            window_start = None
+
+        if in_position:
+            cur_p = float(td.prices[i])
+            if position_max_price is None or cur_p > position_max_price:
+                position_max_price = cur_p
+
+        if not in_position:
+            rising_edge = (
+                state == GateState.PASS
+                and prev_state in (GateState.INACTIVE, GateState.WARMUP, GateState.FAIL)
+            )
+            if rising_edge:
+                # Setup filter check
+                sf_ok = True
+                if use_sf:
+                    sf_ok = sf_is_qualified_at(sf, int(td.timestamps[i]))
+                    if not sf_ok:
+                        n_entries_blocked_by_sf += 1
+
+                if sf_ok:
+                    entry_t_sec = t
+                    entry_price = float(td.prices[min(i + 1, N - 1)])
+                    position_max_price = entry_price
+                    in_position = True
+                    if first_entry_delay is None:
+                        first_entry_delay = t - t_event
+        else:
+            if prev_state == GateState.PASS and state != GateState.PASS:
+                exit_price = float(td.prices[min(i + 1, N - 1)])
+                pnl = (exit_price - entry_price) / entry_price * 100.0
+                hold = t - entry_t_sec
+                pnl_list.append(pnl)
+                hold_list.append(hold)
+                max_price_list.append(
+                    position_max_price if position_max_price is not None else entry_price
+                )
+                entry_price_list.append(entry_price)
+                in_position = False
+                entry_t_sec = None
+                entry_price = None
+                position_max_price = None
+
+        prev_state = state
+
+    if in_position:
+        exit_price = float(td.prices[N - 1])
+        pnl = (exit_price - entry_price) / entry_price * 100.0
+        hold = td.t_sec[N - 1] - entry_t_sec
+        pnl_list.append(pnl)
+        hold_list.append(hold)
+        max_price_list.append(
+            position_max_price if position_max_price is not None else exit_price
+        )
+        entry_price_list.append(entry_price)
+
+    if window_start is not None:
+        pass_windows.append(td.t_sec[N - 1] - window_start)
+
+    return {
+        "n_trades": len(pnl_list),
+        "pnl_list": pnl_list,
+        "hold_list": hold_list,
+        "max_price_list": max_price_list,
+        "entry_price_list": entry_price_list,
+        "pass_fraction": n_pass_ticks / n_postwarm_ticks if n_postwarm_ticks > 0 else 0.0,
+        "pass_windows": pass_windows,
+        "first_entry_delay": first_entry_delay,
+        "n_entries_blocked_by_sf": n_entries_blocked_by_sf,
+    }
+
+
+def aggregate_config_metrics_sf(event_results: list[dict]) -> dict:
+    """Aggregate metrics including SF-specific fields (n_entries_blocked_by_sf)."""
+    base = aggregate_config_metrics_opt2(event_results)
+
+    n_blocked_total = sum(r.get("n_entries_blocked_by_sf", 0) for r in event_results)
+    n_entries_total = base["n_trades"] + n_blocked_total
+    pct_blocked = (
+        round(n_blocked_total / n_entries_total * 100.0, 2)
+        if n_entries_total > 0 else 0.0
+    )
+    total_pnl = round(sum(p for r in event_results for p in r.get("pnl_list", [])), 4)
+    n_events_traded = base.get("n_events_with_trades", 0)
+    total_pnl_per_event = round(
+        total_pnl / n_events_traded if n_events_traded > 0 else 0.0, 4
+    )
+
+    return {
+        **base,
+        "n_entries_blocked_by_sf": n_blocked_total,
+        "pct_entries_blocked": pct_blocked,
+        "total_pnl_pct": total_pnl,
+        "total_pnl_pct_per_event": total_pnl_per_event,
+    }
+
+
+def _sweep_worker_opt2_sf(args: dict) -> dict:
+    """
+    SF-aware multiprocessing worker. Precomputes SF trajectory once per event,
+    then replays all configs with SF entry gating.
+
+    Applies resource limits from compute_profile:
+      os.nice(worker_nice), ionice class 3 — set by pool initializer.
+    """
+    ticker = args["ticker"]
+    date = args["date"]
+    mom_pct = args["mom_pct"]
+    fp = args["hawkes_params"]
+    rho = args["rho"]
+    rho_E = args["rho_E"]
+    q_bar_cfg = args["q_bar_cfg"]
+    configs = args["configs"]
+
+    base = {"ticker": ticker, "date": date}
+
+    try:
+        td = load_trades(ticker, date, mom_pct)
+        if td.n_trades < 30:
+            return {**base, "status": "skipped", "reason": "insufficient_trades"}
+
+        qd = load_quotes(ticker, date, mom_pct)
+        if qd is None or qd.n_quotes < 10:
+            return {**base, "status": "skipped", "reason": "insufficient_quotes"}
+
+        N = td.n_trades
+        tier_qbar = q_bar_cfg.get("wide", {}).get("median", 250.0)
+        ofi_result = compute_trade_ofi(
+            trade_timestamps=td.timestamps, trade_prices=td.prices,
+            trade_sizes=td.sizes.astype(np.float64),
+            quote_timestamps=qd.timestamps,
+            quote_bid_prices=qd.bid_prices, quote_ask_prices=qd.ask_prices,
+            quote_bid_sizes=qd.bid_sizes.astype(np.float64),
+            quote_ask_sizes=qd.ask_sizes.astype(np.float64),
+            window_sec=10.0, q_bar_fallback=tier_qbar,
+        )
+        sides = ofi_result.sides
+
+        lam_buy_out = np.zeros(N, dtype=np.float64)
+        lam_sell_out = np.zeros(N, dtype=np.float64)
+        E_out = np.zeros(N, dtype=np.float64)
+        Edot_out = np.zeros(N, dtype=np.float64)
+        n_base_out = np.zeros(N, dtype=np.float64)
+
+        global_lref = fp["mu_buy"] + fp["mu_sell"]
+        per_event_lref = compute_lambda_ref_per_event(ticker, date)
+        lambda_ref = (
+            per_event_lref
+            if not math.isnan(per_event_lref) and per_event_lref > 0
+            else global_lref
+        )
+
+        cold_start_params = _hawkes_replay_with_refit(
+            t_sec=td.t_sec, sides=sides,
+            rho=rho, lambda_ref=lambda_ref, init_params=fp, rho_E=rho_E,
+            lam_buy_out=lam_buy_out, lam_sell_out=lam_sell_out,
+            E_out=E_out, Edot_out=Edot_out, n_base_out=n_base_out,
+        )
+        lambda_hat = lam_buy_out + lam_sell_out
+
+        anchor_lref = fp["mu_buy"] + fp["mu_sell"]
+        anchor = EventAnchor(lambda_ref=anchor_lref, k_multiplier=EPG_K)
+        if cold_start_params is not None:
+            lref_epg = cold_start_params.mu_buy + cold_start_params.mu_sell
+            if lref_epg > 0:
+                anchor.set_lambda_ref(lref_epg)
+
+        t_event = None
+        for i in range(N):
+            t_ev = anchor.update(lambda_hat[i], td.t_sec[i])
+            if t_ev is not None:
+                t_event = t_ev
+                break
+        if t_event is None:
+            return {**base, "status": "skipped", "reason": "no_t_event"}
+
+        # Precompute SF trajectory once for this event
+        start_ns, end_ns = _session_ns_bounds(date)
+        sf = precompute_sf_trajectory(td, start_ns, end_ns)
+
+        # lambda_v_ref for SlopeGate configs (mu_buy + mu_sell from cold-start)
+        if cold_start_params is not None:
+            lambda_v_ref = cold_start_params.mu_buy + cold_start_params.mu_sell
+        else:
+            lambda_v_ref = fp["mu_buy"] + fp["mu_sell"]
+        lambda_v_ref = max(lambda_v_ref, 1e-9)
+
+        also_unfiltered = args.get("also_unfiltered", False)
+
+        # Run all configs with SF gate (and optionally unfiltered for delta comparison)
+        results: dict[str, dict] = {}
+        results_unfiltered: dict[str, dict] = {}
+        for cfg in configs:
+            results[cfg["config_id"]] = _run_gate_opt2_sf(
+                cfg, td, sides, t_event, sf, lambda_v_ref=lambda_v_ref
+            )
+            if also_unfiltered:
+                results_unfiltered[cfg["config_id"]] = _run_gate_opt2_sf(
+                    cfg, td, sides, t_event, sf=None, lambda_v_ref=lambda_v_ref
+                )
+
+        out = {
+            **base, "status": "ok", "results": results,
+            "sf_first_qualify_bar": sf.first_qualify_bar,
+            "sf_n_bars": sf.n_bars,
+            "sf_mean_q_tilde": sf.mean_q_tilde,
+        }
+        if also_unfiltered:
+            out["results_unfiltered"] = results_unfiltered
+        return out
+
+    except Exception as e:
+        import traceback
+        return {
+            **base, "status": "error",
+            "error": str(e), "traceback": traceback.format_exc(),
+        }
+
+
+def sf_worker_initializer(nice_level: int = 15, use_ionice: bool = True) -> None:
+    """Worker process initializer: apply CPU and I/O priority limits."""
+    import os, subprocess
+    try:
+        os.nice(nice_level)
+    except Exception:
+        pass
+    if use_ionice:
+        try:
+            subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())],
+                           check=False, capture_output=True)
+        except Exception:
+            pass

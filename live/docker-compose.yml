@@ -37,7 +37,6 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       DATA_ROOT: ${DATA_ROOT:-/data}
-      SKIP_POSITION_CHECK: ${SKIP_POSITION_CHECK:-false}
     volumes:
       # Mount the external data directory so session exports land in the
       # same filtered/ catalog the backtest pipeline reads.
