@@ -1161,14 +1161,19 @@ Trading the dominant name (Q1) produces materially lower PF than secondary names
 
 **None implemented. All require explicit approval before any code changes.**
 
-| Signal | Phase G Finding | Phase G v2 Finding | Proposed Gate |
+> **Phase G v1 and v2 findings are analysis-only and NOT actionable.** The quartile boundary in
+> particular shows a clear Q1→Q4 PF gradient in analysis but breaks down in practice. Do not
+> implement any scanner context filter (rank gate, quartile gate, heat gate, multi-day runner,
+> TOD filter) without a dedicated validation phase with explicit approval.
+
+| Signal | Phase G Finding | Phase G v2 Finding | Status |
 |---|---|---|---|
-| Rank gate | Rank 1 PF=1.18 vs ranks 3–9 PF=2.79–6.04 | Q1 PF=1.25 confirms same signal | Avoid rank 1 at entry |
-| Quartile gate | — | Q1→Q4 monotone +1.81 PF spread | Prefer Q3–Q4 entries |
-| Heat gate | Cold Q1 PF=1.46, Hot Q4 PF=2.62 | — | **DECIDED — Q3/Q4 only. cold_Q1 and Q2 not traded.** |
-| Multi-day runner | PF=2.76 vs 1.94 (+0.82 PF) — strongest standalone | — | Prefer tickers in momentum catalog within prior 5 days |
-| TOD midday filter | 11:30–13:30 ET near-breakeven | — | Exclude midday window (~15–20% trade count cost) |
-| Rank × Heat combo | Rank 3 + Hot Q4 = PF 6.46 (n=124) | — | Combined filter |
+| Rank gate | Rank 1 PF=1.18 vs ranks 3–9 PF=2.79–6.04 | Q1 PF=1.25 confirms same signal | NOT ACTIONABLE — analysis only |
+| Quartile gate | — | Q1→Q4 monotone +1.81 PF spread | NOT ACTIONABLE — breaks down in practice |
+| Heat gate | Cold Q1 PF=1.46, Hot Q4 PF=2.62 | — | NOT ACTIONABLE — analysis only |
+| Multi-day runner | PF=2.76 vs 1.94 (+0.82 PF) — strongest standalone | — | NOT ACTIONABLE — analysis only |
+| TOD midday filter | 11:30–13:30 ET near-breakeven | — | NOT ACTIONABLE — analysis only |
+| Rank × Heat combo | Rank 3 + Hot Q4 = PF 6.46 (n=124) | — | NOT ACTIONABLE — analysis only |
 
 ---
 

@@ -6,8 +6,10 @@ import json
 import logging
 import os
 import time
-from datetime import date
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from live.session_clock import SessionClock
 
 import aiohttp
 
@@ -52,7 +54,7 @@ class UniverseManager:
         hot_quotes: list,
         hot_signal_events: list,
         hot_hawkes_refits: list,
-        session_date: date,
+        session_clock: "SessionClock",
         telegram=None,
     ) -> None:
         self._order_queue = order_queue
@@ -62,7 +64,7 @@ class UniverseManager:
         self._hot_quotes = hot_quotes
         self._hot_signal_events = hot_signal_events
         self._hot_hawkes_refits = hot_hawkes_refits
-        self._session_date = session_date
+        self._clock = session_clock
         self._telegram = telegram
 
         self._universe: dict[str, TickerContext] = {}
@@ -150,7 +152,7 @@ class UniverseManager:
         try:
             ctx_result = await fetch_context(
                 ticker=ticker,
-                session_date=self._session_date,
+                session_clock=self._clock,
                 scanner_context=scanner_ctx,
                 polygon_api_key=self._api_key,
                 account_equity=self._risk_state.account_equity,
@@ -165,7 +167,7 @@ class UniverseManager:
             ticker=ticker,
             ctx=ctx_result,
             scanner_context=scanner_ctx,
-            session_date=self._session_date,
+            session_date=self._clock.date,
         )
 
         # If resuming from an existing position (startup triage), mark the state
@@ -209,7 +211,7 @@ class UniverseManager:
                 hot_signal_events=self._hot_signal_events,
                 hot_hawkes_refits=self._hot_hawkes_refits,
                 heartbeat=self._heartbeat,
-                session_date=self._session_date,
+                session_clock=self._clock,
                 disqualify_callback=_sf_disqualify_callback,
             )
         )
@@ -250,7 +252,7 @@ class UniverseManager:
         intraday_pct = ctx.signal_state.intraday_pct if ctx.signal_state else None
         theo_equity = self._risk_state.theoretical_equity
         asyncio.create_task(
-            _export_ticker_session(ticker, self._session_date, intraday_pct, theo_equity, close_reason)
+            _export_ticker_session(ticker, self._clock.date, intraday_pct, theo_equity, close_reason)
         )
 
     async def _dispatch(self, msg: dict) -> None:
@@ -416,6 +418,9 @@ class UniverseManager:
         risk_state._loss_limit_hit = False
 
         await self.close_ws()
+
+        self._clock.roll()
+        log.info("Session date advanced to %s", self._clock.date)
 
         log.info("Session close complete. Universe cleared, closed_today reset, WS closed.")
         if telegram is not None:

@@ -1,0 +1,41 @@
+2026-06-04 13:29:10,917 | INFO | Raw splits: train=3956 val=1211 (has_quotes=True)
+2026-06-04 13:29:10,920 | INFO | === T2a: Processing training split (3956 events) ===
+2026-06-04 14:48:21,102 | INFO | TRAIN: 8% done — ok=278 skip=22 err=0 (4750.2s)
+2026-06-04 16:11:20,415 | INFO | TRAIN: 15% done — ok=557 skip=43 err=0 (9729.5s)
+2026-06-04 17:26:02,128 | INFO | TRAIN: 23% done — ok=844 skip=56 err=0 (14211.2s)
+2026-06-04 18:33:48,242 | INFO | TRAIN: 30% done — ok=1135 skip=65 err=0 (18277.3s)
+2026-06-04 19:57:13,295 | INFO | TRAIN: 38% done — ok=1413 skip=83 err=4 (23282.4s)
+2026-06-04 21:18:46,993 | INFO | TRAIN: 46% done — ok=1696 skip=100 err=4 (28176.1s)
+2026-06-04 22:20:28,791 | INFO | TRAIN: 53% done — ok=1974 skip=122 err=4 (31877.9s)
+2026-06-04 23:14:38,350 | INFO | TRAIN: 61% done — ok=2256 skip=140 err=4 (35127.4s)
+2026-06-05 00:26:09,695 | INFO | TRAIN: 68% done — ok=2530 skip=166 err=4 (39418.8s)
+2026-06-05 01:28:24,657 | INFO | TRAIN: 76% done — ok=2813 skip=183 err=4 (43153.7s)
+2026-06-05 02:47:25,389 | INFO | TRAIN: 83% done — ok=3091 skip=205 err=4 (47894.5s)
+2026-06-05 03:44:29,837 | INFO | TRAIN: 91% done — ok=3371 skip=225 err=4 (51318.9s)
+2026-06-05 04:51:15,310 | INFO | TRAIN: 99% done — ok=3647 skip=249 err=4 (55324.4s)
+2026-06-05 05:00:34,422 | INFO | TRAIN: 100% done — ok=3700 skip=252 err=4 (55883.5s)
+2026-06-05 05:00:34,448 | INFO | TRAIN: total ok=3700 skip=252 err=4 in 55883.5s
+2026-06-05 05:00:34,603 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\.cache_train_results.json
+2026-06-05 05:00:34,604 | INFO | Train results cached: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\.cache_train_results.json
+2026-06-05 05:00:34,605 | INFO | TRAIN: 3700 events with valid T_event
+2026-06-05 05:00:34,606 | INFO | TRAIN: after SF filter (Q_tilde >= 0.65): 436 (dropped 3264)
+2026-06-05 05:00:34,606 | INFO | === T2b: Processing val split (1211 events) ===
+2026-06-05 06:21:49,254 | INFO | VAL: 25% done — ok=281 skip=19 err=0 (4874.6s)
+2026-06-05 07:37:34,658 | INFO | VAL: 50% done — ok=566 skip=34 err=0 (9420.0s)
+2026-06-05 08:59:16,544 | INFO | VAL: 74% done — ok=848 skip=52 err=0 (14321.9s)
+2026-06-05 10:07:22,704 | INFO | VAL: 99% done — ok=1133 skip=67 err=0 (18408.1s)
+2026-06-05 10:07:42,416 | INFO | VAL: 100% done — ok=1144 skip=67 err=0 (18427.8s)
+2026-06-05 10:07:42,434 | INFO | VAL: total ok=1144 skip=67 err=0 in 18427.8s
+2026-06-05 10:07:42,461 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\.cache_val_results.json
+2026-06-05 10:07:42,462 | INFO | Val results cached: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\.cache_val_results.json
+2026-06-05 10:07:42,462 | INFO | VAL: 1144 events with valid T_event
+2026-06-05 10:07:42,462 | INFO | VAL: after SF filter (Q_tilde >= 0.65): 152 (dropped 992)
+2026-06-05 10:07:42,464 | INFO | Training sample: 200 events
+2026-06-05 10:07:42,464 | INFO | Val sample: 100 events
+2026-06-05 10:07:42,467 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\quality_sample_train.json
+2026-06-05 10:07:42,469 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\quality_sample_val.json
+2026-06-05 10:07:42,469 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\quality_filter_summary.json
+2026-06-05 10:07:42,470 | INFO | 
+T2 complete:
+  Train quality universe: 436 events \u2192 sample: 200
+  Val quality universe:   152 events \u2192 sample: 100

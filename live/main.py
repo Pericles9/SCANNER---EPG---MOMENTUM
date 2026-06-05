@@ -8,12 +8,12 @@ import logging.handlers
 import os
 import signal
 import sys
-from datetime import date
 from pathlib import Path
 
 from live.config import CFG
 from live.db.pool import close_pool, init_pool
 from live.db.writer import BatchWriter
+from live.session_clock import SessionClock
 
 
 def validate_config() -> None:
@@ -94,11 +94,11 @@ async def _session_close_scheduler(universe_mgr, order_queue, risk_state, telegr
     _log = logging.getLogger(__name__)
     while True:
         now_et = datetime.now(_ET)
-        target_et = now_et.replace(hour=19, minute=45, second=0, microsecond=0)
+        target_et = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
         if now_et >= target_et:
             target_et += timedelta(days=1)
         secs = (target_et - now_et).total_seconds()
-        _log.info("Session close scheduler: sleeping %.0fs until 19:45 ET", secs)
+        _log.info("Session close scheduler: sleeping %.0fs until 20:00 ET", secs)
         await asyncio.sleep(secs)
         await universe_mgr.session_close(order_queue, risk_state, telegram)
 
@@ -130,15 +130,19 @@ async def _ibkr_watchdog(ibkr, telegram) -> None:
 
 
 def _setup_logging() -> None:
+    from logging.handlers import TimedRotatingFileHandler
     log_dir = Path(CFG.logging.log_dir)
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"{CFG.logging.log_prefix}_{date.today().isoformat()}.log"
+    log_file = log_dir / f"{CFG.logging.log_prefix}.log"
 
-    handler = logging.handlers.RotatingFileHandler(
+    handler = TimedRotatingFileHandler(
         log_file,
-        maxBytes=CFG.logging.max_bytes,
+        when="midnight",
         backupCount=CFG.logging.backup_count,
+        encoding="utf-8",
     )
+    handler.suffix = "%Y-%m-%d"
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -233,7 +237,7 @@ async def main() -> None:
         chat_id=os.environ["TELEGRAM_CHAT_ID"],
     )
 
-    session_date = date.today()
+    clock = SessionClock()
 
     # ── Crash recovery — the single startup path back to a flat state ──
     # Runs after IBKR connects but before any signal loops / scanner polling.
@@ -242,7 +246,7 @@ async def main() -> None:
     # resume — EPG windows are 30-120s and any restart outlives them.
     from live.recovery import run_crash_recovery
     try:
-        recovery = await run_crash_recovery(ibkr.ib, pool, telegram, session_date)
+        recovery = await run_crash_recovery(ibkr.ib, pool, telegram, clock.date)
     except Exception:
         log.critical("Crash recovery raised — halting startup", exc_info=True)
         await telegram.send_silent("🔴 STARTUP HALTED — crash recovery raised an exception.")
@@ -311,7 +315,7 @@ async def main() -> None:
         hot_quotes=hot_quotes,
         hot_signal_events=hot_signal_events,
         hot_hawkes_refits=hot_hawkes_refits,
-        session_date=session_date,
+        session_clock=clock,
         telegram=telegram,
     )
 
@@ -331,7 +335,7 @@ async def main() -> None:
         scanner_last_poll_t=scanner_last_poll_t,
         ws_last_msg_t=universe_mgr.ws_last_msg_t,
         worker_last_wake_t=worker_last_wake_t,
-        session_date=session_date,
+        session_clock=clock,
     )
     telegram.register_bot_state(bot_state)
 
@@ -351,36 +355,17 @@ async def main() -> None:
             except Exception:
                 log.exception("Failed to refresh account equity from IBKR")
 
-    # ── Phase A: launch infrastructure that triage depends on ──
-    # universe_mgr.run() establishes the WS connection so resumed tickers
-    # receive live ticks. order_worker processes triage close requests.
-    # Scanner is held back until triage completes.
-    infra_tasks = [
+    # ── Critical tasks — failure halts the system ──
+    critical_tasks = [
         asyncio.create_task(
             universe_mgr.run(universe_queue),
             name="universe_manager",
         ),
         asyncio.create_task(
-            order_worker(order_queue, risk_state, ibkr, telegram, session_date),
+            order_worker(order_queue, risk_state, ibkr, telegram, clock),
             name="order_worker",
         ),
         asyncio.create_task(writer.run(), name="batch_writer"),
-        asyncio.create_task(kill_flag_watcher(kill_callback), name="kill_watcher"),
-        asyncio.create_task(telegram.start_polling(), name="telegram_bot"),
-        asyncio.create_task(equity_refresher(), name="equity_refresher"),
-        asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
-        asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
-        asyncio.create_task(
-            pending_close_monitor(risk_state, order_queue, telegram, ibkr),
-            name="pending_close_monitor",
-        ),
-    ]
-
-    # Startup position triage is gone — crash recovery (above) already flattened
-    # everything and reconciled the DB to flat before any of these tasks started.
-
-    # ── Phase C: launch scanner + remaining tasks ──
-    runtime_tasks = [
         asyncio.create_task(
             __import__("live.scanner_monitor", fromlist=["scanner_loop"]).scanner_loop(
                 universe_queue,
@@ -391,18 +376,30 @@ async def main() -> None:
             name="scanner_monitor",
         ),
         asyncio.create_task(
-            hourly_pnl_alert(risk_state, telegram, universe_mgr._universe),
-            name="pnl_reporter",
-        ),
-        asyncio.create_task(
             _session_close_scheduler(universe_mgr, order_queue, risk_state, telegram),
             name="session_close_scheduler",
         ),
     ]
-    tasks = infra_tasks + runtime_tasks
+
+    # ── Supervised tasks — retry handled internally; failure logged, not system-halting ──
+    supervised_tasks = [
+        asyncio.create_task(telegram.start_polling(), name="telegram_bot"),
+        asyncio.create_task(kill_flag_watcher(kill_callback), name="kill_watcher"),
+        asyncio.create_task(_ibkr_watchdog(ibkr, telegram), name="ibkr_watchdog"),
+        asyncio.create_task(equity_refresher(), name="equity_refresher"),
+        asyncio.create_task(_sentinel_heartbeat(), name="sentinel_heartbeat"),
+        asyncio.create_task(
+            pending_close_monitor(risk_state, order_queue, telegram, ibkr),
+            name="pending_close_monitor",
+        ),
+        asyncio.create_task(
+            hourly_pnl_alert(risk_state, telegram, universe_mgr._universe),
+            name="pnl_reporter",
+        ),
+    ]
 
     await telegram.send_silent(
-        f"EPG live system started — {session_date.isoformat()} — paper trading"
+        f"EPG live system started — {clock.date.isoformat()} — paper trading"
     )
 
     async def _await_shutdown() -> None:
@@ -410,11 +407,13 @@ async def main() -> None:
         raise SystemExit(0)
 
     _shutdown_task = asyncio.create_task(_await_shutdown(), name="shutdown_signal")
-    all_tasks = tasks + [_shutdown_task]
 
     try:
-        # FIRST_EXCEPTION: block until any task raises (crash or SIGTERM sentinel)
-        done, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_EXCEPTION)
+        # FIRST_EXCEPTION on critical tasks only — supervised failures are handled internally
+        done, _ = await asyncio.wait(
+            critical_tasks + [_shutdown_task],
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
         for task in done:
             if task is _shutdown_task:
                 log.info("Shutdown signal received — beginning clean shutdown")
@@ -427,9 +426,12 @@ async def main() -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutdown signal received")
     finally:
-        for task in all_tasks:
+        for task in critical_tasks + supervised_tasks + [_shutdown_task]:
             task.cancel()
-        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await asyncio.gather(
+            *critical_tasks, *supervised_tasks, _shutdown_task,
+            return_exceptions=True,
+        )
         await writer.flush()
         log.info("clean shutdown — buffer flushed")
         await close_pool()

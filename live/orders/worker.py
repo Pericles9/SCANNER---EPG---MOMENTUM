@@ -4,9 +4,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import date, datetime
-from typing import Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from live.session_clock import SessionClock
 
 from live.config import CFG
 from live.db.pool import get_pool
@@ -43,7 +46,7 @@ async def order_worker(
     risk_state: RiskState,
     ibkr: IBKRClient,
     telegram,
-    session_date: date,
+    session_clock: "SessionClock",
 ) -> None:
     """Consume order_queue. Single writer to RiskState."""
     while True:
@@ -51,7 +54,7 @@ async def order_worker(
         request = await order_queue.get()
 
         if isinstance(request, FlattenAllRequest):
-            await _execute_flatten_all(ibkr, risk_state, telegram, request.reason, session_date)
+            await _execute_flatten_all(ibkr, risk_state, telegram, request.reason, session_clock)
             continue
 
         if not isinstance(request, OrderRequest):
@@ -95,7 +98,7 @@ async def order_worker(
                     f"EXIT TIMEOUT: {request.ticker} — escalating to FlattenAll"
                 )
                 await _execute_flatten_all(ibkr, risk_state, telegram,
-                                           f"exit_timeout_{request.ticker}", session_date)
+                                           f"exit_timeout_{request.ticker}", session_clock)
             else:
                 log.warning("Entry order timed out: %s %s — skipping",
                             request.side, request.ticker)
@@ -105,8 +108,8 @@ async def order_worker(
         pool = get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
-                order_id = await _write_order(conn, fill, session_date)
-                await _update_position(conn, fill, order_id, session_date)
+                order_id = await _write_order(conn, fill, session_clock.date)
+                await _update_position(conn, fill, order_id, session_clock.date)
 
         # Update risk state (only order_worker writes RiskState)
         risk_state.record_fill(
@@ -129,7 +132,7 @@ async def _execute_flatten_all(
     risk_state: RiskState,
     telegram,
     reason: str,
-    session_date: date,
+    session_clock: "SessionClock",
 ) -> None:
     """Submit a limit sell for every tracked open position and wait for fills.
 
@@ -210,8 +213,8 @@ async def _execute_flatten_all(
             pool = get_pool()
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    order_id = await _write_order(conn, fill, session_date)
-                    await _update_position(conn, fill, order_id, session_date)
+                    order_id = await _write_order(conn, fill, session_clock.date)
+                    await _update_position(conn, fill, order_id, session_clock.date)
             risk_state.record_fill(
                 fill.ticker, fill.side, fill.qty, fill.fill_price,
                 filled_qty=fill.filled_qty,

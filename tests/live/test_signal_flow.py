@@ -33,6 +33,7 @@ from core.hawkes.engine import HawkesEngine
 from live.feed.context import TickerContext
 from live.feed.signal_loop import HeartbeatMonitor, signal_loop
 from live.feed.universe import UniverseManager, _normalize_ws_timestamps
+from live.session_clock import SessionClock
 from live.signals.context_fetch import ContextFetchResult, _classify_sides
 from live.signals.live_state import LiveSignalState
 
@@ -248,7 +249,7 @@ def test_bug1_signal_loop_pushes_to_order_queue():
             hot_signal_events=[],
             hot_hawkes_refits=[],
             heartbeat=heartbeat,
-            session_date=date(2026, 5, 26),
+            session_clock=SessionClock(),
         ))
         await ticker_queue.put(_quote_msg(50.0, 9.99, 10.01))
         await ticker_queue.put(_trade_msg(100.0, 10.02, 100))    # WARMUP (seeds buffer)
@@ -409,7 +410,7 @@ def test_bug6_universe_manager_init_sets_current_ws_to_none():
         hot_quotes=[],
         hot_signal_events=[],
         hot_hawkes_refits=[],
-        session_date=date(2026, 5, 26),
+        session_clock=SessionClock(),
     )
     assert mgr._current_ws is None
 

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from live.session_clock import SessionClock
 
 from telegram.ext import Application, CommandHandler
 
@@ -23,7 +25,7 @@ class BotState:
     scanner_last_poll_t: list   # [float] — mutable box
     ws_last_msg_t: list         # [float] — mutable box
     worker_last_wake_t: list    # [float] — mutable box
-    session_date: date = None
+    session_clock: "SessionClock" = None
 
 
 def setup_bot_handlers(app: Application, state: BotState) -> None:

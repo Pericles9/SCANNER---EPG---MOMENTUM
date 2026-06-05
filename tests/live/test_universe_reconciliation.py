@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from live.feed.universe import UniverseManager
+from live.session_clock import SessionClock
 
 
 def _build_mgr() -> UniverseManager:
@@ -23,7 +24,7 @@ def _build_mgr() -> UniverseManager:
     mgr._risk_state.theoretical_equity = 1000.0
     mgr._ws_send_queue = asyncio.Queue()
     mgr._heartbeat = MagicMock()
-    mgr._session_date = None
+    mgr._clock = SessionClock()
     mgr._telegram = None
     mgr._current_ws = None
     return mgr

@@ -6,8 +6,11 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from live.session_clock import SessionClock
 
 import aiohttp
 import numpy as np
@@ -155,7 +158,7 @@ def _classify_sides(prices: np.ndarray) -> np.ndarray:
 
 async def fetch_context(
     ticker: str,
-    session_date: date,
+    session_clock: "SessionClock",
     scanner_context: dict,
     polygon_api_key: str,
     account_equity: float = 0.0,
@@ -163,6 +166,7 @@ async def fetch_context(
 ) -> ContextFetchResult:
     """Fetch historical context, warm Hawkes engine and EPG gate."""
     t0 = time.monotonic()
+    session_date = session_clock.date  # read live at call time
     session_start_ns, session_end_ns = _session_bounds_ns(session_date)
     lambda_ref_global = CFG.hawkes.mu_buy + CFG.hawkes.mu_sell
     intraday_pct = scanner_context.get("pct_change", 0.0) / 100.0

@@ -1,5 +1,5 @@
 """
-Gate variants for Phase EPG-GRT and EPG-OPT2.
+Gate variants for Phase EPG-GRT, EPG-OPT2, and WJI-POC.
 
 All implement the same interface: .activate(t_event), .update(dollar_vol, timestamp, side),
 .reset().  The side argument is +1=buy, -1=sell, 0=unknown.
@@ -12,13 +12,16 @@ Variants:
   SlopeGate               (F) — opens on λ_V acceleration; two sub-variants:
                                  F_ss (slope open / slope close)
                                  F_sl (slope open / level close)
+  WJIGate                 (WJI) — joint buy-side arrival × dollar-volume signal;
+                                   geometric mean of normalised components; slope-driven
+                                   adaptive peak with continuous decay on deceleration
 """
 from __future__ import annotations
 
 import logging
 import math
 from collections import deque
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from core.epg.gate import GateState
 
@@ -610,3 +613,310 @@ class SlopeGate:
             return 0.0
         lv_past = self._buf[0][1]
         return (self._lambda_v - lv_past) / (self.L_sec * max(self.lambda_v_ref, 1e-9))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  WJI — WJIGate
+# ══════════════════════════════════════════════════════════════════════
+
+class WJIGate:
+    """
+    Weighted Joint Intensity Gate (Phase WJI-POC).
+
+    Combines a dollar-volume EMA (λ_V) and a buy-side arrival kernel (λ_buy_slow)
+    via a geometric mean, producing the joint signal WJI(t).  The running peak
+    of WJI is adaptive: it accumulates when WJI is accelerating and decays
+    continuously when WJI is decelerating and the gate is in FAIL.
+
+    Signal:
+        norm_λ_V(t)   = λ_V(t) / λ_V_ref
+        norm_λ_buy(t) = λ_buy_slow(t) / μ_buy
+        WJI(t)        = norm_λ_V(t)^α × norm_λ_buy(t)^(1−α)
+
+    λ_buy_slow kernel:
+        λ_buy_slow += β_slow  on buy trade;  always decays at rate β_slow
+
+    Peak update rules:
+        During PASS or (FAIL and slope ≥ 0):  peak = max(peak, WJI)
+        During FAIL and slope < 0:            peak decays with half-life τ_decay
+
+    PASS condition (asymmetric hysteresis):
+        FAIL → PASS: WJI(t) ≥ p_open  × peak
+        PASS → FAIL: WJI(t) <  p_close × peak
+
+    Activate signature differs from other variants: activate(t_event, λ_V_ref, μ_buy).
+    Peak is initialised at 1.0 so the gate will not open until WJI meaningfully
+    exceeds background level on both components.
+    """
+
+    _EPS: float = 1e-9
+
+    def __init__(
+        self,
+        alpha: float = 0.5,
+        tau_v: float = 180.0,
+        beta_slow: float = 0.01,
+        L_sec: float = 60.0,
+        tau_decay: float = 120.0,
+        p_open: float = 0.65,
+        p_close: float = 0.30,
+        warmup_seconds: float = WARMUP_DURATION_SEC,
+    ):
+        """
+        Parameters
+        ----------
+        alpha : float
+            Volume component weight in [0, 1].  alpha=0.5 → equal blend.
+        tau_v : float
+            Half-life (seconds) for the λ_V dollar-volume EMA.
+        beta_slow : float
+            Decay rate for the buy-side arrival kernel.  ~ln2/β = half-life.
+        L_sec : float
+            Lookback distance (seconds) for WJI slope computation.
+        tau_decay : float
+            Half-life (seconds) for peak decay during FAIL+deceleration periods.
+        p_open : float
+            FAIL→PASS opening threshold as a fraction of peak.  Must be in (0, 1].
+        p_close : float
+            PASS→FAIL closing threshold as a fraction of peak.  Must satisfy
+            0 < p_close ≤ p_open.
+        warmup_seconds : float
+            Duration of WARMUP period after T_event.
+        """
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        if tau_v <= 0:
+            raise ValueError(f"tau_v must be positive, got {tau_v}")
+        if beta_slow <= 0:
+            raise ValueError(f"beta_slow must be positive, got {beta_slow}")
+        if L_sec <= 0:
+            raise ValueError(f"L_sec must be positive, got {L_sec}")
+        if tau_decay <= 0:
+            raise ValueError(f"tau_decay must be positive, got {tau_decay}")
+        if not (0 < p_close <= p_open <= 1.0):
+            raise ValueError(
+                f"need 0 < p_close ≤ p_open ≤ 1, got p_close={p_close}, p_open={p_open}"
+            )
+
+        self.alpha = alpha
+        self.tau_v = tau_v
+        self.beta_slow = beta_slow
+        self.L_sec = L_sec
+        self.tau_decay = tau_decay
+        self.p_open = p_open
+        self.p_close = p_close
+        self.warmup_seconds = warmup_seconds
+
+        self._decay_rate_v: float = LN2 / tau_v
+        self._decay_rate_peak: float = LN2 / tau_decay
+
+        # Signal state
+        self._lambda_v: float = 0.0
+        self._lambda_buy_slow: float = 0.0
+        self._wji: float = 0.0
+        self._peak: float = 1.0
+        self._in_pass: bool = False
+
+        # Activation state
+        self._t_event: Optional[float] = None
+        self._last_timestamp: Optional[float] = None
+        self._active: bool = False
+        self._lambda_v_ref: float = 1.0
+        self._mu_buy: float = 1.0
+
+        # WJI slope lookback buffer: deque of (timestamp, WJI)
+        self._wji_buffer: Deque[Tuple[float, float]] = deque()
+
+        # Per-PASS-window records: list of dicts with keys
+        #   window_open_time, peak_at_open, peak_at_prior_close
+        self._pass_windows: List[Dict[str, float]] = []
+        self._last_pass_close_peak: float = 0.0  # peak at most-recent PASS→FAIL
+        self._first_window: bool = True           # True until first PASS window closes
+
+    def activate(self, t_event: float, lambda_v_ref: float, mu_buy: float) -> None:
+        """
+        Initialise the gate for a new event.
+
+        Parameters
+        ----------
+        t_event : float
+            Timestamp when T_event was established.
+        lambda_v_ref : float
+            Background dollar-volume rate (mean λ_V over [session_start, T_event)).
+            Used to normalise λ_V.  Must be > 0.
+        mu_buy : float
+            Cold-start buy arrival rate from Hawkes MLE fit (mu_buy).
+            Used to normalise λ_buy_slow.  Must be > 0.
+        """
+        if lambda_v_ref <= 0:
+            raise ValueError(f"lambda_v_ref must be positive, got {lambda_v_ref}")
+        if mu_buy <= 0:
+            raise ValueError(f"mu_buy must be positive, got {mu_buy}")
+
+        self._t_event = t_event
+        self._last_timestamp = t_event
+        self._lambda_v = 0.0
+        self._lambda_buy_slow = 0.0
+        self._wji = 0.0
+        self._peak = 1.0
+        self._in_pass = False
+        self._active = True
+        self._lambda_v_ref = lambda_v_ref
+        self._mu_buy = mu_buy
+        self._wji_buffer.clear()
+        self._pass_windows = []
+        self._last_pass_close_peak = 0.0
+        self._first_window = True
+
+    def update(self, dollar_vol: float, timestamp: float, side: int = 0) -> GateState:
+        """
+        Process one trade and return gate state.
+
+        Parameters
+        ----------
+        dollar_vol : float
+            Dollar volume of this trade (price × size).
+        timestamp : float
+            Trade timestamp (must be ≥ previous timestamp).
+        side : int
+            +1 = buy, −1 = sell, 0 = unknown.  Only buys increment λ_buy_slow.
+        """
+        if not self._active or self._t_event is None:
+            return GateState.INACTIVE
+
+        dt = max(0.0, timestamp - self._last_timestamp)
+
+        # ── λ_V EMA ──────────────────────────────────────────────────
+        self._lambda_v = (
+            self._lambda_v * math.exp(-self._decay_rate_v * dt)
+            + dollar_vol * self._decay_rate_v
+        )
+
+        # ── λ_buy_slow kernel ────────────────────────────────────────
+        self._lambda_buy_slow *= math.exp(-self.beta_slow * dt)
+        if side == 1:
+            self._lambda_buy_slow += self.beta_slow
+
+        self._last_timestamp = timestamp
+
+        # ── WJI (geometric mean of normalised components) ────────────
+        norm_v = self._lambda_v / max(self._lambda_v_ref, self._EPS)
+        norm_buy = self._lambda_buy_slow / max(self._mu_buy, self._EPS)
+        self._wji = (
+            max(norm_v, self._EPS) ** self.alpha
+            * max(norm_buy, self._EPS) ** (1.0 - self.alpha)
+        )
+
+        # ── WJI slope buffer ─────────────────────────────────────────
+        self._wji_buffer.append((timestamp, self._wji))
+        cutoff = timestamp - self.L_sec
+        while len(self._wji_buffer) > 1 and self._wji_buffer[1][0] <= cutoff:
+            self._wji_buffer.popleft()
+
+        # ── Warmup gate ───────────────────────────────────────────────
+        if timestamp - self._t_event < self.warmup_seconds:
+            return GateState.WARMUP
+
+        # ── Slope computation ────────────────────────────────────────
+        # slope_defined when buffer[0] predates the cutoff
+        slope_defined = (
+            len(self._wji_buffer) >= 1
+            and self._wji_buffer[0][0] <= cutoff
+        )
+
+        if not slope_defined:
+            # Pre-history period: accumulate peak but gate cannot open (FAIL only)
+            if self._wji > self._peak:
+                self._peak = self._wji
+            return GateState.FAIL
+
+        slope_wji = self._wji - self._wji_buffer[0][1]  # sign only used
+
+        # ── Peak update ───────────────────────────────────────────────
+        # Decay only occurs during FAIL when slope is negative.
+        if self._in_pass or slope_wji >= 0.0:
+            if self._wji > self._peak:
+                self._peak = self._wji
+        else:
+            # FAIL + slope < 0: continuous decay
+            if dt > 0:
+                self._peak *= math.exp(-self._decay_rate_peak * dt)
+
+        # ── Asymmetric hysteresis ─────────────────────────────────────
+        if self._in_pass:
+            if self._wji < self.p_close * self._peak:
+                # PASS → FAIL
+                self._last_pass_close_peak = self._peak
+                self._first_window = False
+                self._in_pass = False
+        else:
+            if self._wji >= self.p_open * self._peak:
+                # FAIL → PASS: record window entry
+                prior_close = 0.0 if self._first_window else self._last_pass_close_peak
+                self._pass_windows.append({
+                    "window_open_time": timestamp,
+                    "peak_at_open": self._peak,
+                    "peak_at_prior_close": prior_close,
+                })
+                self._in_pass = True
+
+        return GateState.PASS if self._in_pass else GateState.FAIL
+
+    def reset(self) -> None:
+        """Reset all state for a new session or event."""
+        self._lambda_v = 0.0
+        self._lambda_buy_slow = 0.0
+        self._wji = 0.0
+        self._peak = 1.0
+        self._in_pass = False
+        self._t_event = None
+        self._last_timestamp = None
+        self._active = False
+        self._lambda_v_ref = 1.0
+        self._mu_buy = 1.0
+        self._wji_buffer.clear()
+        self._pass_windows = []
+        self._last_pass_close_peak = 0.0
+        self._first_window = True
+
+    # ── Properties ────────────────────────────────────────────────────
+
+    @property
+    def wji(self) -> float:
+        """Most recently computed WJI value."""
+        return self._wji
+
+    @property
+    def peak(self) -> float:
+        """Current running peak of WJI."""
+        return self._peak
+
+    @property
+    def norm_lambda_v(self) -> float:
+        """Normalised dollar-volume component: λ_V / λ_V_ref."""
+        return self._lambda_v / max(self._lambda_v_ref, self._EPS)
+
+    @property
+    def norm_lambda_buy(self) -> float:
+        """Normalised buy-arrival component: λ_buy_slow / μ_buy."""
+        return self._lambda_buy_slow / max(self._mu_buy, self._EPS)
+
+    @property
+    def pass_windows(self) -> List[Dict[str, float]]:
+        """
+        Per-PASS-window records.  Each dict has keys:
+            window_open_time     — timestamp of FAIL→PASS transition
+            peak_at_open         — peak value at that moment
+            peak_at_prior_close  — peak at most-recent prior PASS→FAIL (0.0 if first)
+        """
+        return self._pass_windows
+
+    @property
+    def slope_wji(self) -> float:
+        """Most recently computed WJI slope: WJI(t) − WJI(t−L_sec). 0.0 if undefined."""
+        if not self._wji_buffer or self._last_timestamp is None:
+            return 0.0
+        cutoff = self._last_timestamp - self.L_sec
+        if self._wji_buffer[0][0] > cutoff:
+            return 0.0
+        return self._wji - self._wji_buffer[0][1]

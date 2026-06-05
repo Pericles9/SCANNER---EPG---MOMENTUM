@@ -30,9 +30,14 @@ scanner-epg-momentum/
 ├── core/
 │   ├── epg/
 │   │   ├── anchor.py           — EventAnchor (dollar volume crossing detector)
-│   │   └── gate.py             — ParticipationGate (λ_V decay, peak threshold)
+│   │   ├── gate.py             — ParticipationGate (λ_V decay, peak threshold)
+│   │   └── gate_variants.py    — AbsoluteThresholdGate, HawkesCumulativeGate,
+│   │                             HawkesBuySideGate, BurstRatioGate, SlopeGate F_ss/F_sl
 │   ├── exits/
-│   │   └── luld_proximity.py   — LuldProximityExit (Tier 2 band proximity, RTH only)
+│   │   ├── luld_proximity.py   — LuldProximityExit (Tier 2 band proximity, RTH only)
+│   │   └── reentry.py          — ReentrySignal (inverse-intensity re-entry timer, Phase B)
+│   ├── features/
+│   │   └── volume_acceleration.py — Volume acceleration feature
 │   ├── filters/
 │   │   └── setup_filter.py     — SetupFilter (range, volume, thinness, conviction)
 │   ├── hawkes/
@@ -55,13 +60,29 @@ scanner-epg-momentum/
 ├── logs/                       — Run logs (gitignored)
 ├── results/                    — Backtest outputs (gitignored)
 ├── tests/
-│   ├── test_epg.py             — EventAnchor + ParticipationGate tests (22 tests)
+│   ├── test_epg.py             — EventAnchor + ParticipationGate tests (32 tests)
 │   ├── test_hawkes_ll.py       — Hawkes log-likelihood + engine tests (19 tests)
-│   └── test_luld_proximity.py  — LuldProximityExit tests (9 tests)
+│   ├── test_luld_proximity.py  — LuldProximityExit tests (15 tests)
+│   ├── test_luld_lower_gate.py — LULD lower-band gate tests (9 tests)
+│   ├── test_gate_variants.py   — AbsoluteThreshold/Hawkes/BurstRatio/SlopeGate (26 tests)
+│   ├── test_slope_gate.py      — SlopeGate F_ss / F_sl unit tests (21 tests)
+│   ├── test_reentry.py         — ReentrySignal timer + state machine (18 tests)
+│   ├── test_runner_sf.py       — Setup filter gate integration (6 tests)
+│   └── test_cvd_accumulator.py — CVD accumulator fix verification (6 tests)
+│   Total: 152 tests
 ├── tools/
-│   └── exit_d_tuning/
-│       ├── replay.py           — Build per-event replay caches (Hawkes+EPG state)
-│       └── simulate.py         — Sweep EXIT_D params without re-running Hawkes
+│   ├── exit_d_tuning/
+│   │   ├── replay.py           — Build per-event Hawkes+EPG replay caches
+│   │   └── simulate.py         — Sweep EXIT_D params without re-running Hawkes
+│   ├── phase_d/                — Phase D watermark sweep + charts
+│   ├── phase_e/                — Phase E symmetric LULD sweep + charts
+│   ├── phase_f/                — Phase F aggregate + per-event charts
+│   ├── phase_g/                — Phase G scanner context analysis + charts
+│   ├── phase_g_v2/             — Phase G v2 momentum-weighted quartile analysis
+│   ├── t2_build_train_sample.py … t8_val_validate.py  — Phase EPG-GRT pipeline tasks
+│   ├── t3_stage1_sweep.py … t8_val_validate_opt2.py   — Phase EPG-OPT2 pipeline tasks
+│   ├── sweep_runner_opt2.py    — EPG-OPT2-SF setup filter sweep runner
+│   └── t1_top_decile_sf.py … t6_sf_charts.py         — EPG-OPT2-SF pipeline tasks
 ├── CLAUDE.md                   — Session directives
 └── MEMORY.md                   — Claude's working memory
 ```
@@ -161,6 +182,37 @@ def run_setup_filter(
 
 ---
 
+### `core/epg/gate_variants.py` — Gate variants B–F (Phase EPG-GRT / EPG-OPT2)
+
+All share the same interface as `ParticipationGate`: `.activate(t_event)`, `.update(dollar_vol, timestamp, side)`, `.reset()`.
+
+| Class | Variant | Description |
+|-------|---------|-------------|
+| `AbsoluteThresholdGate` | B | λ_V vs fixed pre-event mean; no peak ratchet |
+| `HawkesCumulativeGate` | C | Slow arrival-rate kernel (buy+sell) vs μ_background |
+| `HawkesBuySideGate` | D | Slow arrival-rate kernel (buy-only) vs μ_buy |
+| `BurstRatioGate` | E | Fast/slow EMA ratio; fires at volume inflection |
+| `SlopeGate` | F | Opens on λ_V acceleration. F_ss: slope open/slope close. F_sl: slope open/level close. |
+
+---
+
+### `core/exits/reentry.py` — ReentrySignal
+
+```python
+class ReentrySignal:
+    def __init__(self, theta: float, tau_recovery: float)
+    def update(self, t_sec: float, lambda_buy: float, lambda_sell: float,
+               gate_state: GateState) -> bool
+        # Returns True when re-entry fires (I_buy >= 1-theta for >= tau_recovery seconds
+        # AND gate_state == PASS)
+    def reset(self) -> None
+```
+
+**Inputs:** Hawkes intensities per tick, gate state
+**Outputs:** bool fire signal
+
+---
+
 ### `core/hawkes/forgetting.py` — fit_hawkes_forgetting, fit_online, HawkesParams
 
 ```python
@@ -241,10 +293,12 @@ backtest/runner.py
     ├── core/hawkes/engine.py        ← core/hawkes/ekf.py
     ├── core/hawkes/forgetting.py    ← core/hawkes/ekf.py
     ├── core/epg/anchor.py
-    ├── core/epg/gate.py
+    ├── core/epg/gate.py             (ParticipationGate — backtest)
+    ├── core/epg/gate_variants.py    (SlopeGate, etc — sweep tools / live)
+    ├── core/exits/luld_proximity.py
+    ├── core/exits/reentry.py
     ├── core/ofi/trade_ofi.py
     ├── core/filters/setup_filter.py
-    ├── core/exits/luld_proximity.py
     ├── data/loaders/trades.py       ← data/schemas/mom_db.py
     ├── data/loaders/quotes.py
     └── data/loaders/prev_close.py
@@ -270,6 +324,7 @@ backtest/runner.py
     "cold_start_size": 1000
   },
   "exit_d": {
+    "enabled": false,
     "theta": 0.65,
     "tau_min_sec": 4.0
   },
@@ -277,7 +332,9 @@ backtest/runner.py
     "ref_window_sec": 300.0,
     "proximity_pct_threshold": 2.0,
     "warmup_sec": 60.0,
-    "rth_only": true
+    "rth_only": true,
+    "upper_band_enabled": true,
+    "lower_band_enabled": false
   },
   "gap_gate": {
     "threshold": 0.30,

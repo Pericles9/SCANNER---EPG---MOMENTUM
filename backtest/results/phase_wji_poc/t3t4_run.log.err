@@ -1,0 +1,20 @@
+2026-06-05 10:18:28,778 | INFO | WJI config: {'config_id': 'wji_poc', 'variant': 'wji', 'alpha': 0.5, 'tau_v': 180.0, 'beta_slow': 0.01, 'L_sec': 60.0, 'tau_decay': 120.0, 'p_open': 0.65, 'p_close': 0.3}
+2026-06-05 10:18:28,779 | INFO | Baseline config: {'config_id': 'var_a_t300_po65_pc30', 'variant': 'a', 'tau': 300.0, 'p_open': 0.65, 'p_close': 0.3, 'm_cool_sec': 0.0, 'tau_cool_sec': 120.0}
+2026-06-05 10:18:28,787 | INFO | === T3: Training split (200 events) ===
+2026-06-05 10:50:44,942 | INFO | T3-TRAIN: 50% done — ok=100 skip=0 err=0 (1936.2s)
+2026-06-05 11:12:52,430 | INFO | T3-TRAIN: 100% done — ok=200 skip=0 err=0 (3263.6s)
+2026-06-05 11:12:52,450 | INFO | T3-TRAIN: total ok=200 skip=0 err=0 in 3263.7s
+2026-06-05 11:12:52,453 | INFO | T3 WJI:      PF=1.4705 n=2937 win=49.4% mean_pnl=0.95% component_balance=0.310 pct_decay=0.904
+2026-06-05 11:12:52,453 | INFO | T3 Baseline: PF=1.7630 n=538 win=44.2% mean_pnl=3.02%
+2026-06-05 11:12:52,454 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\train_wji.json
+2026-06-05 11:12:52,455 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\train_baseline.json
+2026-06-05 11:12:52,455 | INFO | T3 escalation checks PASSED (PF=1.4705 >= 1.20, balance=0.3098 >= 0.10)
+2026-06-05 11:12:52,464 | INFO | === T4: Val split (100 events) ===
+2026-06-05 11:35:56,467 | INFO | T4-VAL: 100% done — ok=100 skip=0 err=0 (1384.0s)
+2026-06-05 11:35:56,487 | INFO | T4-VAL: total ok=100 skip=0 err=0 in 1384.0s
+2026-06-05 11:35:56,488 | INFO | T4 WJI:      PF=1.1720 n=1546 win=47.4% mean_pnl=0.44% component_balance=0.276 pct_decay=0.899
+2026-06-05 11:35:56,488 | INFO | T4 Baseline: PF=1.1747 n=267 win=40.8% mean_pnl=0.87%
+2026-06-05 11:35:56,489 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\val_wji.json
+2026-06-05 11:35:56,490 | INFO | Written: D:\Trading Research\scanner-epg-momentum\backtest\results\phase_wji_poc\val_baseline.json
+2026-06-05 11:35:56,490 | INFO | T4 escalation checks PASSED (PF=1.1720 >= 1.00, n_trades=1546 >= 30)
+2026-06-05 11:35:56,491 | INFO | T3/T4 complete.

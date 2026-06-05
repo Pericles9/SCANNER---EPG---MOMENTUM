@@ -298,7 +298,7 @@ async def reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ibkr = state.ibkr
     risk_state = state.risk_state
     pool = state.pool
-    session_date: date = state.session_date or date.today()
+    session_date: date = state.session_clock.date
 
     from live.config import CFG
 

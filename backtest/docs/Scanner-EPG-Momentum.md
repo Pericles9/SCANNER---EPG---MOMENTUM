@@ -17,32 +17,17 @@ Simplified momentum strategy derived from the full Scanner × Hawkes × OFI Impa
 (`hawkes-ofi-impact`). Removes the OFI normalization, Gate 3 (burst magnitude), dynamic stop,
 and regime stack. Retains the core participation-gated entry and time-to-exhaustion exit logic.
 
-**Thesis:** Extended-hours momentum stocks (≥30% intraday gap, setup filter PASS) have
-predictable participation windows (EPG) where price continues in the direction of the gap.
-The Hawkes intensity imbalance (EXIT_D) provides an early exhaustion signal that captures
-more of the move than waiting for EPG close.
+**Thesis:** Extended-hours momentum stocks (≥30% intraday gap) have predictable participation
+windows (EPG) where price continues in the direction of the gap. The Hawkes intensity
+imbalance (EXIT_D) provides an early exhaustion signal. The setup filter is computed at each
+tick but does NOT gate first entry — Phase EPG-OPT2-SF showed the filter blocks the
+early-impulse entries that carry this strategy's alpha (mean delta_pf = −0.085 when added).
 
 ---
 
 ## Entry Stack
 
-### Step 1 — Setup Filter
-
-Four-signal composite filter run on 1-minute OHLCV bars from session open to event time.
-
-| Signal | Condition |
-|--------|-----------|
-| Range | Day's range (H-L)/VWAP ≥ floor |
-| Volume | Dollar volume ≥ floor |
-| Thinness | Spread/mid ≤ ceiling |
-| Conviction | Body fraction of range ≥ floor |
-
-Composite score Q̃(t) ∈ [0,1]. PASS if Q̃(t) > threshold.
-
-**Source:** `core/filters/setup_filter.py`
-**Calibration:** Phase F0 (not yet re-run in this project — using parent calibration)
-
-### Step 2 — EPG Rising Edge
+### Step 1 — EPG Rising Edge
 
 **EventAnchor:** Detects when cumulative dollar volume since session open crosses the
 k × λ_ref threshold. Fires exactly once per event, setting t_event.
@@ -62,10 +47,30 @@ State machine: INACTIVE → WARMUP → {PASS, FAIL} (cycles until event ends)
 Note: after exiting a trade mid-PASS window, `prev_state = PASS` → next tick is NOT a
 rising edge. Maximum one trade per PASS window by design.
 
-### Step 3 — Gap Gate (backtest only)
+### Step 2 — Gap Gate (backtest only)
 
 `intraday_pct ≥ 30%` at entry time. If gap < 30% at rising edge, queue the entry and
 re-check each subsequent PASS tick. Cancel if PASS window closes without reaching 30%.
+
+### Setup Filter — Re-entry gate and continuous disqualifier (not an initial entry gate)
+
+Four-signal composite run on 1-minute OHLCV bars.
+
+| Signal | Condition |
+|--------|-----------|
+| Range | Day's range (H-L)/VWAP ≥ floor |
+| Volume | Dollar volume ≥ floor |
+| Thinness | Spread/mid ≤ ceiling |
+| Conviction | Body fraction of range ≥ floor |
+
+Composite score Q̃(t) ∈ [0,1]. PASS if Q̃(t) > threshold.
+
+**Roles:**
+- **NOT an initial entry gate.** Computed at every tick but does not block first entry.
+- **Re-entry gate (backtest):** After EXIT_D fires, SF must be passing before re-entry.
+- **Continuous disqualifier (live only):** Q̃ < 0.65 for 15 consecutive bars → disqualify ticker.
+
+**Source:** `core/filters/setup_filter.py`
 
 ---
 
@@ -86,6 +91,9 @@ Fires when timer has been running continuously for ≥ tau_min seconds.
 - `theta = 0.65`, `tau_min = 4.0s` → PF=1.3848, n_exit_d=134 fires
 - Phase U default: `theta=0.75`, `tau_min=8.0s` → PF=1.0962
 
+**Current status: disabled** (`exit_d.enabled = false` in `config/strategy.json`). Code retained.
+In live, EXIT_D was disabled with the SlopeGate swap (2026-06-03); sole exit = SlopeGate PASS→FAIL.
+
 **Source:** inline in `backtest/runner.py`
 
 ### LULD Proximity Exit
@@ -96,7 +104,9 @@ RTH only (09:30–16:00 ET). Warmup 60s after RTH open.
 - `proximity_pct_threshold = 2.0%`
 - `ref_window_sec = 300.0s` — rolling 5-min reference price window
 
-Phase U: 16 fires, mean PnL = -5.97%, PF ≈ 0 → fire behavior needs investigation.
+Phase F finding: **upper band only** (lower band disabled). luld_upper PF=13.47 (val-sample),
+17.53 (val-full), 11.73 (test). luld_lower PF=0.059 at all N — destroys value by pre-empting
+EXIT_D on declining trades. Lower band is disabled in current config.
 
 **Source:** `core/exits/luld_proximity.py`
 
@@ -230,29 +240,133 @@ Key findings:
 
 **Config:** `config/phase_e.json` | **Results:** `results/phase_e/` | **Docs:** [[Phase_E_Results]]
 
+### Phase F — Asymmetric LULD (upper band only)
+
+- Same 100-event val seed=42 sample + full val (1,228 events) + test sample (100 events)
+- EXIT_D theta=0.65/tau=4s, watermark 2%, gap gate disabled, luld_lower disabled
+
+| Split | PF | n_trades | win% | luld_upper PF | luld_upper mean% |
+|-------|----|----------|------|---------------|-----------------|
+| val-sample | 2.2976 | 476 | 50.63% | 13.47 | +4.204% |
+| val-full | 1.9194 | 6,004 | 48.57% | **17.53** | +4.633% |
+| test-sample | **2.1849** | 611 | 48.12% | 11.73 | +4.152% |
+
+Phase D baseline exceeded on test. Below Phase D on val-full. epg_window_close is the drag
+(PF=1.018, 42% of trades on val-full). Pre-market val-full PF=1.497; test pre-market PF=2.133
+(possibly period-specific weakness 2023–mid-2024). luld_upper is stable across all splits.
+
+**Config:** `config/phase_f.json` | **Results:** `results/phase_f/` | **Docs:** [[Phase_F_Results]]
+
+### Phase G — Scanner Context Analysis (analysis only, no new backtest)
+
+Source: `results/phase_f/val_full/per_trade.parquet` (6,004 trades), 80 sampled dates.
+
+Key findings (Phase H candidates — not yet implemented):
+
+| Signal | Observation | Candidate gate |
+|--------|-------------|----------------|
+| Rank 1 underperforms | PF=1.18 vs ranks 3–9 PF=2.67–6.04 | Avoid rank 1 entries |
+| Heat gate | Cold Q1 PF=1.46 vs Hot Q4 PF=2.62 | Require scanner heat above session median |
+| Multi-day runner | PF=2.76 vs fresh PF=1.94 (+0.82) | Prefer tickers with momentum event in prior 5 days |
+| TOD midday | 11:30–13:00 ET near-breakeven | Exclude midday window |
+| Rank 3 + Hot Q4 | PF=6.46, n=124 | Combined rank × heat filter |
+
+**Results:** `results/phase_g/` | **Docs:** [[Phase_G_Results]]
+
+### Phase G v2 — Momentum-Weighted Scanner Quartile (analysis only)
+
+Replaces Phase G's population-level heat bins with within-snapshot momentum quartiles.
+Q1 = dominant movers (≥25% of snapshot momentum), Q4 = secondary names.
+
+| Quartile | n | PF | EV% |
+|----------|---|----|-----|
+| Q1 (dominant) | 697 | 1.252 | +0.296% |
+| Q2 | 448 | 1.911 | +0.814% |
+| Q3 | 476 | 2.517 | +1.280% |
+| Q4 (secondary) | 1,249 | **3.058** | +1.194% |
+
+Rank 1 and Q1 are structurally equivalent — the dominant mover is definitionally Q1. The rank
+1 underperformance finding from Phase G and the Q1 underperformance here are the same phenomenon.
+
+> **NOT ACTIONABLE.** The Q1→Q4 PF gradient is clearly visible in analysis but breaks down in
+> practice. No quartile-based entry gate is implemented or planned. Phase G v1/v2 findings are
+> analysis-only — do not implement any scanner context filter without a dedicated validation phase.
+
+**Results:** `results/phase_g_v2/` | **Docs:** [[Phase_G_v2_Results]]
+
+### Phase EPG-GRT — Gate Reaction Time Optimization
+
+Swept 117 ParticipationGate variants (asymmetric hysteresis p_open / p_close, τ=120/180/300s,
+cooling variants). 300-event training + 100-event val (seed=99).
+
+Key findings:
+- **Asymmetric hysteresis dominates**: p_close < p_open consistently outperforms symmetric gate
+- **Best val**: var_a_t300_po65_pc30 PF=2.584 (τ=300, p_open=0.65, p_close=0.30, no cooling)
+- **Live config selected by user**: var_a_t120_po65_pc65 (symmetric, τ=120) — faster reaction time
+  trades lower per-trade quality for earlier entry. Not Borda-ranked but captures first impulse.
+- **Year stability**: all top 10 configs profitable every year 2020–2023
+
+**Results:** `results/phase_epg_grt/` | **Config:** `config/phase_epg_grt/`
+
+### Phase EPG-OPT2 — EPG Optimization Stage 2
+
+Multi-stage sweep building on EPG-GRT. Tested p_close floor to 0.15, peak cooling variants,
+SlopeGate F_ss and F_sl.
+
+Key findings:
+- p_close=0.15 peaks PF=3.06 training but is regime-sensitive; not Borda-selected
+- Peak cooling consistently degrades (t120 configs develop 50k–95k pathological trade counts)
+- SlopeGate F_ss: all DQ'd on first run due to lookback buffer pruning bug (fixed); best val PF=1.49
+- SlopeGate F_sl best: s3_fsl_t180_l60_ko20_pc50, val PF=1.49 — below GRT baseline
+- **T8 escalation**: all Stage 1+2 val candidates below GRT baseline (PF=2.584). Hard stop.
+- GRT winner var_a_t300_po65_pc30 PF=2.584 remains best overall.
+
+**Results:** `results/phase_epg_opt2/`
+
+### Phase EPG-OPT2-SF — Setup Filter Integration Test
+
+Tested SF as an entry-stack gate on top-decile EPG-OPT2 configs (52 configs, seed=99 val).
+
+- **Result: net negative.** Mean delta_pf = −0.085. 47/52 configs hurt by the filter.
+- High-PF τ=300/low-pc configs lose the most (up to −0.32 PF); SF blocks 43–53% of entries.
+- **Why it fails:** SF is a sustained-liquidity quality screen. This strategy's edge is in the
+  first impulse *before* Q̃ confirms. SF and early-entry alpha are misaligned.
+- **Data does not support adding the setup filter to the entry stack.**
+
+**Results:** `results/phase_epg_opt2_sf/`
+
 ---
 
 ## Known Limitations
 
-1. **LULD fires are destructive.** 27 fires in Phase B with PF=0.044, mean=-3.4% — the
-   proximity exit may be exiting positions before a halt that doesn't materialize, or where
-   price recovers immediately after band proximity.
+1. **LULD lower band is destructive; upper band is highly valuable.** Phase E confirmed:
+   luld_lower PF=0.059 (pre-empts EXIT_D on declining trades). luld_upper PF=11–18 across
+   all splits — captures parabolic moves that exhaust at the LULD ceiling. Current config:
+   upper only.
 
-2. **Pre-market regression with EXIT_D (resolved in Phase B).** Phase A pre-market PF
-   dropped to 1.009 with EXIT_D+LULD; Phase B recovered to 1.395. EXIT_D cuts losing
-   pre-market trades before LULD can fire.
+2. **epg_window_close is near-breakeven on full val (PF=1.018).** Sample runs are optimistic
+   for this exit reason. 100-event samples consistently overstate performance vs val-full
+   by ~0.38 PF. Weight val-full numbers more heavily.
 
-3. **Gap gate removal is a look-ahead bias in Phase C.** The live scanner filters events
-   by gap size; removing the gap gate in backtest admits sub-30% gap entries the scanner
-   would not flag. Phase C PF uplift vs Phase B is partially attributable to this bias.
-   The CVD filter is a candidate replacement that does not rely on gap level.
+3. **Gap gate removal (Phase C+) introduces look-ahead bias.** Backtest admits sub-30% gap
+   entries the live scanner wouldn't flag. Intra-window watermark partially mitigates it but
+   does not fully correct the bias.
 
-4. **CVD accumulator bug invalidated Phase C CVD result.** Original CVD PF=2.0328 used a buggy
-   accumulator that mapped ambiguous trades (~9.5% of flow) to sells. Fixed PF=1.7544 (Phase C.5).
-   Watermark 5% (PF=1.9443) is now best single filter. Holdout validation (Phase D) required.
+4. **CVD accumulator bug (fixed).** Original Phase C CVD PF=2.0328 was invalid — ambiguous
+   trades (~9.5%) were mapped to sells. Fixed PF=1.7544 (Phase C.5). Watermark 5%
+   (PF=1.9443) is the current best single filter.
 
-5. **Setup filter using parent calibration.** Phase F0 has not been re-run for this project.
-   The filter params may not be optimally calibrated for the exact data split used here.
+5. **Setup filter excluded from initial entry gate.** Phase EPG-OPT2-SF confirmed this is
+   correct: adding SF as entry gate reduces mean PF by 0.085 (47/52 configs hurt). SF blocks
+   the early-impulse entries that carry this strategy's edge.
+
+6. **Rank 1 underperformance (Phase G/G v2).** The fastest-moving scanner name at entry
+   time produces PF=1.18 vs 2.67–6.04 for ranks 3–9. Q1 (dominant momentum share) and rank
+   1 are structurally equivalent. A rank gate is a Phase H candidate; not yet validated.
+
+7. **SlopeGate F_ss deployed live but not backtested.** Live EPG core replaced
+   ParticipationGate with SlopeGate F_ss (2026-06-03). The backtest runner still uses
+   ParticipationGate. No backtest validation of the swap exists.
 
 ---
 

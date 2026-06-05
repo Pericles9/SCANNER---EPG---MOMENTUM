@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import date
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from live.session_clock import SessionClock
 
 from live.config import CFG
 from live.feed.context import TickerContext
@@ -31,7 +33,7 @@ async def signal_loop(
     hot_signal_events: list,
     hot_hawkes_refits: list,
     heartbeat: "HeartbeatMonitor",
-    session_date: date,
+    session_clock: "SessionClock",
     disqualify_callback=None,
 ) -> None:
     """Per-ticker asyncio task. Blocks until context fetch completes."""
@@ -44,7 +46,7 @@ async def signal_loop(
             raise
 
         ticker = ctx.ticker
-        session_date_val = session_date
+        session_date_val = session_clock.date
 
         bkt = _infer_session_bucket(raw_msg.get("t", 0))
 

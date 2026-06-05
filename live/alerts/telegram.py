@@ -63,11 +63,8 @@ class TelegramBot:
     def register_bot_state(self, state) -> None:
         self._bot_state = state
 
-    async def start_polling(self) -> None:
-        """Start Telegram bot for /kill command handling."""
-        if not self._kill_callback:
-            return
-
+    async def _start_polling_once(self) -> None:
+        """Build the Application, register handlers, and start polling (one attempt)."""
         # Reuse self._bot (pool_size=8, explicit timeouts) instead of letting
         # Application.builder().token() create a second Bot with pool_size=1.
         # With a separate Bot, the single connection is shared between the long-poll
@@ -92,6 +89,33 @@ class TelegramBot:
         await self._app.start()
         await self._app.updater.start_polling()
         log.info("Telegram bot started, listening for /kill")
+
+    async def start_polling(self) -> None:
+        """Start Telegram bot polling with automatic restart on transient failures."""
+        if not self._kill_callback:
+            return
+
+        _MAX_RETRY_DELAY_S = 60.0
+        delay = 5.0
+
+        while True:
+            try:
+                await self._start_polling_once()
+                return  # clean stop
+            except asyncio.CancelledError:
+                raise  # propagate — this is shutdown
+            except Exception:
+                log.exception("Telegram polling failed — restarting in %.0fs", delay)
+                if self._app is not None:
+                    try:
+                        await self._app.updater.stop()
+                        await self._app.stop()
+                        await self._app.shutdown()
+                    except Exception:
+                        pass
+                    self._app = None
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _MAX_RETRY_DELAY_S)
 
     async def stop_polling(self) -> None:
         if self._app:

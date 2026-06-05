@@ -176,6 +176,11 @@ Findings where Q1 vs Q4 difference exceeds 0.5 PF or 0.5% EV. Candidates for Pha
 
 ## Key Findings
 
+> **NOT ACTIONABLE.** Phase G v2 is analysis-only. The Q1→Q4 PF gradient is clearly visible in
+> backtest data but breaks down in practice. No quartile-based entry gate is implemented or planned.
+> Do not add a quartile gate to the live system or backtest runner without a dedicated validation
+> phase with explicit approval.
+
 **GV2-1: Monotone PF gradient Q1 → Q4 (+1.806 PF spread)**
 Within any given scanner snapshot, trading the dominant momentum name (Q1) produces materially lower PF (1.25) than trading secondary names (Q4: PF=3.06). The gradient is monotone across all four quartiles. This is the primary Phase G v2 finding.
 

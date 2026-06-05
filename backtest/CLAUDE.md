@@ -4,8 +4,8 @@
 
 Standalone backtest project for the simplified **Scanner × EPG × LULD** momentum strategy.
 Derived from `hawkes-ofi-impact` (Phase S/T/U). Removes the full OFI/price-impact/regime stack.
-Entry: Setup Filter PASS + EPG rising edge + gap ≥ 30%.
-Exit: EXIT_D (Hawkes intensity imbalance timer) > LULD proximity > EPG window close.
+Entry: EPG rising edge + gap ≥ 30% (backtest). SF computed but not a first-entry gate.
+Exit: EPG window close (primary). EXIT_D currently disabled. LULD upper band active.
 
 **Source project:** `D:\Trading Research\hawkes-ofi-impact`
 
@@ -24,7 +24,7 @@ Inherited from the parent project — apply here without exception:
 - **EPG lambda_ref source is mu_buy + mu_sell only.** Not equilibrium rate, not empirical.
   See parent project CLAUDE.md for full rationale.
 - **Do not touch the test split.** `config/holdout_boundary.json` is locked.
-- **Test before running backtests.** `pytest tests/ -v` must pass 49/49 before any run.
+- **Test before running backtests.** `pytest tests/ -v` must pass all tests before any run. Current count: 152 (grown from initial 49 as phases added new modules and tests).
 
 ---
 
@@ -32,12 +32,24 @@ Inherited from the parent project — apply here without exception:
 
 | Phase | Status | Notes |
 |-------|--------|-------|
-| Bootstrap | **Complete** | All imports verified, 49/49 tests pass, smoke test OK |
-| Phase S baseline | Derived | PF=1.2709, 345 trades, 81 events (100-event val seed=42). See parent. |
+| Bootstrap | **Complete** | All imports verified, 152 tests pass, smoke test OK |
+| Phase S baseline | Derived | PF=1.2709, 345 trades, 81 events (val-sample seed=42). See parent. |
 | Phase T EXIT_D tuning | Derived | Best: theta=0.65 tau=4s (T10 sweep). See parent. |
-| Phase U EXIT_D+LULD integration | Derived | PF=1.0962 (default theta=0.75). Pre-market regression. See parent. |
+| Phase U EXIT_D+LULD | Derived | PF=1.0962 (theta=0.75). Pre-market regression. See parent. |
+| Phase B — Re-entry | **Complete** | PF=1.3825, 1,689 trades, EXIT_D T10 best + re-entry enabled. Pre-market recovered. |
+| Phase C — Backside filters | **Complete** | Gap gate disabled. Watermark 5%: PF=1.9443. CVD fixed: PF=1.7544. |
+| Phase C.5 — CVD bug fix | **Complete** | Buggy accumulator (ambiguous→sell) found and fixed. Original CVD PF=2.0328 invalid. |
+| Phase D — Watermark | **Complete** | Intra-window rolling high watermark. Best 2%: PF=2.6529, n=483. Phase D baseline. |
+| Phase E — Symmetric LULD | **Complete** | Spread-multiple LULD both bands. Best N=1: PF=1.9271. Escalation triggered (<2.20). |
+| Phase F — Asymmetric LULD | **Complete** | Upper band only. Val-full PF=1.9194, test PF=2.1849. Below Phase D baseline. |
+| Phase G — Scanner context | **Complete** | Analysis only. Rank 1 underperforms (PF=1.18). Heat/multi-day runner signals found. |
+| Phase G v2 — Momentum quartile | **Complete** | Analysis only. Q4 (secondary movers) PF=3.06 vs Q1 (dominant) PF=1.25. **Quartile gate NOT actionable — breaks down in practice. Do not implement.** |
+| Phase EPG-GRT | **Complete** | Gate reaction time sweep. Asymmetric hysteresis wins. Best val: var_a_t300_po65_pc30 PF=2.584. |
+| Phase EPG-OPT2 | **Complete** | Stage 1-3 sweep. All below GRT baseline. T8 escalation. SlopeGate F_sl inconclusive. |
+| Phase EPG-OPT2-SF | **Complete** | SF integration test. Net negative: mean delta_pf = −0.085. 47/52 configs hurt. |
+| Live SlopeGate swap | **Deployed (heuristic)** | Live EPG core: ParticipationGate → SlopeGate F_ss (s3_fss_t180_l30_ko5_kc0). EXIT_D+LULD disabled live. |
 
-**What's next:** Re-run Phase U equivalent with theta=0.65/tau=4s across full val split.
+**What's next:** Phase H requires explicit approval before any implementation. **Phase G v1/v2 findings (rank gate, heat gate, quartile gate, multi-day runner) are analysis-only and NOT actionable** — the quartile boundary in particular looks good theoretically but breaks down in practice. Do not implement any of these from Phase G without a dedicated validation phase. SlopeGate F_ss is active live but has no backtest validation — the backtest still uses ParticipationGate.
 
 ---
 
@@ -65,7 +77,7 @@ Setup filter (4-signal composite: range, volume, thinness, body conviction) role
 2. **LULD proximity** — Price within 2% of Tier 2 LULD band. RTH only (09:30–16:00 ET).
 3. **EPG window close** — EPG transitions PASS → FAIL/INACTIVE.
 
-**Config:** `config/strategy.json` (theta=0.65, tau_min=4s from T10 best combo)
+**Config:** `config/strategy.json` — EXIT_D currently **disabled** (`enabled: false`); code retained. LULD upper band active, lower band disabled (Phase F config).
 
 ---
 
@@ -111,17 +123,22 @@ Discovered facts, bugs, open questions. Read at session start.
 
 ---
 
-## Known Issues (from parent project)
+## Known Issues
 
-1. **Pre-market regression:** Phase U PF dropped 1.73→0.90 for pre-market events with
-   EXIT_D+LULD active. Cause unknown. Possible: EXIT_D fires prematurely in thin pre-market
-   order flow, or LULD firing pattern differs.
-2. **Gap gate queue behavior:** 40 queued entries in Phase U 100-event run; quality unknown.
-   These are entries where gap < 30% at EPG fire but later reaches 30%.
-3. **EPG one-trade-per-window:** After exit mid-PASS, `prev_state=PASS` means next tick is
-   not a rising edge. Maximum one trade per PASS window by design.
-4. **T10 best combo not yet validated on full val:** theta=0.65 tau=4s tested on 100-event
-   sample only. Full val run pending.
+1. **EPG one-trade-per-window:** After exit mid-PASS, `prev_state=PASS` means the next tick
+   is not a rising edge. Maximum one trade per PASS window by design.
+2. **Pre-market PF below RTH (Phase F val-full):** Pre-market PF=1.497 vs RTH PF=2.279 on the
+   full val split. May be period-specific (2023–mid-2024); Phase F test pre-market recovered
+   to 2.133.
+3. **epg_window_close is near-breakeven on full val:** PF=1.018 (41.99% of trades). Sample
+   runs are optimistic for this exit reason. Improving it is a Phase H candidate.
+4. **Rank 1 underperformance:** Scanner rank 1 trades PF=1.18 vs ranks 3–9 PF=2.67–6.04
+   (Phase G). Observed in analysis; NOT actionable. Phase G v1/v2 findings including rank gate and quartile gate are analysis-only — do not implement without a dedicated validation phase.
+5. **Gap gate disabled (Phase C+):** Gap gate removal introduces look-ahead bias vs live
+   scanner (which filters by ≥30% gap). Phase C PF uplift vs Phase B is partially from this.
+   The intra-window watermark partially mitigates it.
+6. **SlopeGate F_ss (live only): no backtest validation.** Deployed in live on 2026-06-03.
+   The backtest runner still uses ParticipationGate.
 
 ---
 
