@@ -280,13 +280,15 @@ async def main() -> None:
     elif not recovery.had_open_positions:
         log.info("Crash recovery: no open positions found — clean start")
 
-    # Seed account equity (theoretical equity starts equal to account equity).
+    # Seed account equity and buying power.
     risk_state.account_equity = await ibkr.get_account_equity()
+    risk_state.account_buying_power = await ibkr.get_buying_power()
     if risk_state.account_equity > 0:
         risk_state.theoretical_equity = risk_state.account_equity
-        log.info("Account equity at startup: $%.2f", risk_state.account_equity)
+        log.info("Account equity: $%.2f  Buying power: $%.2f",
+                 risk_state.account_equity, risk_state.account_buying_power)
     else:
-        log.warning("Account equity unavailable at startup — Kelly sizing will use flat fallback")
+        log.warning("Account equity unavailable at startup — buying_power mode will use equity * leverage fallback")
 
     # Shared state
     universe_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -342,18 +344,21 @@ async def main() -> None:
     # Order worker (Process 3)
     from live.orders.worker import hourly_pnl_alert, order_worker, pending_close_monitor
 
-    # Account equity refresher — updates every 5 minutes for Kelly sizing
+    # Account equity + buying power refresher — updates every 5 minutes
     async def equity_refresher() -> None:
         import asyncio as _asyncio
         while True:
             await _asyncio.sleep(300)
             try:
                 equity = await ibkr.get_account_equity()
+                buying_power = await ibkr.get_buying_power()
                 if equity > 0:
                     risk_state.account_equity = equity
-                    log.debug("Account equity refreshed: $%.2f", equity)
+                if buying_power > 0:
+                    risk_state.account_buying_power = buying_power
+                log.debug("Equity refreshed: $%.2f  Buying power: $%.2f", equity, buying_power)
             except Exception:
-                log.exception("Failed to refresh account equity from IBKR")
+                log.exception("Failed to refresh account equity/buying power from IBKR")
 
     # ── Critical tasks — failure halts the system ──
     critical_tasks = [

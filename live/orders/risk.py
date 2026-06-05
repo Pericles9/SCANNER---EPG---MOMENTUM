@@ -40,7 +40,8 @@ class RiskState:
     manual_review_required: set = field(default_factory=set)   # tickers crash recovery could not auto-flatten
     max_daily_loss: float = field(default_factory=lambda: CFG.risk.max_daily_loss)
     max_concurrent: int = field(default_factory=lambda: CFG.risk.max_concurrent_positions)
-    account_equity: float = 0.0       # refreshed from IBKR every 5 minutes
+    account_equity: float = 0.0        # refreshed from IBKR every 5 minutes
+    account_buying_power: float = 0.0  # refreshed from IBKR every 5 minutes
     theoretical_equity: float = 0.0   # compounding strategy equity curve
     _loss_limit_hit: bool = field(default=False, init=False, repr=False)
     _auto_kill_fired: bool = field(default=False, init=False, repr=False)
@@ -138,7 +139,11 @@ class RiskState:
 
     def compute_position_size(self, price: float, session_bucket: str) -> int:
         """Return share qty for the given price and session bucket."""
-        if CFG.position_sizing.mode == "kelly":
+        if CFG.position_sizing.mode == "buying_power":
+            buying_power = self.account_buying_power if self.account_buying_power > 0 \
+                           else self.account_equity * CFG.position_sizing.leverage
+            notional = buying_power / max(self.max_concurrent, 1)
+        elif CFG.position_sizing.mode == "kelly":
             notional = self.compute_kelly_notional()
         elif session_bucket == "pre_market":
             notional = CFG.position_sizing.pre_market_notional

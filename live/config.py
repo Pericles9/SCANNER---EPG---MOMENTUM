@@ -90,6 +90,7 @@ class OrderExecutionConfig:
 @dataclass
 class PositionSizingConfig:
     mode: str
+    leverage: float
     rth_notional: float
     pre_market_notional: float
     kelly_fraction: float
@@ -264,6 +265,7 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
         ),
         position_sizing=PositionSizingConfig(
             mode=raw["position_sizing"]["mode"],
+            leverage=raw["position_sizing"]["leverage"],
             rth_notional=raw["position_sizing"]["rth_notional"],
             pre_market_notional=raw["position_sizing"]["pre_market_notional"],
             kelly_fraction=raw["position_sizing"]["kelly_fraction"],

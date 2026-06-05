@@ -83,6 +83,20 @@ class IBKRClient:
         log.warning("IBKR: NetLiquidation not found in account values")
         return 0.0
 
+    async def get_buying_power(self) -> float:
+        """Return current buying power from IBKR account values."""
+        vals = self._ib.accountValues()
+        for v in vals:
+            if v.tag == "BuyingPower" and v.currency == "USD":
+                try:
+                    return float(v.value)
+                except (ValueError, TypeError):
+                    pass
+        log.warning("IBKR: BuyingPower not found — falling back to NetLiquidation * leverage")
+        equity = await self.get_account_equity()
+        from live.config import CFG
+        return equity * CFG.position_sizing.leverage
+
     async def submit(self, request: OrderRequest) -> Optional[Fill]:
         """Submit order and wait for fill. Returns Fill or None on full timeout with no fill."""
         contract = Stock(request.ticker, "SMART", "USD")
