@@ -156,6 +156,122 @@ def _classify_sides(prices: np.ndarray) -> np.ndarray:
     return sides
 
 
+def _run_context_computations(
+    ticker: str,
+    t_sec: np.ndarray,
+    sides: np.ndarray,
+    prices: np.ndarray,
+    sizes: np.ndarray,
+    ts_ns: np.ndarray,
+    session_start_ns: int,
+    session_end_ns: int,
+    lambda_ref_global: float,
+    init_params: dict,
+) -> tuple:
+    """CPU-bound Hawkes replay, gate warmup, and setup filter. Called via run_in_executor."""
+    N = len(t_sec)
+    lam_buy_out = np.zeros(N, dtype=np.float64)
+    lam_sell_out = np.zeros(N, dtype=np.float64)
+    E_out = np.zeros(N, dtype=np.float64)
+    Edot_out = np.zeros(N, dtype=np.float64)
+    n_base_out = np.zeros(N, dtype=np.float64)
+
+    # NOTE: Lee-Ready for historical ticks uses tick direction only (price change sign)
+    # because the Polygon trades REST endpoint does not return bid/ask. True Lee-Ready
+    # (last-quote comparison) is only possible for live WebSocket ticks.
+    fitted_params = _hawkes_replay_with_refit(
+        t_sec, sides.astype(np.int32), CFG.hawkes.rho, lambda_ref_global, init_params,
+        CFG.hawkes.rho_e, lam_buy_out, lam_sell_out, E_out, Edot_out, n_base_out,
+    )
+
+    if fitted_params is not None:
+        lambda_ref_fitted = fitted_params.mu_buy + fitted_params.mu_sell
+        mu_buy_fitted = fitted_params.mu_buy
+        mu_sell_fitted = fitted_params.mu_sell
+        params_for_engine = fitted_params
+    else:
+        lambda_ref_fitted = None
+        mu_buy_fitted = None
+        mu_sell_fitted = None
+
+        class _ConfigParams:
+            alpha_buy_self = CFG.hawkes.alpha_buy_self
+            alpha_sell_self = CFG.hawkes.alpha_sell_self
+            mu_buy = CFG.hawkes.mu_buy
+            mu_sell = CFG.hawkes.mu_sell
+            beta = CFG.hawkes.beta
+
+        params_for_engine = _ConfigParams()
+
+    lambda_ref_for_engine = lambda_ref_fitted or lambda_ref_global
+    engine = HawkesEngine(
+        beta_mle=params_for_engine.beta,
+        alpha_self_buy=params_for_engine.alpha_buy_self,
+        alpha_cross_buy=0.0,
+        mu_buy=params_for_engine.mu_buy,
+        mu_sell=params_for_engine.mu_sell,
+        lambda_ref=lambda_ref_for_engine,
+        alpha_self_sell=params_for_engine.alpha_sell_self,
+        alpha_cross_sell=0.0,
+    )
+
+    tail_cutoff = t_sec[-1] - CFG.context_fetch.tail_replay_sec
+    tail_mask = t_sec >= tail_cutoff
+    tail_t = t_sec[tail_mask]
+    tail_sides = sides[tail_mask]
+    for i in range(len(tail_t)):
+        engine.update(float(tail_t[i]), int(tail_sides[i]))
+
+    # Replay EventAnchor + SlopeGate (F_ss) through all historical ticks.
+    # SlopeGate normalises its dollar-volume slope by lambda_v_ref. Per the live
+    # architecture, we use the cold-start reference (mu_buy+mu_sell, fitted or
+    # global) — the same quantity fed to EventAnchor/HawkesEngine — rather than the
+    # offline parquet-catalog compute_lambda_ref_per_event, which is not available
+    # for a live gapper. Heuristic/unvalidated; see strategy.json epg_gate._comment.
+    anchor = EventAnchor(
+        lambda_ref=lambda_ref_for_engine,
+        k_multiplier=CFG.epg.t_event_threshold,
+    )
+    gate = _build_gate(lambda_ref_for_engine)
+
+    prev_gate_state = GateState.INACTIVE
+    gate_activated = False
+    for i in range(N):
+        # Invariant: historical and live must feed the same quantity to EventAnchor.
+        # Here: Hawkes left-limit total intensity. Live mirror: live_state.py uses
+        # hawkes_state.lambda_total (= lambda_buy + lambda_sell). Backtest: runner.py:440.
+        lambda_total_i = lam_buy_out[i] + lam_sell_out[i]
+        t_ev = anchor.update(lambda_total_i, float(t_sec[i]))
+        if t_ev is not None and not gate_activated:
+            gate.activate(t_ev)
+            gate_activated = True
+        if gate_activated:
+            dollar_vol = float(prices[i]) * float(sizes[i])
+            # SlopeGate's 30s lookback buffer and prev_state are populated here so the
+            # gate is not blind for the first L_sec of live ticks. The instance (not its
+            # params) is passed into LiveSignalState to survive the historical->live boundary.
+            prev_gate_state = gate.update(dollar_vol, float(t_sec[i]))
+
+    sf_result: Optional[SetupFilterResult] = None
+    try:
+        sf_result = run_setup_filter(
+            timestamps=ts_ns,
+            prices=prices,
+            sizes=sizes,
+            session_start_ns=session_start_ns,
+            session_end_ns=session_end_ns,
+        )
+    except Exception:
+        log.exception("%s: setup filter failed on historical data", ticker)
+
+    n_base_last = float(n_base_out[-1]) if N > 0 else 0.0
+    return (
+        engine, anchor, gate, gate_activated, prev_gate_state,
+        fitted_params, lambda_ref_fitted, mu_buy_fitted, mu_sell_fitted,
+        lambda_ref_for_engine, n_base_last, sf_result,
+    )
+
+
 async def fetch_context(
     ticker: str,
     session_clock: "SessionClock",
@@ -222,101 +338,14 @@ async def fetch_context(
         "beta": CFG.hawkes.beta,
     }
 
-    lam_buy_out = np.zeros(N, dtype=np.float64)
-    lam_sell_out = np.zeros(N, dtype=np.float64)
-    E_out = np.zeros(N, dtype=np.float64)
-    Edot_out = np.zeros(N, dtype=np.float64)
-    n_base_out = np.zeros(N, dtype=np.float64)
-
-    # NOTE: Lee-Ready for historical ticks uses tick direction only (price change sign)
-    # because the Polygon trades REST endpoint does not return bid/ask. True Lee-Ready
-    # (last-quote comparison) is only possible for live WebSocket ticks.
-    fitted_params = _hawkes_replay_with_refit(
-        t_sec, sides.astype(np.int32), CFG.hawkes.rho, lambda_ref_global, init_params,
-        CFG.hawkes.rho_e, lam_buy_out, lam_sell_out, E_out, Edot_out, n_base_out,
+    loop = asyncio.get_running_loop()
+    (engine, anchor, gate, gate_activated, prev_gate_state,
+     fitted_params, lambda_ref_fitted, mu_buy_fitted, mu_sell_fitted,
+     lambda_ref_for_engine, n_base_last, sf_result) = await loop.run_in_executor(
+        None, _run_context_computations,
+        ticker, t_sec, sides, prices, sizes, ts_ns,
+        session_start_ns, session_end_ns, lambda_ref_global, init_params,
     )
-
-    if fitted_params is not None:
-        lambda_ref_fitted = fitted_params.mu_buy + fitted_params.mu_sell
-        mu_buy_fitted = fitted_params.mu_buy
-        mu_sell_fitted = fitted_params.mu_sell
-        params_for_engine = fitted_params
-    else:
-        lambda_ref_fitted = None
-        mu_buy_fitted = None
-        mu_sell_fitted = None
-        # Build a minimal HawkesParams-like from config for engine init
-        class _ConfigParams:
-            alpha_buy_self = CFG.hawkes.alpha_buy_self
-            alpha_sell_self = CFG.hawkes.alpha_sell_self
-            mu_buy = CFG.hawkes.mu_buy
-            mu_sell = CFG.hawkes.mu_sell
-            beta = CFG.hawkes.beta
-        params_for_engine = _ConfigParams()
-
-    # Init HawkesEngine with fitted (or config) params
-    lambda_ref_for_engine = lambda_ref_fitted or lambda_ref_global
-    engine = HawkesEngine(
-        beta_mle=params_for_engine.beta,
-        alpha_self_buy=params_for_engine.alpha_buy_self,
-        alpha_cross_buy=0.0,
-        mu_buy=params_for_engine.mu_buy,
-        mu_sell=params_for_engine.mu_sell,
-        lambda_ref=lambda_ref_for_engine,
-        alpha_self_sell=params_for_engine.alpha_sell_self,
-        alpha_cross_sell=0.0,
-    )
-
-    # Tail-replay last N seconds through engine to warm R state
-    tail_cutoff = t_sec[-1] - CFG.context_fetch.tail_replay_sec
-    tail_mask = t_sec >= tail_cutoff
-    tail_t = t_sec[tail_mask]
-    tail_sides = sides[tail_mask]
-    for i in range(len(tail_t)):
-        engine.update(float(tail_t[i]), int(tail_sides[i]))
-
-    # Replay EventAnchor + SlopeGate (F_ss) through all historical ticks.
-    # SlopeGate normalises its dollar-volume slope by lambda_v_ref. Per the live
-    # architecture, we use the cold-start reference (mu_buy+mu_sell, fitted or
-    # global) — the same quantity fed to EventAnchor/HawkesEngine — rather than the
-    # offline parquet-catalog compute_lambda_ref_per_event, which is not available
-    # for a live gapper. Heuristic/unvalidated; see strategy.json epg_gate._comment.
-    anchor = EventAnchor(
-        lambda_ref=lambda_ref_for_engine,
-        k_multiplier=CFG.epg.t_event_threshold,
-    )
-    gate = _build_gate(lambda_ref_for_engine)
-
-    prev_gate_state = GateState.INACTIVE
-    gate_activated = False
-    for i in range(N):
-        # Invariant: historical and live must feed the same quantity to EventAnchor.
-        # Here: Hawkes left-limit total intensity. Live mirror: live_state.py uses
-        # hawkes_state.lambda_total (= lambda_buy + lambda_sell). Backtest: runner.py:440.
-        lambda_total_i = lam_buy_out[i] + lam_sell_out[i]
-        t_ev = anchor.update(lambda_total_i, float(t_sec[i]))
-        if t_ev is not None and not gate_activated:
-            gate.activate(t_ev)
-            gate_activated = True
-        if gate_activated:
-            dollar_vol = float(prices[i]) * float(sizes[i])
-            # SlopeGate's 30s lookback buffer and prev_state are populated here so the
-            # gate is not blind for the first L_sec of live ticks. The instance (not its
-            # params) is passed into LiveSignalState to survive the historical->live boundary.
-            prev_gate_state = gate.update(dollar_vol, float(t_sec[i]))
-
-    # Run setup filter on full historical tick buffer
-    sf_result: Optional[SetupFilterResult] = None
-    try:
-        sf_result = run_setup_filter(
-            timestamps=ts_ns,
-            prices=prices,
-            sizes=sizes,
-            session_start_ns=session_start_ns,
-            session_end_ns=session_end_ns,
-        )
-    except Exception:
-        log.exception("%s: setup filter failed on historical data", ticker)
 
     fetch_ms = int((time.monotonic() - t0) * 1000)
     log.info("%s: context fetch complete in %dms, N=%d, degraded=%s",
@@ -327,7 +356,7 @@ async def fetch_context(
 
     alpha_buy_fitted = fitted_params.alpha_buy_self if fitted_params is not None else None
     alpha_sell_fitted = fitted_params.alpha_sell_self if fitted_params is not None else None
-    n_base_at_cold_start = float(n_base_out[-1]) if N > 0 else None
+    n_base_at_cold_start = n_base_last
     setup_filter_passes = sf_result.passes if sf_result is not None else None
     _raw_score = getattr(sf_result, "q_tilde", None) if sf_result is not None else None
     try:

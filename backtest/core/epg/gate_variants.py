@@ -1,8 +1,7 @@
 """
-Gate variants for Phase EPG-GRT, EPG-OPT2, and WJI-POC.
+Gate variants for Phase EPG-GRT, EPG-OPT2, WJI-POC, and WJI-OPT.
 
-All implement the same interface: .activate(t_event), .update(dollar_vol, timestamp, side),
-.reset().  The side argument is +1=buy, -1=sell, 0=unknown.
+All implement the same interface: .activate(t_event), .update(...), .reset().
 
 Variants:
   AbsoluteThresholdGate   (B) — λ_V vs fixed pre-event mean reference; no peak ratchet
@@ -15,6 +14,9 @@ Variants:
   WJIGate                 (WJI) — joint buy-side arrival × dollar-volume signal;
                                    geometric mean of normalised components; slope-driven
                                    adaptive peak with continuous decay on deceleration
+  RunningMaxGate          (RMG) — signal-agnostic running-max threshold gate;
+                                   accepts pre-normalised signal; no decay; hysteresis
+                                   toggle: 'single' (symmetric) or 'asym' (asymmetric)
 """
 from __future__ import annotations
 
@@ -920,3 +922,121 @@ class WJIGate:
         if self._wji_buffer[0][0] > cutoff:
             return 0.0
         return self._wji - self._wji_buffer[0][1]
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  RunningMaxGate — signal-agnostic running-max threshold (WJI-OPT)
+# ══════════════════════════════════════════════════════════════════════
+
+class RunningMaxGate:
+    """
+    Running-max threshold gate (Phase WJI-OPT).
+
+    Signal-agnostic: caller computes the normalised signal (WJI or norm_λ_V) and
+    passes a single float to update().  The gate applies a causal running-max
+    peak with no decay and no slope term.
+
+    Peak initialises at 1.0 (background level for normalised signals) and is
+    monotonically non-decreasing — it never falls.
+
+    Hysteresis modes
+    ----------------
+    'single':  FAIL→PASS at signal ≥ p × peak
+               PASS→FAIL at signal < p × peak       (symmetric)
+    'asym':    FAIL→PASS at signal ≥ p × peak
+               PASS→FAIL at signal < p_close × peak  (p_close=0.30 default)
+
+    The peak is updated before the threshold check on every tick (including
+    during warmup), so the threshold ratchets up as the signal makes new highs.
+    """
+
+    def __init__(
+        self,
+        p: float,
+        hysteresis: str = "asym",
+        p_close: float = 0.30,
+        warmup_seconds: float = WARMUP_DURATION_SEC,
+    ):
+        """
+        Parameters
+        ----------
+        p : float
+            FAIL→PASS opening threshold as fraction of peak.  In 'single' mode,
+            also used as the PASS→FAIL close threshold.  Must be in (0, 1].
+        hysteresis : str
+            'single' or 'asym'.
+        p_close : float
+            PASS→FAIL close threshold in 'asym' mode.
+            Must satisfy 0 < p_close ≤ p.  Ignored in 'single' mode.
+        warmup_seconds : float
+            Duration of WARMUP period after t_event.
+        """
+        if hysteresis not in ("single", "asym"):
+            raise ValueError(f"hysteresis must be 'single' or 'asym', got {hysteresis!r}")
+        if not (0.0 < p <= 1.0):
+            raise ValueError(f"p must be in (0, 1], got {p}")
+        if hysteresis == "asym" and not (0.0 < p_close <= p):
+            raise ValueError(
+                f"p_close must satisfy 0 < p_close <= p={p}, got p_close={p_close}"
+            )
+
+        self.p = p
+        self.hysteresis = hysteresis
+        self.p_close = p_close if hysteresis == "asym" else p
+        self.warmup_seconds = warmup_seconds
+
+        self._peak: float = 1.0
+        self._in_pass: bool = False
+        self._t_event: Optional[float] = None
+        self._active: bool = False
+
+    def activate(self, t_event: float) -> None:
+        """Initialise the gate for a new event."""
+        self._t_event = t_event
+        self._peak = 1.0
+        self._in_pass = False
+        self._active = True
+
+    def update(self, signal: float, timestamp: float) -> GateState:
+        """
+        Process one pre-normalised signal value and return gate state.
+
+        Parameters
+        ----------
+        signal : float
+            Normalised intensity (e.g., WJI or norm_λ_V).  Values are expected
+            near 1.0 at background; gate opens when signal is meaningfully above
+            background relative to the running peak.
+        timestamp : float
+            Absolute timestamp in seconds.
+        """
+        if not self._active or self._t_event is None:
+            return GateState.INACTIVE
+
+        # Peak is always monotonically non-decreasing (updated on every tick)
+        if signal > self._peak:
+            self._peak = signal
+
+        if timestamp - self._t_event < self.warmup_seconds:
+            return GateState.WARMUP
+
+        if self._in_pass:
+            if signal < self.p_close * self._peak:
+                self._in_pass = False
+        else:
+            if signal >= self.p * self._peak:
+                self._in_pass = True
+
+        return GateState.PASS if self._in_pass else GateState.FAIL
+
+    def reset(self) -> None:
+        """Reset all state."""
+        self._peak = 1.0
+        self._in_pass = False
+        self._t_event = None
+        self._active = False
+
+    @property
+    def peak(self) -> float:
+        """Current running-max peak value."""
+        return self._peak

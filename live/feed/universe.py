@@ -136,7 +136,7 @@ class UniverseManager:
         )
 
         # Subscribe WebSocket
-        await self._ws_send_queue.put({
+        self._ws_send_queue.put_nowait({
             "action": "subscribe",
             "params": f"T.{ticker},Q.{ticker}",
         })
@@ -188,9 +188,9 @@ class UniverseManager:
             await self.remove_ticker(ticker, "sf_disqualified")
             if self._telegram is not None:
                 try:
-                    await self._telegram.send_silent(
+                    asyncio.create_task(self._telegram.send_silent(
                         f"{ticker}: SF disqualified after {CFG.setup_filter.removal_bars} consecutive failing bars — removed from universe"
-                    )
+                    ))
                 except Exception:
                     pass
 
@@ -241,7 +241,7 @@ class UniverseManager:
         if ctx is None:
             return
         ctx.task.cancel()
-        await self._ws_send_queue.put({
+        self._ws_send_queue.put_nowait({
             "action": "unsubscribe",
             "params": f"T.{ticker},Q.{ticker}",
         })

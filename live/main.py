@@ -112,19 +112,19 @@ async def _ibkr_watchdog(ibkr, telegram) -> None:
         if ibkr.is_connected():
             if _down:
                 _down = False
-                await telegram.send_silent("IBKR reconnected")
+                asyncio.create_task(telegram.send_silent("IBKR reconnected"))
             continue
         if not _down:
             _down = True
             _log.critical("IBKR connection lost — attempting reconnect")
-            await telegram.send_silent("IBKR disconnected — attempting reconnect")
+            asyncio.create_task(telegram.send_silent("IBKR disconnected — attempting reconnect"))
         else:
             _log.warning("IBKR still disconnected — retrying")
         try:
             await ibkr.connect()
             _down = False
             _log.info("IBKR reconnected successfully")
-            await telegram.send_silent("IBKR reconnected")
+            asyncio.create_task(telegram.send_silent("IBKR reconnected"))
         except Exception:
             _log.exception("IBKR reconnect failed — will retry in 15s")
 

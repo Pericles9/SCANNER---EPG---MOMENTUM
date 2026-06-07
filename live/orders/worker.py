@@ -64,9 +64,9 @@ async def order_worker(
         if not risk_state.allows(request):
             log.warning("Risk check blocked: %s %s", request.side, request.ticker)
             if risk_state._loss_limit_hit:
-                await telegram.send_silent(
+                asyncio.create_task(telegram.send_silent(
                     f"Daily loss limit hit — entries blocked. PnL: {risk_state.daily_pnl:.2f}"
-                )
+                ))
                 # Auto-kill: flatten all open positions once when loss limit is hit
                 if CFG.risk.auto_kill_on_daily_loss and not risk_state._auto_kill_fired:
                     risk_state._auto_kill_fired = True
@@ -94,9 +94,9 @@ async def order_worker(
                 risk_state.pending_close.add(request.ticker)
                 if request.on_fill_failed is not None:
                     request.on_fill_failed()
-                await telegram.send_silent(
+                asyncio.create_task(telegram.send_silent(
                     f"EXIT TIMEOUT: {request.ticker} — escalating to FlattenAll"
-                )
+                ))
                 await _execute_flatten_all(ibkr, risk_state, telegram,
                                            f"exit_timeout_{request.ticker}", session_clock)
             else:
@@ -120,7 +120,7 @@ async def order_worker(
         if request.on_fill_confirmed is not None:
             request.on_fill_confirmed()
 
-        await _notify_fill(telegram, fill, risk_state)
+        _notify_fill(telegram, fill, risk_state)
 
         log.info("Fill: %s %s %d/%d @ %.4f slippage=%.1fbps status=%s reason=%s",
                  fill.ticker, fill.side, fill.filled_qty, fill.qty,
@@ -145,7 +145,7 @@ async def _execute_flatten_all(
     from live.feed import market_status
 
     log.critical("FLATTEN ALL: reason=%s", reason)
-    await telegram.send_silent(f"CRITICAL: FLATTEN ALL triggered — {reason}")
+    asyncio.create_task(telegram.send_silent(f"CRITICAL: FLATTEN ALL triggered — {reason}"))
 
     if not market_status.is_tradable_now():
         deferred = list(risk_state.open_positions)
@@ -153,9 +153,9 @@ async def _execute_flatten_all(
             risk_state.pending_close.add(t)
         log.warning("FLATTEN ALL: market closed — deferred %s to pending_close", deferred)
         if deferred:
-            await telegram.send_silent(
+            asyncio.create_task(telegram.send_silent(
                 f"FLATTEN ALL: market closed — {deferred} deferred to pending_close"
-            )
+            ))
         return
 
     await ibkr.cancel_all_orders()
@@ -205,10 +205,10 @@ async def _execute_flatten_all(
                 ticker, fails,
             )
             if fails == 3:
-                await telegram.send_silent(
+                asyncio.create_task(telegram.send_silent(
                     f"FLATTEN {ticker}: {fails} consecutive timeouts — likely illiquid "
                     f"or halted. Switching to 5-min retry. May need manual close at RTH."
-                )
+                ))
         else:
             pool = get_pool()
             async with pool.acquire() as conn:
@@ -223,13 +223,13 @@ async def _execute_flatten_all(
             risk_state.pending_close_failures.pop(fill.ticker, None)
             filled_count += 1
             log.critical("FLATTEN ALL: %s filled %d @ %.4f", ticker, fill.filled_qty, fill.fill_price)
-            await _notify_fill(telegram, fill, risk_state)
+            _notify_fill(telegram, fill, risk_state)
 
     summary = f"FLATTEN ALL complete — {filled_count}/{len(positions)} filled"
     if deferred_tickers:
         summary += f", deferred: {deferred_tickers}"
     log.critical(summary)
-    await telegram.send_silent(summary)
+    asyncio.create_task(telegram.send_silent(summary))
 
 
 def _to_ns(dt) -> int:
@@ -337,7 +337,7 @@ async def _update_position(conn, fill: Fill, order_id: int, session_date: date) 
             )
 
 
-async def _notify_fill(telegram, fill: Fill, risk_state: RiskState) -> None:
+def _notify_fill(telegram, fill: Fill, risk_state: RiskState) -> None:
     partial_note = f" [partial {fill.filled_qty}/{fill.qty}]" if fill.status == "partial_cancelled" else ""
     if fill.is_entry:
         msg = (
@@ -350,7 +350,7 @@ async def _notify_fill(telegram, fill: Fill, risk_state: RiskState) -> None:
             f"reason={fill.exit_reason} slip={fill.slippage_bps:.1f}bps{partial_note} "
             f"| daily PnL: ${risk_state.daily_pnl:.2f}"
         )
-    await telegram.send_silent(msg)
+    asyncio.create_task(telegram.send_silent(msg))
 
 
 async def pending_close_monitor(
@@ -442,4 +442,4 @@ async def hourly_pnl_alert(
             else:
                 lines.append(f"  Open: {ticker}")
 
-        await telegram.send_silent("\n".join(lines))
+        asyncio.create_task(telegram.send_silent("\n".join(lines)))
