@@ -726,5 +726,207 @@ class TestPeakCooling:
             ParticipationGate(300.0, 0.65, m_cool_sec=30.0, tau_cool_sec=-5.0)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  T3i — gate_mode="peak" backward-compat tests
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestGateModePeakBackwardCompat:
+    """gate_mode='peak' must be bit-for-bit identical to default (no gate_mode arg)."""
+
+    def _run_sequence(self, gate, dv_seq, t_seq):
+        states = []
+        for dv, t in zip(dv_seq, t_seq):
+            states.append(gate.update(dv, t))
+        return states
+
+    def test_default_and_peak_mode_identical(self):
+        """ParticipationGate with gate_mode='peak' matches default (no mode arg)."""
+        tau = 60.0
+        p = 0.65
+        warmup = 10.0
+        dv_seq = [5000.0] * 20 + [0.0] * 200 + [3000.0] * 50
+        t_seq = list(range(1, len(dv_seq) + 1))
+
+        ref = ParticipationGate(half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup)
+        ref.activate(0.0)
+
+        new = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup,
+            gate_mode="peak",
+        )
+        new.activate(0.0)
+
+        ref_states = self._run_sequence(ref, dv_seq, [float(t) for t in t_seq])
+        new_states = self._run_sequence(new, dv_seq, [float(t) for t in t_seq])
+
+        assert ref_states == new_states, "gate_mode='peak' must match default behavior"
+        assert ref.lambda_v == pytest.approx(new.lambda_v)
+        assert ref.lambda_v_peak == pytest.approx(new.lambda_v_peak)
+
+    def test_peak_mode_with_extra_kwargs_ignored(self):
+        """In peak mode, background kwargs (mu_buy etc.) are ignored — state identical."""
+        tau = 300.0
+        p = 0.65
+        warmup = 5.0
+        dv_seq = [10000.0] * 15 + [500.0] * 100
+
+        ref = ParticipationGate(half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup)
+        ref.activate(0.0)
+
+        new = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p, warmup_seconds=warmup,
+            gate_mode="peak",
+        )
+        new.activate(0.0)
+
+        for i, dv in enumerate(dv_seq):
+            t = float(i + 1)
+            s_ref = ref.update(dv, t)
+            # Pass background kwargs — must be silently ignored in peak mode
+            s_new = new.update(
+                dv, t,
+                mu_buy=1.0, mu_sell=0.5, lambda_buy=2.0, lambda_sell=1.0, dbar=500.0,
+            )
+            assert s_ref == s_new, f"State mismatch at t={t}: ref={s_ref}, peak_mode={s_new}"
+
+    def test_peak_mode_with_asymmetric_hysteresis_identical(self):
+        """gate_mode='peak' + p_open/p_close matches plain asymmetric gate."""
+        tau = 60.0
+        p_open = 0.65
+        p_close = 0.30
+        warmup = 0.0
+        dv_seq = [100000.0, 0.0, 0.0, 0.0, 50000.0, 0.0] * 30
+
+        ref = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p_open, warmup_seconds=warmup,
+            p_open=p_open, p_close=p_close,
+        )
+        ref.activate(0.0)
+
+        new = ParticipationGate(
+            half_life_seconds=tau, peak_threshold_p=p_open, warmup_seconds=warmup,
+            p_open=p_open, p_close=p_close,
+            gate_mode="peak",
+        )
+        new.activate(0.0)
+
+        for i, dv in enumerate(dv_seq):
+            t = float(i + 1)
+            s_ref = ref.update(dv, t)
+            s_new = new.update(dv, t)
+            assert s_ref == s_new, f"Asymmetric mismatch at t={t}: {s_ref} vs {s_new}"
+
+    def test_invalid_gate_mode_raises(self):
+        """Constructor rejects unknown gate_mode values."""
+        with pytest.raises(ValueError, match="gate_mode"):
+            ParticipationGate(300.0, 0.65, gate_mode="bogus")
+
+    def test_invalid_tau_peak_raises(self):
+        with pytest.raises(ValueError, match="tau_peak"):
+            ParticipationGate(300.0, 0.65, gate_mode="background", tau_peak=0.0)
+
+    def test_invalid_C_raises(self):
+        with pytest.raises(ValueError, match="C must"):
+            ParticipationGate(300.0, 0.65, gate_mode="background", C=-1.0)
+
+
+class TestBackgroundGateLogic:
+    """Unit tests for gate_mode='background' WJI gate behavior (POC construction)."""
+
+    def _make_gate(self, tau_peak=600.0, C=2.0, warmup=0.0, p=0.65,
+                   lambda_v_ref=1.0, mu_buy_ref=1.0):
+        g = ParticipationGate(
+            half_life_seconds=300.0, peak_threshold_p=p, warmup_seconds=warmup,
+            gate_mode="background", tau_peak=tau_peak, C=C,
+        )
+        g.activate(0.0, lambda_v_ref=lambda_v_ref, mu_buy_ref=mu_buy_ref)
+        return g
+
+    def test_returns_inactive_before_activate(self):
+        g = ParticipationGate(300.0, 0.65, gate_mode="background")
+        assert g.update(100.0, 1.0) == GateState.INACTIVE
+
+    def test_warmup_when_refs_zero(self):
+        """Thin-name guard fires when lambda_v_ref=0 (invalid ref); holds WARMUP state."""
+        g = self._make_gate(warmup=300.0, lambda_v_ref=0.0)
+        state = g.update(100.0, 1.0)
+        assert state == GateState.WARMUP
+        assert g._thin_guard_count == 1
+
+    def test_thin_guard_rate(self):
+        """thin_guard_rate = 1.0 when lambda_v_ref=0 (all updates trigger guard)."""
+        g_thin = self._make_gate(warmup=0.0, lambda_v_ref=0.0)
+        g_thin.update(100.0, 1.0)
+        g_thin.update(100.0, 2.0)
+        assert g_thin._thin_guard_count == 2
+        assert g_thin._thin_guard_total == 2
+        assert g_thin.thin_guard_rate == pytest.approx(1.0)
+        # Valid refs: guard never fires
+        g_ok = self._make_gate(warmup=0.0)
+        g_ok.update(100.0, 1.0)
+        g_ok.update(100.0, 2.0)
+        assert g_ok._thin_guard_count == 0
+        assert g_ok.thin_guard_rate == pytest.approx(0.0)
+
+    def test_pass_when_wji_exceeds_threshold(self):
+        """High volume + buy trades accumulating lambda_buy_slow → PASS."""
+        g = self._make_gate(C=1.5, tau_peak=600.0, warmup=0.0)
+        # side=1 accumulates lambda_buy_slow; large dv makes volume_ratio >> 1
+        for t in range(1, 50):
+            g.update(1_000_000.0, float(t), side=1)
+        state = g.update(1_000_000.0, 50.0, side=1)
+        assert state == GateState.PASS
+
+    def test_fail_when_no_buy_trades(self):
+        """With side=0 throughout, lambda_buy_slow=0, buy_term=0, WJI=0 → FAIL."""
+        # C=2.0: threshold = max(p*0, 2.0*1.0) = 2.0; WJI = sqrt(vol_ratio * 0) = 0 → FAIL
+        g = self._make_gate(C=2.0, tau_peak=600.0, warmup=0.0)
+        for t in range(1, 20):
+            g.update(200.0, float(t))  # side=0 default: lambda_buy_slow stays 0
+        state = g.update(200.0, 20.0)
+        assert state == GateState.FAIL
+
+    def test_peak_wji_decays(self):
+        """After a burst (side=1), peak_WJI decays when WJI falls back near zero.
+
+        Uses very short lambda_V half-life (5s) so lambda_V collapses fast, producing
+        near-zero WJI. One tick at t_far (many tau_peak after burst) should show
+        peak_WJI decayed from the burst high.
+        """
+        tau_peak = 10.0
+        g = ParticipationGate(
+            half_life_seconds=5.0, peak_threshold_p=0.65, warmup_seconds=0.0,
+            gate_mode="background", tau_peak=tau_peak, C=0.01,
+        )
+        g.activate(0.0, lambda_v_ref=1.0, mu_buy_ref=1.0)
+
+        # Large burst: side=1 accumulates lambda_buy_slow; large dv makes volume_ratio >> 1
+        for t in range(1, 6):
+            g.update(1_000_000.0, float(t), side=1)
+        peak_after_burst = g._peak_wji
+        assert peak_after_burst > 0
+
+        # At t=5+10*tau_peak: lambda_V decayed ~exp(-20)~0; lambda_buy_slow ~0. WJI~0.
+        # peak_WJI decays 10 half-lives → < 1% of original.
+        t_far = 5.0 + 10 * tau_peak
+        g.update(0.0, t_far, side=0)
+        peak_decayed = g._peak_wji
+        assert peak_decayed < 0.01 * peak_after_burst, (
+            f"peak_WJI should decay; got {peak_decayed:.6f} (was {peak_after_burst:.4f})"
+        )
+
+    def test_reset_clears_background_state(self):
+        """reset() clears _peak_wji, _lambda_buy_slow, and thin_guard counters."""
+        g = self._make_gate()
+        g.update(500.0, 1.0, side=1)
+        g.update(100.0, 2.0)
+        g.reset()
+        assert g._peak_wji == 0.0
+        assert g._lambda_buy_slow == 0.0
+        assert g._thin_guard_count == 0
+        assert g._thin_guard_total == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
