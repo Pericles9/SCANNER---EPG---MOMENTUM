@@ -335,6 +335,45 @@ Tested SF as an entry-stack gate on top-decile EPG-OPT2 configs (52 configs, see
 
 **Results:** `results/phase_epg_opt2_sf/`
 
+### Phase WJI-SlowEMA — Slow EMA Gate (T3b escalation — parked)
+
+Hypothesis: replace the `RunningMaxGate` (monotonically non-decreasing peak reference) with a
+slow EMA of WJI that adapts to current momentum level. An EMA reference would avoid stale-peak
+lock-in while still filtering noisy entries via asymmetric hysteresis (p_open > p_close).
+
+**Signal (unchanged from WJI-OPT):**
+```
+WJI(t) = norm_λ_V^0.5 × norm_λ_buy_slow^0.5   (τ_V=180s, β_slow=0.01)
+```
+
+**Reference (new):**
+```
+WJI_slow(t) = WJI_slow × exp(-ln2·dt/τ_slow) + WJI × (1 − exp(-ln2·dt/τ_slow))
+```
+State transitions: FAIL→PASS at `WJI ≥ p_open × WJI_slow`; PASS→FAIL at `WJI < p_close × WJI_slow`.
+`dt` is **halt-adjusted active seconds** (T1 audit: halt detection was not wired into any prior sweep runner; wired here for the first time).
+
+**T3 sweep — 25 configs** (τ_slow ∈ {300,600,900,1200,1800}, p_open ∈ {0.70,…,0.90}, p_close=0.55 fixed):
+
+| Best PF | Best CVaR5 | Baseline PF | Baseline CVaR5 |
+|---------|-----------|-------------|----------------|
+| 1.2219 (t300_po75) | −16.79% (t900_po70) | 1.1881 | −9.16% |
+
+**T3b escalation: zero configs met CVaR5 ≥ −10.0%.** Hard stop; T4/T5/T7 blocked.
+
+**Root cause:** The EMA reference adapts downward during momentum deceleration, maintaining
+`WJI/WJI_slow ≈ 1.0` as both decline together. The gate stays PASS through deceleration and
+reversal, producing deep tail losses. The `RunningMaxGate` avoids this because the peak never
+falls — decelerating WJI exits immediately. Stagnation (T3c): ~57–113 PASS↔FAIL cycles per
+event (threshold: 8), reflecting continuous threshold crossings due to tick-scale WJI noise
+against a near-stationary EMA level.
+
+**Status:** Parked (TBD — not abandoned, not approved for follow-on). Three remediation paths
+identified: (1) tighten p_close sweep {0.70–0.80}; (2) add a peak floor to WJI_slow
+(`max(ema, peak × floor)`); (3) abandon in favour of `RunningMaxGate`. Requires Cooper decision.
+
+**Results:** `results/phase_wji_slow_ema/t3_sweep.json` | **Gate doc:** [[wji_slow_ema_gate]]
+
 ---
 
 ## Known Limitations

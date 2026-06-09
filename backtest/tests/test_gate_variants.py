@@ -2,7 +2,8 @@
 Unit tests for Phase EPG-GRT gate variant classes.
 
 Covers AbsoluteThresholdGate (B), HawkesCumulativeGate (C),
-HawkesBuySideGate (D), BurstRatioGate (E).  Minimum 3 tests per class.
+HawkesBuySideGate (D), BurstRatioGate (E), WJISlowEMAGate (SEM).
+Minimum 3 tests per class.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from core.epg.gate_variants import (
     BurstRatioGate,
     HawkesBuySideGate,
     HawkesCumulativeGate,
+    WJISlowEMAGate,
 )
 
 
@@ -434,3 +436,135 @@ class TestBurstRatioGate:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  WJISlowEMAGate (SEM) tests — T2c
+# ══════════════════════════════════════════════════════════════════════
+
+class TestWJISlowEMAGate:
+    """Unit tests for WJISlowEMAGate (Phase WJI-SlowEMA, T2c)."""
+
+    def _make_gate(
+        self,
+        tau_slow: float = 300.0,
+        p_open: float = 0.80,
+        p_close: float = 0.55,
+        warmup: float = 0.0,
+    ) -> WJISlowEMAGate:
+        return WJISlowEMAGate(
+            tau_slow=tau_slow, p_open=p_open, p_close=p_close, warmup_seconds=warmup
+        )
+
+    def _drive_to_pass(
+        self, gate: WJISlowEMAGate, wji_val: float = 1.0, n: int = 1
+    ) -> GateState:
+        """Send n ticks of wji_val × 1.5 (well above p_open=0.80) with dt=1."""
+        state = GateState.INACTIVE
+        for _ in range(n):
+            state = gate.update(wji_val * 1.5, 1.0)
+        return state
+
+    # -- T2c test 1: fast tau tracks signal quickly
+    def test_fast_tau_ema_tracks_signal(self):
+        """With small tau_slow the EMA converges to the input in a few half-lives."""
+        tau = 10.0
+        gate = self._make_gate(tau_slow=tau, warmup=0.0)
+        gate.activate(0.0)
+
+        # Seed with initial value 1.0
+        gate.update(1.0, 0.0)
+        assert math.isclose(gate.wji_slow, 1.0)
+
+        # Drive with 5.0 for 3 × tau (= 30 s active); expect EMA > 4.0
+        t = 0.0
+        for _ in range(30):
+            gate.update(5.0, 1.0)
+            t += 1.0
+        # After 3 × half-life the EMA should be > 87.5% of the way to 5.0
+        assert gate.wji_slow > 4.0, f"Expected fast convergence, got wji_slow={gate.wji_slow:.4f}"
+
+    # -- T2c test 2: slow tau keeps EMA stable against a transient spike
+    def test_slow_tau_resists_transient_spike(self):
+        """With large tau_slow a single spike barely moves the EMA."""
+        tau = 1800.0
+        gate = self._make_gate(tau_slow=tau, warmup=0.0)
+        gate.activate(0.0)
+
+        # Establish baseline EMA at 1.0 with many 1-second ticks
+        for _ in range(300):
+            gate.update(1.0, 1.0)
+        baseline = gate.wji_slow
+
+        # One spike tick with dt=1 should barely move the EMA
+        gate.update(10.0, 1.0)
+        delta = gate.wji_slow - baseline
+        assert delta < 0.01, f"Slow EMA moved too much on spike: delta={delta:.6f}"
+
+    # -- T2c test 3: halt gap (large dt) decays EMA toward zero, then re-initialises
+    def test_halt_gap_large_dt_decays_ema(self):
+        """After a halt (large dt), EMA decays significantly toward zero."""
+        tau = 300.0
+        gate = self._make_gate(tau_slow=tau, warmup=0.0)
+        gate.activate(0.0)
+
+        # Establish EMA near 2.0
+        for _ in range(200):
+            gate.update(2.0, 1.0)
+        pre_halt = gate.wji_slow
+
+        # Simulate a 30-minute halt (1800 active seconds with wji=0 — effectively zero contrib)
+        # Use a zero-WJI tick with the halt dt so EMA decays to near zero
+        gate.update(0.0, 1800.0)
+        post_halt = gate.wji_slow
+
+        # After 6 half-lives the EMA should be < 2% of pre-halt value
+        decay_expected = math.exp(-math.log(2) * 1800.0 / tau)
+        assert post_halt < pre_halt * decay_expected * 1.05, (
+            f"EMA did not decay: pre={pre_halt:.4f} post={post_halt:.4f} decay={decay_expected:.4f}"
+        )
+
+    # -- T2c test 4: dead zone holds current state (no transition in dead zone)
+    def test_dead_zone_holds_state(self):
+        """WJI in dead zone (p_close <= WJI < p_open * wji_slow) should not change state."""
+        gate = self._make_gate(tau_slow=300.0, p_open=0.80, p_close=0.55, warmup=0.0)
+        gate.activate(0.0)
+
+        # Seed EMA at 1.0
+        gate.update(1.0, 0.0)
+        # Force into PASS by sending WJI above p_open threshold
+        gate.update(gate.wji_slow * 0.80 * 1.1, 1.0)
+        assert gate.update(gate.wji_slow * 0.80 * 1.1, 1.0) == GateState.PASS
+
+        # Now send a dead-zone tick: p_close < wji < p_open (e.g., 0.70 × wji_slow)
+        wji_dead = gate.wji_slow * 0.70
+        state = gate.update(wji_dead, 1.0)
+        assert state == GateState.PASS, (
+            f"Dead zone tick changed state to {state}; expected PASS"
+        )
+
+    # -- T2c test 5: FAIL→PASS only at p_open, not at p_close
+    def test_fail_to_pass_only_at_p_open(self):
+        """Gate opens at p_open threshold; p_close alone never triggers PASS."""
+        gate = self._make_gate(tau_slow=300.0, p_open=0.80, p_close=0.55, warmup=0.0)
+        gate.activate(0.0)
+
+        # Seed EMA
+        gate.update(1.0, 0.0)
+        # Confirm gate starts FAIL
+        state = gate.update(0.5, 1.0)
+        assert state == GateState.FAIL
+
+        # Send a tick at exactly p_close * wji_slow — should NOT open
+        tick_at_pclose = gate.wji_slow * gate._p_close
+        state = gate.update(tick_at_pclose, 1.0)
+        assert state == GateState.FAIL, (
+            f"Gate opened at p_close level; expected FAIL, got {state}"
+        )
+
+        # Send a tick at p_open * wji_slow — now should open
+        tick_at_popen = gate.wji_slow * gate._p_open
+        state = gate.update(tick_at_popen, 1.0)
+        assert state == GateState.PASS, (
+            f"Gate did not open at p_open level; expected PASS, got {state}"
+        )

@@ -1,22 +1,26 @@
 """
-Gate variants for Phase EPG-GRT, EPG-OPT2, WJI-POC, and WJI-OPT.
+Gate variants for Phase EPG-GRT, EPG-OPT2, WJI-POC, WJI-OPT, and WJI-SlowEMA.
 
 All implement the same interface: .activate(t_event), .update(...), .reset().
 
 Variants:
-  AbsoluteThresholdGate   (B) — λ_V vs fixed pre-event mean reference; no peak ratchet
-  HawkesCumulativeGate    (C) — slow arrival-rate kernel (buy+sell) vs μ_background
-  HawkesBuySideGate       (D) — slow arrival-rate kernel (buy-only) vs μ_buy
-  BurstRatioGate          (E) — fast/slow EMA ratio; fires at volume inflection point
-  SlopeGate               (F) — opens on λ_V acceleration; two sub-variants:
-                                 F_ss (slope open / slope close)
-                                 F_sl (slope open / level close)
+  AbsoluteThresholdGate   (B)   — λ_V vs fixed pre-event mean reference; no peak ratchet
+  HawkesCumulativeGate    (C)   — slow arrival-rate kernel (buy+sell) vs μ_background
+  HawkesBuySideGate       (D)   — slow arrival-rate kernel (buy-only) vs μ_buy
+  BurstRatioGate          (E)   — fast/slow EMA ratio; fires at volume inflection point
+  SlopeGate               (F)   — opens on λ_V acceleration; two sub-variants:
+                                   F_ss (slope open / slope close)
+                                   F_sl (slope open / level close)
   WJIGate                 (WJI) — joint buy-side arrival × dollar-volume signal;
                                    geometric mean of normalised components; slope-driven
                                    adaptive peak with continuous decay on deceleration
   RunningMaxGate          (RMG) — signal-agnostic running-max threshold gate;
                                    accepts pre-normalised signal; no decay; hysteresis
                                    toggle: 'single' (symmetric) or 'asym' (asymmetric)
+  WJISlowEMAGate          (SEM) — slow EMA of WJI as participation reference; asymmetric
+                                   hysteresis dead zone (p_open > p_close) prevents
+                                   choppiness; caller passes pre-computed WJI + halt-
+                                   adjusted dt_active instead of raw timestamp
 """
 from __future__ import annotations
 
@@ -1040,3 +1044,158 @@ class RunningMaxGate:
     def peak(self) -> float:
         """Current running-max peak value."""
         return self._peak
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  WJISlowEMAGate (SEM) — slow EMA of WJI as participation reference
+# ══════════════════════════════════════════════════════════════════════
+
+class WJISlowEMAGate:
+    """
+    Signal-agnostic gate using a slow EMA of WJI as the participation reference.
+
+    The caller pre-computes the WJI signal and passes it along with dt_active
+    (halt-adjusted seconds since the previous tick) on each update call.
+
+    EMA formula (half-life tau_slow in active seconds):
+        decay = exp(-ln2 * dt_active / tau_slow)
+        wji_slow = wji_slow * decay + wji * (1 - decay)
+
+    WJI_slow is initialised to the first non-zero WJI value seen during
+    the pre-event or warmup period to avoid a zero-denominator at the first
+    PASS check (T2a requirement).
+
+    State machine (post-warmup):
+        FAIL → PASS : wji >= p_open  * wji_slow
+        PASS → FAIL : wji <  p_close * wji_slow
+        Dead zone   : p_close * wji_slow <= wji < p_open * wji_slow → hold state
+
+    Parameters
+    ----------
+    tau_slow : float
+        Half-life (in active seconds) of the slow WJI EMA.
+    p_open : float
+        Threshold multiplier to open (FAIL→PASS).  Must satisfy p_open > p_close.
+    p_close : float
+        Threshold multiplier to close (PASS→FAIL).
+    warmup_seconds : float
+        Warmup period in active seconds after T_event.  Default 300 s.
+    """
+
+    def __init__(
+        self,
+        tau_slow: float,
+        p_open: float,
+        p_close: float,
+        warmup_seconds: float = WARMUP_DURATION_SEC,
+    ) -> None:
+        if tau_slow <= 0.0:
+            raise ValueError(f"tau_slow must be positive, got {tau_slow}")
+        if not (0.0 < p_close < p_open):
+            raise ValueError(
+                f"p_close must satisfy 0 < p_close < p_open, got p_close={p_close} p_open={p_open}"
+            )
+        self._tau_slow = tau_slow
+        self._p_open = p_open
+        self._p_close = p_close
+        self._warmup_seconds = warmup_seconds
+
+        self._wji_slow: float = 0.0
+        self._ema_initialized: bool = False
+        self._cumulative_active: float = 0.0
+        self._t_event_active: float = 0.0
+        self._state: GateState = GateState.INACTIVE
+
+    def activate(self, t_event_active_sec: float) -> None:
+        """
+        Prepare gate for a new event.
+
+        Parameters
+        ----------
+        t_event_active_sec : float
+            Active-seconds elapsed from the first trade to T_event.
+            Typically active_seconds[idx_event] from compress_active_seconds().
+        """
+        self._t_event_active = t_event_active_sec
+        self._cumulative_active = 0.0
+        self._wji_slow = 0.0
+        self._ema_initialized = False
+        self._state = GateState.INACTIVE
+
+    def update(self, wji: float, dt_active: float) -> GateState:
+        """
+        Process one WJI tick and return the current gate state.
+
+        Parameters
+        ----------
+        wji : float
+            Pre-computed WJI value for this tick.
+        dt_active : float
+            Halt-adjusted seconds elapsed since the previous tick.
+            Use active_seconds[i] - active_seconds[i-1]; pass 0.0 for the
+            first tick in the session.
+        """
+        self._cumulative_active += max(0.0, dt_active)
+
+        # EMA update — initialise to first non-zero WJI (T2a)
+        dt = max(0.0, dt_active)
+        if not self._ema_initialized:
+            if wji > 0.0:
+                self._wji_slow = wji
+                self._ema_initialized = True
+        else:
+            decay = math.exp(-LN2 * dt / self._tau_slow)
+            self._wji_slow = self._wji_slow * decay + wji * (1.0 - decay)
+
+        # Before T_event: gate is inactive
+        if self._cumulative_active < self._t_event_active:
+            return GateState.INACTIVE
+
+        # Within warmup window after T_event
+        elapsed_post_event = self._cumulative_active - self._t_event_active
+        if elapsed_post_event < self._warmup_seconds:
+            if self._state == GateState.INACTIVE:
+                self._state = GateState.WARMUP
+            return GateState.WARMUP
+
+        # Warmup just ended: initialise PASS/FAIL from current snapshot
+        if self._state in (GateState.INACTIVE, GateState.WARMUP):
+            if self._ema_initialized and wji >= self._p_open * self._wji_slow:
+                self._state = GateState.PASS
+            else:
+                self._state = GateState.FAIL
+            return self._state
+
+        # Running PASS/FAIL with asymmetric hysteresis dead zone
+        if self._ema_initialized and self._wji_slow > 0.0:
+            if self._state == GateState.FAIL:
+                if wji >= self._p_open * self._wji_slow:
+                    self._state = GateState.PASS
+            elif self._state == GateState.PASS:
+                if wji < self._p_close * self._wji_slow:
+                    self._state = GateState.FAIL
+
+        return self._state
+
+    def reset(self) -> None:
+        """Reset all state."""
+        self._wji_slow = 0.0
+        self._ema_initialized = False
+        self._cumulative_active = 0.0
+        self._t_event_active = 0.0
+        self._state = GateState.INACTIVE
+
+    @property
+    def wji_slow(self) -> float:
+        """Current slow EMA of WJI."""
+        return self._wji_slow
+
+    @property
+    def threshold_open(self) -> float:
+        """FAIL→PASS threshold: p_open * wji_slow."""
+        return self._p_open * self._wji_slow
+
+    @property
+    def threshold_close(self) -> float:
+        """PASS→FAIL threshold: p_close * wji_slow."""
+        return self._p_close * self._wji_slow
