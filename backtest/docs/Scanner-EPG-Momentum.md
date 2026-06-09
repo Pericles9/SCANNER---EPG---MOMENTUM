@@ -342,22 +342,25 @@ slow EMA of WJI that adapts to current momentum level. An EMA reference would av
 lock-in while still filtering noisy entries via asymmetric hysteresis (p_open > p_close).
 
 **Signal (unchanged from WJI-OPT):**
-```
+
+```text
 WJI(t) = norm_λ_V^0.5 × norm_λ_buy_slow^0.5   (τ_V=180s, β_slow=0.01)
 ```
 
 **Reference (new):**
-```
+
+```text
 WJI_slow(t) = WJI_slow × exp(-ln2·dt/τ_slow) + WJI × (1 − exp(-ln2·dt/τ_slow))
 ```
+
 State transitions: FAIL→PASS at `WJI ≥ p_open × WJI_slow`; PASS→FAIL at `WJI < p_close × WJI_slow`.
 `dt` is **halt-adjusted active seconds** (T1 audit: halt detection was not wired into any prior sweep runner; wired here for the first time).
 
 **T3 sweep — 25 configs** (τ_slow ∈ {300,600,900,1200,1800}, p_open ∈ {0.70,…,0.90}, p_close=0.55 fixed):
 
-| Best PF | Best CVaR5 | Baseline PF | Baseline CVaR5 |
-|---------|-----------|-------------|----------------|
-| 1.2219 (t300_po75) | −16.79% (t900_po70) | 1.1881 | −9.16% |
+| Best PF             | Best CVaR5           | Baseline PF | Baseline CVaR5 |
+|---------------------|----------------------|-------------|----------------|
+| 1.2219 (t300_po75)  | −16.79% (t900_po70)  | 1.1881      | −9.16%         |
 
 **T3b escalation: zero configs met CVaR5 ≥ −10.0%.** Hard stop; T4/T5/T7 blocked.
 

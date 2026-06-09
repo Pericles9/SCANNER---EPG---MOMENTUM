@@ -48,6 +48,7 @@ Inherited from the parent project — apply here without exception:
 | Phase EPG-OPT2 | **Complete** | Stage 1-3 sweep. All below GRT baseline. T8 escalation. SlopeGate F_sl inconclusive. |
 | Phase EPG-OPT2-SF | **Complete** | SF integration test. Net negative: mean delta_pf = −0.085. 47/52 configs hurt. |
 | Live SlopeGate swap | **Deployed (heuristic)** | Live EPG core: ParticipationGate → SlopeGate F_ss (s3_fss_t180_l30_ko5_kc0). EXIT_D+LULD disabled live. |
+| Phase WJI-SlowEMA | **Parked (T3b escalation)** | Slow EMA of WJI as gate reference. All 25 configs fail CVaR5 ≥ −10% (best −16.79%). Root cause: EMA chases signal down during deceleration — late exits, deep tails. T4/T5/T7 blocked. TBD whether to retry or abandon. |
 
 **What's next:** Phase H requires explicit approval before any implementation. **Phase G v1/v2 findings (rank gate, heat gate, quartile gate, multi-day runner) are analysis-only and NOT actionable** — the quartile boundary in particular looks good theoretically but breaks down in practice. Do not implement any of these from Phase G without a dedicated validation phase. SlopeGate F_ss is active live but has no backtest validation — the backtest still uses ParticipationGate.
 

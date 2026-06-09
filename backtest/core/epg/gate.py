@@ -21,10 +21,12 @@ existing behavior).
 from __future__ import annotations
 
 import enum
+import logging
 import math
 from typing import Optional
 
 
+log = logging.getLogger(__name__)
 LN2 = math.log(2)
 WARMUP_DURATION_SEC = 300.0  # 5 minutes
 
@@ -54,6 +56,9 @@ class ParticipationGate:
         tau_peak: float = 600.0,
         C: float = 2.0,
         beta_slow: float = 0.01,
+        k: float = 1.0,
+        h: float = 4.0,
+        sigma_log_fallback: float = 0.209,
     ):
         """
         Parameters
@@ -95,14 +100,21 @@ class ParticipationGate:
             raise ValueError(f"p_close must be in (0, 1], got {_p_close}")
         if _p_close > _p_open:
             raise ValueError(f"p_close ({_p_close}) must be <= p_open ({_p_open})")
-        if gate_mode not in ("peak", "background"):
-            raise ValueError(f"gate_mode must be 'peak' or 'background', got {gate_mode!r}")
+        if gate_mode not in ("peak", "background", "cusum"):
+            raise ValueError(f"gate_mode must be 'peak', 'background' or 'cusum', got {gate_mode!r}")
         if tau_peak <= 0:
             raise ValueError(f"tau_peak must be positive, got {tau_peak}")
         if C <= 0:
             raise ValueError(f"C must be positive, got {C}")
         if beta_slow <= 0:
             raise ValueError(f"beta_slow must be positive, got {beta_slow}")
+        if gate_mode == "cusum":
+            if k <= 0:
+                raise ValueError(f"cusum k must be positive, got {k}")
+            if h <= 0:
+                raise ValueError(f"cusum h must be positive, got {h}")
+            if sigma_log_fallback <= 0:
+                raise ValueError(f"cusum sigma_log_fallback must be positive, got {sigma_log_fallback}")
 
         self.half_life = half_life_seconds
         self.peak_threshold_p = peak_threshold_p
@@ -115,6 +127,9 @@ class ParticipationGate:
         self.tau_peak = tau_peak
         self.C = C
         self.beta_slow = beta_slow
+        self.k = k
+        self.h = h
+        self.sigma_log_fallback = sigma_log_fallback
 
         # Precompute decay constant: ln2 / tau
         self._decay_rate = LN2 / half_life_seconds
@@ -142,10 +157,35 @@ class ParticipationGate:
         self._thin_guard_total: int = 0
         self._last_bg_debug: dict = {}
 
+        # CUSUM mode state (gate_mode="cusum"). The one-sided upper CUSUM accumulates
+        # standardised log-ratio deviations of WJI from its background. It is a purely
+        # per-tick recursion (no dt term), so it naturally "holds" across halts: halted
+        # ticks are skipped and S_up is left untouched.
+        self._s_up: float = 0.0                       # accumulated regime-entry evidence
+        self._sigma_log: Optional[float] = None       # finalised at warmup exit
+        self._warmup_logs: list = []                  # log-ratios collected during warmup
+        self._sigma_finalized: bool = False
+        self._last_cusum_debug: dict = {}
+
     @property
     def last_bg_debug(self) -> dict:
         """Internal WJI state from the most recent background-mode update()."""
         return self._last_bg_debug
+
+    @property
+    def s_up(self) -> float:
+        """Current CUSUM upper accumulator (cusum mode). Primary decision variable."""
+        return self._s_up
+
+    @property
+    def sigma_log(self) -> Optional[float]:
+        """Finalised per-event sigma_log (cusum mode), or None before warmup exit."""
+        return self._sigma_log
+
+    @property
+    def last_cusum_debug(self) -> dict:
+        """Internal CUSUM state from the most recent cusum-mode update() (for charts)."""
+        return self._last_cusum_debug
 
     @property
     def lambda_v(self) -> float:
@@ -222,11 +262,17 @@ class ParticipationGate:
         self._thin_guard_count = 0
         self._thin_guard_total = 0
         self._last_bg_debug = {}
+        # CUSUM state resets only here (event start) — never between PASS/FAIL cycles.
+        self._s_up = 0.0
+        self._sigma_log = None
+        self._warmup_logs = []
+        self._sigma_finalized = False
+        self._last_cusum_debug = {}
 
     def update(
         self,
-        dollar_vol: float,
-        timestamp: float,
+        dollar_vol: float = 0.0,
+        timestamp: float = 0.0,
         side: int = 0,
         *,
         mu_buy: float = 0.0,
@@ -234,6 +280,9 @@ class ParticipationGate:
         lambda_buy: float = 0.0,
         lambda_sell: float = 0.0,
         dbar: float = 0.0,
+        wji: Optional[float] = None,
+        wji_background: float = 1.0,
+        is_halted: bool = False,
     ) -> GateState:
         """
         Update lambda_V with a new trade and return gate state.
@@ -264,6 +313,11 @@ class ParticipationGate:
         """
         if not self._active or self._t_event is None:
             return GateState.INACTIVE
+
+        # ── CUSUM mode (gate_mode="cusum") ──
+        # Branches early: does not touch the λ_V / peak / background machinery below.
+        if self.gate_mode == "cusum":
+            return self._update_cusum(wji, wji_background, timestamp, is_halted)
 
         # Compute dt and decay
         dt = timestamp - self._last_timestamp
@@ -389,6 +443,98 @@ class ParticipationGate:
                 self._cooling_active = False
         return GateState.PASS if self._in_pass else GateState.FAIL
 
+    def _update_cusum(
+        self,
+        wji: Optional[float],
+        wji_background: float,
+        timestamp: float,
+        is_halted: bool,
+    ) -> GateState:
+        """
+        One-sided upper CUSUM branch (Phase CPD-1).
+
+        Pipeline per tick (post-warmup):
+            wji_log   = log(WJI / WJI_background)        # log-ratio transform
+            deviation = wji_log / sigma_log              # standardise (H0 mean = 0)
+            S_up      = max(0, S_up_prev + deviation - k) # accumulate, one-sided floor
+
+        State (natural hysteresis from the accumulator):
+            PASS  when  S_up > h
+            FAIL  when  S_up <= 0          (evidence fully drained)
+            hold        0 < S_up <= h      (keep prior PASS/FAIL)
+
+        `caller passes the pre-computed (locked) WJI signal; wji_background defaults to
+        1.0 (Cooper Option A — WJI is already background-normalised and rests at ≈ 1.0,
+        so wji_log rests at ≈ 0 and no mean-subtraction is needed). sigma_log is
+        estimated once from the warmup window and is then a fixed per-event constant.
+        S_up resets to 0 only at event start (activate()), never between PASS/FAIL
+        cycles — a partial drain lets the gate re-open faster on a continuation burst.
+        """
+        # Halt guard (T5b): a halted tick must leave S_up untouched. On the active-
+        # seconds axis halt ticks are already removed, so this is belt-and-braces for
+        # any raw-axis caller. CUSUM has no dt term, so "holding" is simply skipping.
+        if is_halted:
+            return GateState.PASS if self._in_pass else GateState.FAIL
+
+        time_since_event = timestamp - self._t_event
+
+        # Pre-event ticks (a full-trace replay feeds ticks before T_event): the gate is
+        # not yet meaningful and must NOT collect them into the warmup sample — sigma_log
+        # is estimated strictly on the post-event warmup window [T_event, T_event+warmup).
+        if time_since_event < 0.0:
+            return GateState.WARMUP
+
+        # Zero-background / undefined-log guard: log needs WJI > 0 and background > 0.
+        # On failure, contribute nothing to S_up and return the prior state.
+        if wji is None or wji <= 0.0 or wji_background <= 0.0:
+            if time_since_event < self.warmup_seconds:
+                return GateState.WARMUP
+            return GateState.PASS if self._in_pass else GateState.FAIL
+
+        wji_log = math.log(wji / wji_background)
+
+        # ── WARMUP: collect log-ratios for sigma_log; gate cannot open ──
+        if time_since_event < self.warmup_seconds:
+            self._warmup_logs.append(wji_log)
+            return GateState.WARMUP
+
+        # ── Warmup exit: finalise sigma_log once (fixed for the rest of the event) ──
+        if not self._sigma_finalized:
+            n = len(self._warmup_logs)
+            if n >= 20:
+                mean = sum(self._warmup_logs) / n
+                var = sum((x - mean) ** 2 for x in self._warmup_logs) / (n - 1)
+                sigma = math.sqrt(var) if var > 0.0 else 0.0
+                self._sigma_log = sigma if sigma > 0.0 else self.sigma_log_fallback
+            else:
+                self._sigma_log = self.sigma_log_fallback
+                log.info(
+                    "cusum: warmup n=%d < 20 obs; using sigma_log fallback=%.4f",
+                    n, self.sigma_log_fallback,
+                )
+            self._sigma_finalized = True
+
+        # ── Accumulate evidence ──
+        # deviation: how many rest-noise sigmas this tick sits above H0 (0).
+        deviation = wji_log / self._sigma_log
+        # k (slack): subtract so rest-level deviations do not accumulate. max(0, …)
+        # is the one-sided CUSUM floor — evidence drains toward 0 but never banks
+        # negative credit, so a return to background empties S_up (the exit signal).
+        self._s_up = max(0.0, self._s_up + deviation - self.k)
+
+        # ── State transition (hysteresis band 0 < S_up <= h holds prior state) ──
+        if self._s_up > self.h:
+            self._in_pass = True
+        elif self._s_up <= 0.0:
+            self._in_pass = False
+
+        self._last_cusum_debug = {
+            "wji": wji, "wji_background": wji_background, "wji_log": wji_log,
+            "sigma_log": self._sigma_log, "deviation": deviation,
+            "s_up": self._s_up, "k": self.k, "h": self.h, "in_pass": self._in_pass,
+        }
+        return GateState.PASS if self._in_pass else GateState.FAIL
+
     def reset(self) -> None:
         """
         Reset for continuation events or new session.
@@ -413,3 +559,8 @@ class ParticipationGate:
         self._thin_guard_count = 0
         self._thin_guard_total = 0
         self._last_bg_debug = {}
+        self._s_up = 0.0
+        self._sigma_log = None
+        self._warmup_logs = []
+        self._sigma_finalized = False
+        self._last_cusum_debug = {}
