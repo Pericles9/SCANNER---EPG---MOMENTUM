@@ -32,6 +32,17 @@ class FlattenAllRequest:
 
 
 @dataclass
+class FlattenTickerRequest:
+    """Sentinel: close a single ticker position (dead man's switch / stuck exit).
+
+    Does NOT affect other open positions. Use FlattenAllRequest only for
+    kill-switch, daily loss auto-kill, and WS disconnect scenarios.
+    """
+    ticker: str
+    reason: str
+
+
+@dataclass
 class RiskState:
     daily_pnl: float = 0.0
     open_positions: dict = field(default_factory=dict)  # ticker → {qty, avg_cost}

@@ -10,6 +10,35 @@ Running record of decisions made during the build, deviations from the architect
 
 ---
 
+## 2026-06-08 — Flatten Escalation Feedback Loop Fix
+
+### [BUG] Single stuck exit froze the order worker and triggered a continuous flatten cycle
+
+**Root cause:** Two compounding issues created a feedback loop this morning.
+
+1. **`_execute_flatten_all` was serial.** Each `ibkr.submit()` awaited in sequence — with 4 open positions and a 5s cancel timeout each, the order worker was blocked for up to 20s per flatten call, starving all queue entries including Telegram command responses.
+
+2. **Exit timeout escalated to FlattenAllRequest.** When a single exit order timed out, `order_worker` called `_execute_flatten_all` for *every* open position. One illiquid ticker should never close positions in unrelated tickers.
+
+3. **`pending_close_monitor` fired `FlattenAllRequest` on retry.** The retry path used `FlattenAllRequest(reason=f"pending_close_retry_{ticker}")` — still a full account flatten — which re-entered `_execute_flatten_all` serially, blocking the worker again, timing out again, and repeating the cycle.
+
+**Fix:**
+
+- Introduced `FlattenTickerRequest(ticker, reason)` in `live/orders/risk.py` — a per-ticker sentinel that closes exactly one position.
+- Removed the exit-timeout → `FlattenAllRequest` escalation from `order_worker`. Timed-out exits are added to `pending_close` for retry only.
+- Added `_execute_flatten_ticker` in `worker.py`: mirrors `_execute_flatten_all` for a single ticker with the same market-closed deferral and `pending_close_failures` counter.
+- Made `_execute_flatten_all` concurrent via `asyncio.gather` — all positions now submit in parallel, bounding wall time at ~1× `unfilled_cancel_sec` regardless of position count.
+- `pending_close_monitor` now enqueues `FlattenTickerRequest` instead of `FlattenAllRequest` for stuck tickers.
+- `heartbeat_monitor` in `signal_loop.py` now enqueues `FlattenTickerRequest(ticker=ticker)` — the dead man's switch now affects only the stale ticker's position, not the entire account.
+
+**Invariant:** `FlattenAllRequest` is reserved for: `/kill` command, `kill.flag` watcher, daily loss auto-kill, and WS disconnect (60s). All other flatten paths use `FlattenTickerRequest`.
+
+**Files changed:** `live/orders/risk.py`, `live/orders/worker.py`, `live/feed/signal_loop.py`.
+**Tests added:** `live/tests/live/test_flatten_escalation.py` (5 gate tests).
+**CLAUDE.md:** Dead man's switch row superseded; new behaviour documented.
+
+---
+
 ## 2026-05-20 — Pre-Build Housekeeping
 
 ### [FINDING] `live_system_architecture.md` does not exist

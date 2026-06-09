@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 from live.config import CFG
 from live.db.pool import get_pool
 from live.orders.ibkr import Fill, IBKRClient
-from live.orders.risk import FlattenAllRequest, OrderRequest, RiskState
+from live.orders.risk import FlattenAllRequest, FlattenTickerRequest, OrderRequest, RiskState
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,12 @@ async def order_worker(
             await _execute_flatten_all(ibkr, risk_state, telegram, request.reason, session_clock)
             continue
 
+        if isinstance(request, FlattenTickerRequest):
+            await _execute_flatten_ticker(
+                request.ticker, ibkr, risk_state, telegram, request.reason, session_clock.date
+            )
+            continue
+
         if not isinstance(request, OrderRequest):
             log.warning("order_worker: unknown request type %s", type(request))
             continue
@@ -88,17 +94,15 @@ async def order_worker(
         if fill is None:
             if not request.is_entry:
                 log.critical(
-                    "Exit order timed out: %s %s — adding to pending_close, escalating to FlattenAll",
+                    "Exit order timed out: %s %s — adding to pending_close",
                     request.side, request.ticker,
                 )
                 risk_state.pending_close.add(request.ticker)
                 if request.on_fill_failed is not None:
                     request.on_fill_failed()
                 asyncio.create_task(telegram.send_silent(
-                    f"EXIT TIMEOUT: {request.ticker} — escalating to FlattenAll"
+                    f"EXIT TIMEOUT: {request.ticker} — added to pending_close for retry"
                 ))
-                await _execute_flatten_all(ibkr, risk_state, telegram,
-                                           f"exit_timeout_{request.ticker}", session_clock)
             else:
                 log.warning("Entry order timed out: %s %s — skipping",
                             request.side, request.ticker)
@@ -165,16 +169,15 @@ async def _execute_flatten_all(
         log.info("FLATTEN ALL: no open positions tracked")
         return
 
-    filled_count = 0
-    deferred_tickers = []
+    filled_count_box = [0]
+    deferred_tickers: list[str] = []
+    session_date = session_clock.date
 
-    for ticker, pos in positions:
+    async def _submit_one(ticker: str, pos: dict) -> None:
         qty = pos["qty"]
         avg_cost = pos.get("avg_cost", 0.0)
         bkt = _bkt_now()
 
-        # Aggressive limit: bid - offset if we have a quote; 50% of avg_cost
-        # otherwise (more aggressive than the normal 70% because we MUST get out).
         bid, _ask = await ibkr.snapshot_quote(ticker)
         if bid > 0:
             limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
@@ -205,31 +208,113 @@ async def _execute_flatten_all(
                 ticker, fails,
             )
             if fails == 3:
-                asyncio.create_task(telegram.send_silent(
+                await telegram.send_silent(
                     f"FLATTEN {ticker}: {fails} consecutive timeouts — likely illiquid "
                     f"or halted. Switching to 5-min retry. May need manual close at RTH."
-                ))
+                )
         else:
             pool = get_pool()
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    order_id = await _write_order(conn, fill, session_clock.date)
-                    await _update_position(conn, fill, order_id, session_clock.date)
+                    order_id = await _write_order(conn, fill, session_date)
+                    await _update_position(conn, fill, order_id, session_date)
             risk_state.record_fill(
                 fill.ticker, fill.side, fill.qty, fill.fill_price,
                 filled_qty=fill.filled_qty,
             )
             risk_state.pending_close.discard(fill.ticker)
             risk_state.pending_close_failures.pop(fill.ticker, None)
-            filled_count += 1
+            filled_count_box[0] += 1
             log.critical("FLATTEN ALL: %s filled %d @ %.4f", ticker, fill.filled_qty, fill.fill_price)
             _notify_fill(telegram, fill, risk_state)
 
-    summary = f"FLATTEN ALL complete — {filled_count}/{len(positions)} filled"
+    await asyncio.gather(*[_submit_one(t, p) for t, p in positions])
+
+    summary = f"FLATTEN ALL complete — {filled_count_box[0]}/{len(positions)} filled"
     if deferred_tickers:
         summary += f", deferred: {deferred_tickers}"
     log.critical(summary)
     asyncio.create_task(telegram.send_silent(summary))
+
+
+async def _execute_flatten_ticker(
+    ticker: str,
+    ibkr: IBKRClient,
+    risk_state: RiskState,
+    telegram,
+    reason: str,
+    session_date: date,
+) -> None:
+    """Close a single ticker position. Does not touch other open positions."""
+    from live.feed import market_status
+
+    log.critical("FLATTEN TICKER: %s reason=%s", ticker, reason)
+    await telegram.send_silent(f"CRITICAL: FLATTEN {ticker} triggered — {reason}")
+
+    if not market_status.is_tradable_now():
+        risk_state.pending_close.add(ticker)
+        log.warning("FLATTEN TICKER: %s market closed — deferred to pending_close", ticker)
+        await telegram.send_silent(
+            f"FLATTEN {ticker}: market closed — deferred to pending_close"
+        )
+        return
+
+    pos = risk_state.open_positions.get(ticker)
+    if pos is None:
+        log.info("FLATTEN TICKER: %s — no open position tracked", ticker)
+        return
+
+    qty = pos["qty"]
+    avg_cost = pos.get("avg_cost", 0.0)
+    bkt = _bkt_now()
+
+    bid, _ask = await ibkr.snapshot_quote(ticker)
+    if bid > 0:
+        limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
+    else:
+        limit_price = round(max(0.01, avg_cost * 0.50), 2)
+
+    req = OrderRequest(
+        ticker=ticker,
+        side="SELL",
+        qty=qty,
+        session_bucket=bkt,
+        is_entry=False,
+        exit_reason=reason,
+        limit_price=limit_price,
+        intraday_pct=0.0,
+        expected_price=limit_price,
+    )
+
+    fill: Optional[Fill] = await ibkr.submit(req)
+
+    if fill is None:
+        fails = risk_state.pending_close_failures.get(ticker, 0) + 1
+        risk_state.pending_close_failures[ticker] = fails
+        risk_state.pending_close.add(ticker)
+        log.critical(
+            "FLATTEN TICKER: %s — no fill within timeout (attempt %d), adding to pending_close",
+            ticker, fails,
+        )
+        if fails == 3:
+            await telegram.send_silent(
+                f"FLATTEN {ticker}: {fails} consecutive timeouts — likely illiquid "
+                f"or halted. Switching to 5-min retry. May need manual close at RTH."
+            )
+    else:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                order_id = await _write_order(conn, fill, session_date)
+                await _update_position(conn, fill, order_id, session_date)
+        risk_state.record_fill(
+            fill.ticker, fill.side, fill.qty, fill.fill_price,
+            filled_qty=fill.filled_qty,
+        )
+        risk_state.pending_close.discard(ticker)
+        risk_state.pending_close_failures.pop(ticker, None)
+        log.critical("FLATTEN TICKER: %s filled %d @ %.4f", ticker, fill.filled_qty, fill.fill_price)
+        _notify_fill(telegram, fill, risk_state)
 
 
 def _to_ns(dt) -> int:
@@ -366,7 +451,7 @@ async def pending_close_monitor(
     Open-order aware: if IBKR already has a live sell order sitting for a
     ticker (e.g. from a previous flatten attempt on an illiquid stock),
     we leave it alone — no cancel-and-replace, no order accumulation.
-    We only re-queue FlattenAll when the position is open AND there is no
+    We only re-queue FlattenTicker when the position is open AND there is no
     existing order already working it.
     """
     from live.feed import market_status
@@ -402,17 +487,19 @@ async def pending_close_monitor(
             _last_attempt[ticker] = now
 
             if failures < _BACKOFF_THRESHOLD:
-                log.critical("pending_close: %s open, no live order — re-queuing FlattenAll", ticker)
+                log.critical("pending_close: %s open, no live order — re-queuing FlattenTicker", ticker)
                 asyncio.create_task(
-                    telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenAll")
+                    telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenTicker")
                 )
             else:
                 log.warning(
-                    "pending_close: %s open, attempt %d (5-min backoff) — re-queuing FlattenAll",
+                    "pending_close: %s open, attempt %d (5-min backoff) — re-queuing FlattenTicker",
                     ticker, failures + 1,
                 )
 
-            order_queue.put_nowait(FlattenAllRequest(reason=f"pending_close_retry_{ticker}"))
+            order_queue.put_nowait(
+                FlattenTickerRequest(ticker=ticker, reason=f"pending_close_retry_{ticker}")
+            )
 
 
 async def hourly_pnl_alert(

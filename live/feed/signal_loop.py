@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 from live.config import CFG
 from live.feed.context import TickerContext
-from live.orders.risk import FlattenAllRequest, OrderRequest, RiskState
+from live.orders.risk import FlattenAllRequest, FlattenTickerRequest, OrderRequest, RiskState
 from live.signals.live_state import SignalResult
 
 log = logging.getLogger(__name__)
@@ -204,7 +204,9 @@ async def heartbeat_monitor(
         for ticker in stale:
             if risk_state.has_position(ticker):
                 log.critical(
-                    "DEAD MAN'S SWITCH: no heartbeat for %s in %ds with open position — flattening",
+                    "DEAD MAN'S SWITCH: no heartbeat for %s in %ds with open position — flattening ticker only",
                     ticker, CFG.risk.dead_man_timeout_s,
                 )
-                order_queue.put_nowait(FlattenAllRequest(reason="dead_mans_switch"))
+                order_queue.put_nowait(
+                    FlattenTickerRequest(ticker=ticker, reason="dead_mans_switch")
+                )

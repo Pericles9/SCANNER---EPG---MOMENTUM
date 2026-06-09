@@ -304,7 +304,8 @@ These were identified in research but are not active:
 | Pre-market — no quote > 30s | Soft halt. Pause processing. Do not force-exit. |
 | Queue full | `put_nowait` drops tick. Log WARNING. Bounded by design. |
 | Open positions on startup | Crash recovery runs. Flattens all before trading begins. |
-| Dead man's switch | No heartbeat > 30s during open position → flatten all immediately. |
+| Dead man's switch | [SUPERSEDED — see build_log.md 2026-06-08] No heartbeat > 30s during open position → flatten all immediately. |
+| Dead man's switch | No heartbeat >30s for ticker X with open position → FlattenTickerRequest for X only. FlattenAllRequest reserved for kill switch, daily loss auto-kill, and WS disconnect (60s) only. |
 | Unfilled limit order | Cancel after 5s. Do not chase. Do not resubmit. |
 | `dv=0` in setup filter | `τ_t = μ_τ(t-1)` — handled in `setup_filter.py`. Do not add logic. |
 

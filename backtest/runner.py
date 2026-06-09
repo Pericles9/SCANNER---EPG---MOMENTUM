@@ -163,6 +163,10 @@ def _hawkes_replay_with_refit(
     E_out: np.ndarray,
     Edot_out: np.ndarray,
     n_base_out: np.ndarray,
+    dv_arr=None,
+    mu_buy_out=None,
+    mu_sell_out=None,
+    dbar_out=None,
     cold_start_size: int = COLD_START_SIZE,
     refit_interval: int = REFIT_INTERVAL,
     window_size: int = REFIT_WINDOW,
@@ -185,6 +189,12 @@ def _hawkes_replay_with_refit(
         )
         _nb = (init_params["alpha_buy_self"] + init_params["alpha_sell_self"]) / beta_fixed
         n_base_out[:] = _nb
+        if mu_buy_out is not None:
+            mu_buy_out[:] = init_params["mu_buy"]
+        if mu_sell_out is not None:
+            mu_sell_out[:] = init_params["mu_sell"]
+        if dbar_out is not None and dv_arr is not None and N > 0:
+            dbar_out[:] = float(np.mean(dv_arr))
         return None
 
     init_arr = np.array([
@@ -244,6 +254,17 @@ def _hawkes_replay_with_refit(
         if mu_total < 1e-10:
             mu_total = 1e-10
         chunk_n_base = (params.alpha_buy_self + params.alpha_sell_self) / params.beta
+
+        if mu_buy_out is not None:
+            mu_buy_out[c_start:c_end] = params.mu_buy
+        if mu_sell_out is not None:
+            mu_sell_out[c_start:c_end] = params.mu_sell
+        if dbar_out is not None and dv_arr is not None:
+            if chunk_idx == 0:
+                _dw = dv_arr[:c_end]
+            else:
+                _dw = dv_arr[max(0, c_end - window_size):c_end]
+            dbar_out[c_start:c_end] = float(np.mean(_dw)) if len(_dw) > 0 else 0.0
 
         for i in range(c_start, c_end):
             n_base_out[i] = chunk_n_base
@@ -368,6 +389,10 @@ def _process_event(args: dict) -> dict:
     watermark_threshold = args.get("watermark_threshold", None)
     cvd_filter_enabled = args.get("cvd_filter_enabled", False)
     intra_window_watermark_threshold = args.get("intra_window_watermark_threshold", None)
+    epg_cfg = args.get("epg_cfg", {})
+    gate_mode = epg_cfg.get("gate_mode", "peak")
+    epg_tau_peak = epg_cfg.get("tau_peak", 600.0)
+    epg_C = epg_cfg.get("C", 2.0)
 
     base = {"ticker": ticker, "date": date, "event_idx": event_idx}
 
@@ -419,6 +444,13 @@ def _process_event(args: dict) -> dict:
         E_out = np.zeros(N, dtype=np.float64)
         Edot_out = np.zeros(N, dtype=np.float64)
         n_base_out = np.zeros(N, dtype=np.float64)
+        dv_arr = td.prices.astype(np.float64) * td.sizes.astype(np.float64)
+        if gate_mode == "background":
+            mu_buy_out_arr = np.zeros(N, dtype=np.float64)
+            mu_sell_out_arr = np.zeros(N, dtype=np.float64)
+            dbar_out_arr = np.zeros(N, dtype=np.float64)
+        else:
+            mu_buy_out_arr = mu_sell_out_arr = dbar_out_arr = None
 
         global_lambda_ref = fp["mu_buy"] + fp["mu_sell"]
         per_event_lref = compute_lambda_ref_per_event(ticker, date)
@@ -433,6 +465,9 @@ def _process_event(args: dict) -> dict:
             init_params=fp, rho_E=rho_E,
             lam_buy_out=lam_buy_out, lam_sell_out=lam_sell_out,
             E_out=E_out, Edot_out=Edot_out, n_base_out=n_base_out,
+            dv_arr=dv_arr,
+            mu_buy_out=mu_buy_out_arr, mu_sell_out=mu_sell_out_arr,
+            dbar_out=dbar_out_arr,
         )
         lambda_hat = lam_buy_out + lam_sell_out
 
@@ -447,6 +482,9 @@ def _process_event(args: dict) -> dict:
             half_life_seconds=EPG_TAU,
             peak_threshold_p=EPG_P,
             warmup_seconds=EPG_WARMUP,
+            gate_mode=gate_mode,
+            tau_peak=epg_tau_peak,
+            C=epg_C,
         )
 
         epg_states = [GateState.INACTIVE] * N
@@ -459,7 +497,17 @@ def _process_event(args: dict) -> dict:
                 t_event_fired = True
                 t_event_idx = i
             dv = float(td.prices[i]) * float(td.sizes[i])
-            epg_states[i] = gate.update(dv, td.t_sec[i])
+            if gate_mode == "background":
+                epg_states[i] = gate.update(
+                    dv, td.t_sec[i],
+                    mu_buy=mu_buy_out_arr[i],
+                    mu_sell=mu_sell_out_arr[i],
+                    lambda_buy=lam_buy_out[i],
+                    lambda_sell=lam_sell_out[i],
+                    dbar=dbar_out_arr[i],
+                )
+            else:
+                epg_states[i] = gate.update(dv, td.t_sec[i])
 
         if not t_event_fired:
             return {**base, "status": "skipped", "reason": "no_t_event",
@@ -1498,6 +1546,7 @@ def main():
             "watermark_threshold": watermark_threshold,
             "cvd_filter_enabled": cvd_filter_enabled,
             "intra_window_watermark_threshold": intra_window_watermark_threshold,
+            "epg_cfg": phase_cfg.get("epg", {}),
         })
 
     log.info(
