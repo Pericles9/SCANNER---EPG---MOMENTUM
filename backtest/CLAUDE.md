@@ -49,6 +49,9 @@ Inherited from the parent project — apply here without exception:
 | Phase EPG-OPT2-SF | **Complete** | SF integration test. Net negative: mean delta_pf = −0.085. 47/52 configs hurt. |
 | Live SlopeGate swap | **Deployed (heuristic)** | Live EPG core: ParticipationGate → SlopeGate F_ss (s3_fss_t180_l30_ko5_kc0). EXIT_D+LULD disabled live. |
 | Phase WJI-SlowEMA | **Parked (T3b escalation)** | Slow EMA of WJI as gate reference. All 25 configs fail CVaR5 ≥ −10% (best −16.79%). Root cause: EMA chases signal down during deceleration — late exits, deep tails. T4/T5/T7 blocked. TBD whether to retry or abandon. |
+| Phase CPD-0 — PELT calibration | **Complete (Gate-1 approved)** | Log-ratio WJI_log=log(WJI) (background≡1.0); active-seconds axis. Symmetry OK (skew +0.227), σ_log median 0.209. See `results/phase_cpd/cpd0/`. |
+| Phase CPD-1 — CUSUM gate | **HARD STOP (T6c)** | `gate_mode="cusum"` added (13/13 tests). 28-config sweep: all fail CVaR5≥−10% (best −30.55%, k12_h8). PF/EV positive everywhere; tails from slow gate-close exit through regime collapse. See `results/phase_cpd/cpd1/`. |
+| Phase CPD-DIAG — k12_h8 charts | **Complete** | 15 diagnostic charts (seed=7). 6/15 zero-trade, 2/15 tail events drive the −30% CVaR5. Diagnostic only. See `results/phase_cpd_diag/`. |
 
 **What's next:** Phase H requires explicit approval before any implementation. **Phase G v1/v2 findings (rank gate, heat gate, quartile gate, multi-day runner) are analysis-only and NOT actionable** — the quartile boundary in particular looks good theoretically but breaks down in practice. Do not implement any of these from Phase G without a dedicated validation phase. SlopeGate F_ss is active live but has no backtest validation — the backtest still uses ParticipationGate.
 
