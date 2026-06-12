@@ -25,6 +25,8 @@ import logging
 import math
 from typing import Optional
 
+import numpy as np
+
 
 log = logging.getLogger(__name__)
 LN2 = math.log(2)
@@ -59,6 +61,11 @@ class ParticipationGate:
         k: float = 1.0,
         h: float = 4.0,
         sigma_log_fallback: float = 0.209,
+        lambda_h: float = 0.01,
+        p_enter: float = 0.80,
+        prior_mean_std: float = 1.0,
+        dir_thresh_mult: float = 1.0,
+        max_run_length: int = 600,
     ):
         """
         Parameters
@@ -100,8 +107,10 @@ class ParticipationGate:
             raise ValueError(f"p_close must be in (0, 1], got {_p_close}")
         if _p_close > _p_open:
             raise ValueError(f"p_close ({_p_close}) must be <= p_open ({_p_open})")
-        if gate_mode not in ("peak", "background", "cusum"):
-            raise ValueError(f"gate_mode must be 'peak', 'background' or 'cusum', got {gate_mode!r}")
+        if gate_mode not in ("peak", "background", "cusum", "bocpd"):
+            raise ValueError(
+                f"gate_mode must be 'peak', 'background', 'cusum' or 'bocpd', got {gate_mode!r}"
+            )
         if tau_peak <= 0:
             raise ValueError(f"tau_peak must be positive, got {tau_peak}")
         if C <= 0:
@@ -115,6 +124,20 @@ class ParticipationGate:
                 raise ValueError(f"cusum h must be positive, got {h}")
             if sigma_log_fallback <= 0:
                 raise ValueError(f"cusum sigma_log_fallback must be positive, got {sigma_log_fallback}")
+        if gate_mode == "bocpd":
+            if not (0.0 < lambda_h < 1.0):
+                raise ValueError(f"bocpd lambda_h must be in (0, 1), got {lambda_h}")
+            # p_exit = p_enter - 0.10 (fixed hysteresis gap); require p_exit > 0.
+            if not (0.10 < p_enter <= 1.0):
+                raise ValueError(f"bocpd p_enter must be in (0.10, 1.0], got {p_enter}")
+            if prior_mean_std <= 0:
+                raise ValueError(f"bocpd prior_mean_std must be positive, got {prior_mean_std}")
+            if dir_thresh_mult < 0:
+                raise ValueError(f"bocpd dir_thresh_mult must be >= 0, got {dir_thresh_mult}")
+            if max_run_length < 1:
+                raise ValueError(f"bocpd max_run_length must be >= 1, got {max_run_length}")
+            if sigma_log_fallback <= 0:
+                raise ValueError(f"bocpd sigma_log_fallback must be positive, got {sigma_log_fallback}")
 
         self.half_life = half_life_seconds
         self.peak_threshold_p = peak_threshold_p
@@ -130,6 +153,15 @@ class ParticipationGate:
         self.k = k
         self.h = h
         self.sigma_log_fallback = sigma_log_fallback
+        # BOCPD params (gate_mode="bocpd"). lambda_h / p_enter are the 2 swept knobs;
+        # the rest are fixed, documented model constants (NOT tuned). p_exit is derived
+        # from p_enter with a hard-coded 0.10 hysteresis gap.
+        self.lambda_h = lambda_h
+        self.p_enter = p_enter
+        self.p_exit = p_enter - 0.10
+        self.prior_mean_std = prior_mean_std      # sigma0: prior std on a run's mean (WJI_log units)
+        self.dir_thresh_mult = dir_thresh_mult    # kappa_dir: surge threshold = kappa_dir * sigma_log
+        self.max_run_length = int(max_run_length)
 
         # Precompute decay constant: ln2 / tau
         self._decay_rate = LN2 / half_life_seconds
@@ -167,6 +199,19 @@ class ParticipationGate:
         self._sigma_finalized: bool = False
         self._last_cusum_debug: dict = {}
 
+        # BOCPD mode state (gate_mode="bocpd"). Run-length posterior + per-run-length
+        # sufficient statistics for a Normal-Normal (known variance sigma_log^2, unknown
+        # run mean, prior mean 0) conjugate model. Reuses the cusum warmup-sigma machinery
+        # (_warmup_logs / _sigma_log / _sigma_finalized). R/count/sum are allocated at
+        # warmup exit. See _update_bocpd for the full algorithm + directional P_regime.
+        self._bo_R: Optional[np.ndarray] = None       # run-length posterior (normalized)
+        self._bo_count: Optional[np.ndarray] = None    # obs count per run-length hypothesis
+        self._bo_sum: Optional[np.ndarray] = None      # sum of WJI_log per run-length hypothesis
+        self._bo_len: int = 0                          # number of valid hypotheses (0..len-1)
+        self._bo_initialized: bool = False
+        self._p_regime: float = 0.0
+        self._last_bocpd_debug: dict = {}
+
     @property
     def last_bg_debug(self) -> dict:
         """Internal WJI state from the most recent background-mode update()."""
@@ -186,6 +231,23 @@ class ParticipationGate:
     def last_cusum_debug(self) -> dict:
         """Internal CUSUM state from the most recent cusum-mode update() (for charts)."""
         return self._last_cusum_debug
+
+    @property
+    def p_regime(self) -> float:
+        """Directional surge-regime probability from the latest bocpd update (0 before activation)."""
+        return self._p_regime
+
+    @property
+    def bocpd_R(self) -> Optional[np.ndarray]:
+        """Current BOCPD run-length posterior (copy), or None before warmup exit (for charts)."""
+        if self._bo_R is None or self._bo_len == 0:
+            return None
+        return self._bo_R[: self._bo_len].copy()
+
+    @property
+    def last_bocpd_debug(self) -> dict:
+        """Internal BOCPD state from the most recent bocpd-mode update() (for charts)."""
+        return self._last_bocpd_debug
 
     @property
     def lambda_v(self) -> float:
@@ -268,6 +330,14 @@ class ParticipationGate:
         self._warmup_logs = []
         self._sigma_finalized = False
         self._last_cusum_debug = {}
+        # BOCPD state resets only here (event start) — never between PASS/FAIL cycles.
+        self._bo_R = None
+        self._bo_count = None
+        self._bo_sum = None
+        self._bo_len = 0
+        self._bo_initialized = False
+        self._p_regime = 0.0
+        self._last_bocpd_debug = {}
 
     def update(
         self,
@@ -318,6 +388,11 @@ class ParticipationGate:
         # Branches early: does not touch the λ_V / peak / background machinery below.
         if self.gate_mode == "cusum":
             return self._update_cusum(wji, wji_background, timestamp, is_halted)
+
+        # ── BOCPD mode (gate_mode="bocpd") ──
+        # Same early branch: consumes the pre-computed (locked) WJI / WJI_background.
+        if self.gate_mode == "bocpd":
+            return self._update_bocpd(wji, wji_background, timestamp, is_halted)
 
         # Compute dt and decay
         dt = timestamp - self._last_timestamp
@@ -535,6 +610,203 @@ class ParticipationGate:
         }
         return GateState.PASS if self._in_pass else GateState.FAIL
 
+    def _update_bocpd(
+        self,
+        wji: Optional[float],
+        wji_background: float,
+        timestamp: float,
+        is_halted: bool,
+    ) -> GateState:
+        """
+        Directional surge-aware Bayesian Online Changepoint Detection (Phase CPD-BOCPD).
+
+        Operates on WJI_log(t) = log(WJI / WJI_background) (Option A: WJI_background ≡ 1.0,
+        so WJI_log = log(WJI), resting at ≈ 0 = the H0 background mean).
+
+        Model (standard Adams & MacKay 2007 with a Normal-Normal conjugate UPM):
+            observations  x_t ~ N(mu_run, sigma_log^2)     sigma_log^2 KNOWN (per-event warmup)
+            run mean      mu_run ~ N(0, prior_mean_std^2)   conjugate prior, mean 0 (= H0)
+        Each run-length hypothesis r tracks sufficient stats (count_r, sum_r) over the r
+        observations in that run. Posterior over its mean:
+            denom_r   = 1/prior_mean_std^2 + count_r / sigma_log^2
+            mu_post_r = (sum_r / sigma_log^2) / denom_r        # prior mean 0
+            var_post_r= 1 / denom_r
+        and the posterior predictive for the new x_t is N(mu_post_r, sigma_log^2 + var_post_r).
+        This run-length dependence is what makes the posterior informative (the literal CPD-
+        BOCPD spec used a run-length-INDEPENDENT predictive, which is degenerate — see the
+        phase findings; Cooper approved this directional fix).
+
+        Recursion per post-warmup tick (Adams-MacKay message passing):
+            msg[r]   = R[r] * pred[r]
+            R_new[0] = lambda_h * sum_r msg[r]                 # changepoint at t
+            R_new[r+1] = (1 - lambda_h) * msg[r]               # run grows (absorbs x_t)
+            R_new /= sum(R_new)
+        Sufficient stats grow with the run: (count, sum) for run r -> r+1 become
+        (count_r + 1, sum_r + x_t); the fresh run length 0 starts at (0, 0).
+
+        Directional regime score (Cooper Option 2 — surge-aware, mirrors CPD-1's one-sided
+        CUSUM):
+            P_regime(t) = sum_{r>0} R_new[r] * 1[ mu_post_r(new) > dir_thresh ]
+            dir_thresh  = dir_thresh_mult * sigma_log
+        i.e. only run-length mass whose posterior mean is ELEVATED (an ongoing *up* regime)
+        counts. Background runs (mu_post ≈ 0) and the changepoint bin (r=0) contribute 0, so
+        the gate is long-only directional, unlike a vanilla non-directional BOCPD.
+
+        Gate state (fixed 0.10 hysteresis gap, p_exit = p_enter - 0.10):
+            PASS  when  P_regime >= p_enter
+            FAIL  when  P_regime <  p_exit
+            hold        p_exit <= P_regime < p_enter
+
+        Run-length cap: arrays are capped at max_run_length (default 600). On overflow the
+        mass that would land at run length (cap+1) is folded back into the cap bin; the cap
+        bin keeps its own sufficient stats (a single absorbing long-run) — an approximation
+        whose error is negligible because by run length 600 the posterior mean has long
+        converged. sigma_log estimation reuses the cusum warmup machinery exactly.
+
+        Halt handling: a halted tick freezes the posterior (R/count/sum untouched) and
+        returns the prior state. On resume the next tick updates normally.
+        """
+        # Halt guard: freeze the posterior across a halt (belt-and-braces for raw-axis
+        # callers; on the active-seconds axis halt ticks are already removed).
+        if is_halted:
+            return GateState.PASS if self._in_pass else GateState.FAIL
+
+        time_since_event = timestamp - self._t_event
+
+        # Pre-event ticks must NOT enter the warmup sigma sample.
+        if time_since_event < 0.0:
+            return GateState.WARMUP
+
+        # Undefined-log guard: contribute nothing, hold prior state.
+        if wji is None or wji <= 0.0 or wji_background <= 0.0:
+            if time_since_event < self.warmup_seconds:
+                return GateState.WARMUP
+            return GateState.PASS if self._in_pass else GateState.FAIL
+
+        wji_log = math.log(wji / wji_background)
+
+        # ── WARMUP: collect log-ratios for sigma_log; gate cannot open ──
+        if time_since_event < self.warmup_seconds:
+            self._warmup_logs.append(wji_log)
+            return GateState.WARMUP
+
+        # ── Warmup exit: finalise sigma_log once, then seed the posterior ──
+        if not self._sigma_finalized:
+            n = len(self._warmup_logs)
+            if n >= 20:
+                mean = sum(self._warmup_logs) / n
+                var = sum((v - mean) ** 2 for v in self._warmup_logs) / (n - 1)
+                sigma = math.sqrt(var) if var > 0.0 else 0.0
+                self._sigma_log = sigma if sigma > 0.0 else self.sigma_log_fallback
+            else:
+                self._sigma_log = self.sigma_log_fallback
+                log.info(
+                    "bocpd: warmup n=%d < 20 obs; using sigma_log fallback=%.4f",
+                    n, self.sigma_log_fallback,
+                )
+            self._sigma_finalized = True
+
+        if not self._bo_initialized:
+            # R = [1.0] at run length 0 (a potential changepoint boundary entering the
+            # active window); sufficient stats empty (prior only).
+            self._bo_R = np.array([1.0], dtype=np.float64)
+            self._bo_count = np.array([0.0], dtype=np.float64)
+            self._bo_sum = np.array([0.0], dtype=np.float64)
+            self._bo_len = 1
+            self._bo_initialized = True
+
+        sigma2 = self._sigma_log * self._sigma_log
+        inv_s0_2 = 1.0 / (self.prior_mean_std * self.prior_mean_std)
+        lh = self.lambda_h
+        cap1 = self.max_run_length + 1   # max array length (run lengths 0..max_run_length)
+
+        L = self._bo_len
+        R = self._bo_R[:L]
+        cnt = self._bo_count[:L]
+        sm = self._bo_sum[:L]
+
+        # Predictive of x_t under each current run-length hypothesis (uses the r prior
+        # observations already absorbed into that run; r=0 = prior predictive).
+        denom = inv_s0_2 + cnt / sigma2
+        mu_post = (sm / sigma2) / denom
+        pred_var = sigma2 + 1.0 / denom
+        pred = np.exp(-0.5 * (wji_log - mu_post) ** 2 / pred_var) / np.sqrt(2.0 * math.pi * pred_var)
+
+        msg = R * pred
+        total = float(msg.sum())
+        if not math.isfinite(total) or total <= 0.0:
+            # Numerical underflow (x_t implausible under every hypothesis): freeze and hold.
+            self._last_bocpd_debug = {
+                "wji": wji, "wji_background": wji_background, "wji_log": wji_log,
+                "sigma_log": self._sigma_log, "p_regime": self._p_regime,
+                "p_enter": self.p_enter, "p_exit": self.p_exit,
+                "r0": float(self._bo_R[0]) if self._bo_R is not None else None,
+                "underflow": True, "in_pass": self._in_pass,
+            }
+            return GateState.PASS if self._in_pass else GateState.FAIL
+
+        cp = lh * total                 # changepoint mass -> new run length 0
+        growth = (1.0 - lh) * msg       # run r -> r+1 (absorbs x_t)
+
+        if L < cap1:
+            new_len = L + 1
+            R_new = np.empty(new_len, dtype=np.float64)
+            cnt_new = np.empty(new_len, dtype=np.float64)
+            sm_new = np.empty(new_len, dtype=np.float64)
+            R_new[0] = cp
+            R_new[1:] = growth
+            cnt_new[0] = 0.0
+            cnt_new[1:] = cnt + 1.0
+            sm_new[0] = 0.0
+            sm_new[1:] = sm + wji_log
+        else:
+            # At the cap: growth would push old index cap -> cap+1. Fold it into the cap
+            # bin (mass preserved). The cap bin keeps its own absorbing-run stats + x_t.
+            new_len = cap1
+            R_new = np.empty(new_len, dtype=np.float64)
+            cnt_new = np.empty(new_len, dtype=np.float64)
+            sm_new = np.empty(new_len, dtype=np.float64)
+            R_new[0] = cp
+            R_new[1:cap1 - 1] = growth[0:cap1 - 2]
+            R_new[cap1 - 1] = growth[cap1 - 2] + growth[cap1 - 1]   # fold cap and cap+1
+            cnt_new[0] = 0.0
+            cnt_new[1:cap1 - 1] = cnt[0:cap1 - 2] + 1.0
+            cnt_new[cap1 - 1] = cnt[cap1 - 1] + 1.0
+            sm_new[0] = 0.0
+            sm_new[1:cap1 - 1] = sm[0:cap1 - 2] + wji_log
+            sm_new[cap1 - 1] = sm[cap1 - 1] + wji_log
+
+        R_new /= total   # cp + sum(growth) == total (folding preserves the sum)
+
+        # Directional surge-aware regime score on the UPDATED sufficient stats.
+        dir_thresh = self.dir_thresh_mult * self._sigma_log
+        denom_new = inv_s0_2 + cnt_new / sigma2
+        mu_post_new = (sm_new / sigma2) / denom_new
+        elevated = mu_post_new > dir_thresh
+        # Exclude run length 0 (changepoint bin) per the directional spec.
+        p_regime = float(np.dot(R_new[1:], elevated[1:].astype(np.float64)))
+
+        self._bo_R = R_new
+        self._bo_count = cnt_new
+        self._bo_sum = sm_new
+        self._bo_len = new_len
+        self._p_regime = p_regime
+
+        # State transition (hysteresis band p_exit <= P_regime < p_enter holds prior state).
+        if p_regime >= self.p_enter:
+            self._in_pass = True
+        elif p_regime < self.p_exit:
+            self._in_pass = False
+
+        self._last_bocpd_debug = {
+            "wji": wji, "wji_background": wji_background, "wji_log": wji_log,
+            "sigma_log": self._sigma_log, "p_regime": p_regime,
+            "p_enter": self.p_enter, "p_exit": self.p_exit,
+            "r0": float(R_new[0]), "run_len_mode": int(np.argmax(R_new)),
+            "dir_thresh": dir_thresh, "in_pass": self._in_pass,
+        }
+        return GateState.PASS if self._in_pass else GateState.FAIL
+
     def reset(self) -> None:
         """
         Reset for continuation events or new session.
@@ -564,3 +836,10 @@ class ParticipationGate:
         self._warmup_logs = []
         self._sigma_finalized = False
         self._last_cusum_debug = {}
+        self._bo_R = None
+        self._bo_count = None
+        self._bo_sum = None
+        self._bo_len = 0
+        self._bo_initialized = False
+        self._p_regime = 0.0
+        self._last_bocpd_debug = {}
