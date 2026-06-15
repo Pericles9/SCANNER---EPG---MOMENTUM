@@ -130,9 +130,25 @@ class TelegramConfig:
 
 
 @dataclass
+class StrategyConfig:
+    active_strategy: str  # "epg" | "scanner_vwap"
+
+
+@dataclass
+class ScannerVwapConfig:
+    setup_filter_gate: bool
+    vwap_anchor: str          # "per_bucket" | "rth_only"
+    hard_stop_pct: float
+    one_shot_per_session: bool
+    skip_hawkes: bool
+
+
+@dataclass
 class Config:
     strategy_id: str
     display_name: str
+    strategy: StrategyConfig
+    scanner_vwap: ScannerVwapConfig
     scanner: ScannerConfig
     context_fetch: ContextFetchConfig
     hawkes: HawkesConfig
@@ -174,6 +190,24 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
             "Fill from backtest calibration results before running live."
         )
 
+    # Strategy selection + auto-derived identity.
+    _STRATEGY_ID_MAP = {
+        "epg": "epg_v1",
+        "scanner_vwap": "scanner_vwap",
+    }
+    _DISPLAY_NAME_MAP = {
+        "epg": "EPG — Event Participation Gate",
+        "scanner_vwap": "Scanner × VWAP v1",
+    }
+    strat_block = raw.get("strategy", {})
+    active_strategy = strat_block.get("active_strategy", "epg")
+    if active_strategy not in _STRATEGY_ID_MAP:
+        raise RuntimeError(
+            f"strategy.active_strategy must be 'epg' or 'scanner_vwap', got {active_strategy!r}."
+        )
+    strategy_id = _STRATEGY_ID_MAP[active_strategy]
+    display_name = _DISPLAY_NAME_MAP[active_strategy]
+
     # EPG gate validation.
     eg = raw.get("epg_gate")
     if eg is None:
@@ -199,10 +233,21 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
 
     cf = raw["context_fetch"]
     ft = cf["fallback_tiers"]
+    sv = raw.get("scanner_vwap", {})
 
     return Config(
-        strategy_id=raw["strategy_id"],
-        display_name=raw["display_name"],
+        strategy_id=strategy_id,
+        display_name=display_name,
+        strategy=StrategyConfig(
+            active_strategy=active_strategy,
+        ),
+        scanner_vwap=ScannerVwapConfig(
+            setup_filter_gate=sv.get("setup_filter_gate", True),
+            vwap_anchor=sv.get("vwap_anchor", "per_bucket"),
+            hard_stop_pct=sv.get("hard_stop_pct", 0.12),
+            one_shot_per_session=sv.get("one_shot_per_session", True),
+            skip_hawkes=sv.get("skip_hawkes", False),
+        ),
         scanner=ScannerConfig(
             gap_threshold=raw["scanner"]["gap_threshold"],
             poll_interval_s=raw["scanner"]["poll_interval_s"],

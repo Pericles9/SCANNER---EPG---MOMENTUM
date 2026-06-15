@@ -74,6 +74,7 @@ live/
 ├── signals/
 │   ├── __init__.py
 │   ├── live_state.py          ← LiveSignalState — SlopeGate, Hawkes, SF gate
+│   ├── scanner_vwap.py        ← VwapSignalState — VWAP bar-close strategy (scanner_vwap mode)
 │   └── context_fetch.py       ← cold-start context fetch + Hawkes + SlopeGate replay
 │
 ├── scanner_monitor.py         ← Process 1 (the live scanner — not scanner/monitor.py)
@@ -280,6 +281,10 @@ Runs before any trading begins. A crash == dead man's switch scenario: cancel al
 | Timestamps | All nanoseconds UTC throughout. No timezone assumptions in data layer. |
 | IBKR data | Execution quotes only. Not the primary feed. |
 | PDT Rule | Paper trading only until rule change. Do not remove paper trading constraints. |
+| `exit_reason` codes (scanner_vwap) | `vwap_close`, `hard_stop` — additive VARCHARs; no schema migration required. |
+| `signal_events.event_type` (scanner_vwap) | `VWAP_ARMED`, `VWAP_ENTRY`, `VWAP_EXIT`, `HARD_STOP` — additive; EPG fields NULL. |
+| `scanner_vwap` strategy registration | `id = 'scanner_vwap'` in `strategies` table — inserted idempotently in `init_db.sql`. |
+| `CFG.strategy_id` derivation | Auto-derived in `load_config()` from `active_strategy`: `"epg"` → `"epg_v1"`, `"scanner_vwap"` → `"scanner_vwap"`. |
 
 ---
 
@@ -319,7 +324,7 @@ These were identified in research but are not active:
 - EventAnchor fires **~30s before scanner trigger** — model is already mid-warmup at live handoff
 - SlopeGate lookback buffer: **30s**. Must be populated during replay, not built up from live ticks.
 - Phase G join rate: **94.6%**
-- Strategy ID: `"epg_v1"` — used in all strategy-tagged DB tables
+- Strategy ID: `"epg_v1"` (EPG mode) or `"scanner_vwap"` (scanner_vwap mode) — auto-derived at startup from `strategy.active_strategy`
 
 ---
 
@@ -338,4 +343,42 @@ DATA_ROOT=/data
 
 ---
 
-*Last updated: June 2026.*
+---
+
+## `scanner_vwap` Strategy (v1 — added June 2026)
+
+**Strategy selection is now config-driven.** Set `strategy.active_strategy` in `strategy.json` to either `"epg"` or `"scanner_vwap"`. Restart required. EPG is NOT removed; flipping back to `"epg"` produces zero behavioral diff.
+
+**Implementation:** `live/signals/scanner_vwap.py` — `VwapSignalState` class. Duck-typed to the same protocol as `LiveSignalState`; `signal_loop.py` is strategy-agnostic.
+
+**v1 parameters (HEURISTIC / UNVALIDATED — not backtested):**
+
+| Parameter | Value | Notes |
+|---|---|---|
+| `vwap_anchor` | `per_bucket` | VWAP resets at each session bucket boundary (pre-market → RTH). |
+| Entry | Bar-close strictly above VWAP | Requires `_armed=True` (SF gate or always-armed). |
+| Exit | Bar-close strictly below VWAP | `VWAP_CLOSE` signal. |
+| `hard_stop_pct` | 0.12 | Intra-bar crash backstop. Not the working stop. |
+| `one_shot_per_session` | true | After any exit: `session_done_callback` → `closed_today.add(ticker)` for the day. |
+| `setup_filter_gate` | true | SF gates arming. Same admission (1-bar, `q_tilde >= 0.65`) and removal (15 consecutive bars) as EPG. |
+| `skip_hawkes` | false | Context fetch runs Hawkes replay as-is. VwapSignalState ignores the Hawkes output. |
+
+**Open config forks (pending live validation):**
+- `setup_filter_gate`: true/false — is SF arming necessary for VWAP entry quality?
+- `vwap_anchor`: `"per_bucket"` vs `"rth_only"` — does including pre-market ticks in VWAP help or hurt?
+
+**One-shot session lockout mechanism:**
+- `VwapSignalState.record_exit()` → `_state="CLOSED"`
+- Next tick: `update_trade()` returns `SignalResult(disqualify=True, session_done=True)`
+- `signal_loop` routes `session_done=True` → `session_done_callback()`
+- `session_done_callback` in `universe.py`: `_closed_today.add(ticker)` then `remove_ticker(ticker, "vwap_exit")`
+- Scanner's next `_add_ticker()` finds ticker in `_closed_today` → blocked for the day
+
+**Do not implement without explicit approval:**
+- Multiple entries per session
+- Time-of-day filters on VWAP entry
+- Dynamic stop levels (ATR-based, etc.)
+
+---
+
+*Last updated: June 2026 — scanner_vwap v1 added.*

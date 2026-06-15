@@ -14,3 +14,8 @@ ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS account_equity_start      NUMERIC(12,2),
     ADD COLUMN IF NOT EXISTS theoretical_equity_start  NUMERIC(12,2),
     ADD COLUMN IF NOT EXISTS theoretical_equity_end    NUMERIC(12,2);
+
+-- Register scanner_vwap strategy (idempotent — safe on every startup)
+INSERT INTO strategies (id, display_name, active)
+VALUES ('scanner_vwap', 'Scanner × VWAP v1', TRUE)
+ON CONFLICT (id) DO NOTHING;

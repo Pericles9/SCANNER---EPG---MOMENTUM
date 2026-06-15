@@ -35,6 +35,7 @@ async def signal_loop(
     heartbeat: "HeartbeatMonitor",
     session_clock: "SessionClock",
     disqualify_callback=None,
+    session_done_callback=None,
 ) -> None:
     """Per-ticker asyncio task. Blocks until context fetch completes."""
     await ctx.state_ready.wait()
@@ -82,9 +83,14 @@ async def signal_loop(
             ))
 
         if result.disqualify:
-            log.info("%s: SF disqualified — removing from universe", ticker)
-            if disqualify_callback is not None:
-                await disqualify_callback()
+            if result.session_done:
+                log.info("%s: strategy session complete — removing from universe", ticker)
+                if session_done_callback is not None:
+                    await session_done_callback()
+            else:
+                log.info("%s: SF disqualified — removing from universe", ticker)
+                if disqualify_callback is not None:
+                    await disqualify_callback()
             return
 
         if result.order_signal:
@@ -146,7 +152,7 @@ def _build_order_request(
             expected_price=limit_price,
         )
 
-    if signal in ("EXIT_D", "LULD", "EPG_CLOSE"):
+    if signal in ("EXIT_D", "LULD", "EPG_CLOSE", "VWAP_CLOSE", "HARD_STOP"):
         bid = (
             ctx.signal_state.last_bid
             if ctx.signal_state.last_bid is not None

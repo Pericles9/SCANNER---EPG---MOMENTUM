@@ -3,15 +3,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-
-from live.signals.live_state import LiveSignalState
+from typing import Any
 
 
 @dataclass
 class TickerContext:
     ticker: str
     queue: asyncio.Queue              # bounded — put_nowait drops on full
-    signal_state: LiveSignalState
+    signal_state: Any                 # LiveSignalState or VwapSignalState (duck-typed)
     task: asyncio.Task
     state_ready: asyncio.Event        # set after context fetch completes
     scanner_context: dict             # scanner fields at trigger time

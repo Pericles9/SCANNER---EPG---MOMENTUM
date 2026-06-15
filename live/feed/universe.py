@@ -163,12 +163,34 @@ class UniverseManager:
             state_ready.set()
             return
 
-        live_state = LiveSignalState(
-            ticker=ticker,
-            ctx=ctx_result,
-            scanner_context=scanner_ctx,
-            session_date=self._clock.date,
-        )
+        # Strategy dispatch: instantiate the correct signal state for this session.
+        session_done_cb = None
+        if CFG.strategy.active_strategy == "scanner_vwap":
+            from live.signals.scanner_vwap import VwapSignalState
+            live_state = VwapSignalState(
+                ticker=ticker,
+                ctx=ctx_result,
+                scanner_context=scanner_ctx,
+                session_date=self._clock.date,
+                risk_state=self._risk_state,
+            )
+            log.info(
+                "%s: VWAP context seeded: armed=%s anchor=%s vwap=%.4f",
+                ticker, live_state._armed, CFG.scanner_vwap.vwap_anchor, live_state._last_vwap,
+            )
+
+            async def _vwap_session_done_callback() -> None:
+                self._closed_today.add(ticker)
+                await self.remove_ticker(ticker, "vwap_exit")
+
+            session_done_cb = _vwap_session_done_callback
+        else:
+            live_state = LiveSignalState(
+                ticker=ticker,
+                ctx=ctx_result,
+                scanner_context=scanner_ctx,
+                session_date=self._clock.date,
+            )
 
         # If resuming from an existing position (startup triage), mark the state
         # in_position so the signal loop dispatches to _check_exits, not _check_entry.
@@ -213,6 +235,7 @@ class UniverseManager:
                 heartbeat=self._heartbeat,
                 session_clock=self._clock,
                 disqualify_callback=_sf_disqualify_callback,
+                session_done_callback=session_done_cb,
             )
         )
 

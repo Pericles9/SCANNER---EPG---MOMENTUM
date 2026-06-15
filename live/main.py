@@ -155,19 +155,31 @@ async def main() -> None:
     _setup_logging()
     _check_numba_cache()
     log = logging.getLogger(__name__)
-    log.info("EPG live system starting — strategy_id=%s", CFG.strategy_id)
-    if CFG.epg_gate.variant == "participation_gate":
+    log.info(
+        "Live trading system starting — active_strategy=%s strategy_id=%s",
+        CFG.strategy.active_strategy, CFG.strategy_id,
+    )
+    if CFG.strategy.active_strategy == "scanner_vwap":
         log.info(
-            "EPG gate: participation_gate (half_life=%.0fs peak_threshold_p=%.2f warmup=%.0fs)",
-            CFG.epg.window_close_sec, CFG.epg.lambda_v_threshold, CFG.epg_gate.warmup_seconds,
+            "scanner_vwap params: setup_filter_gate=%s vwap_anchor=%s "
+            "hard_stop_pct=%.2f one_shot=%s skip_hawkes=%s [HEURISTIC/UNVALIDATED]",
+            CFG.scanner_vwap.setup_filter_gate, CFG.scanner_vwap.vwap_anchor,
+            CFG.scanner_vwap.hard_stop_pct, CFG.scanner_vwap.one_shot_per_session,
+            CFG.scanner_vwap.skip_hawkes,
         )
     else:
-        log.info(
-            "EPG gate: %s (mode=%s tau=%.0fs L=%.0fs k_open=%.2f k_close=%.2f warmup=%.0fs) "
-            "[HEURISTIC/UNVALIDATED]",
-            CFG.epg_gate.variant, CFG.epg_gate.mode, CFG.epg_gate.tau_sec, CFG.epg_gate.L_sec,
-            CFG.epg_gate.k_open, CFG.epg_gate.k_close, CFG.epg_gate.warmup_seconds,
-        )
+        if CFG.epg_gate.variant == "participation_gate":
+            log.info(
+                "EPG gate: participation_gate (half_life=%.0fs peak_threshold_p=%.2f warmup=%.0fs)",
+                CFG.epg.window_close_sec, CFG.epg.lambda_v_threshold, CFG.epg_gate.warmup_seconds,
+            )
+        else:
+            log.info(
+                "EPG gate: %s (mode=%s tau=%.0fs L=%.0fs k_open=%.2f k_close=%.2f warmup=%.0fs) "
+                "[HEURISTIC/UNVALIDATED]",
+                CFG.epg_gate.variant, CFG.epg_gate.mode, CFG.epg_gate.tau_sec, CFG.epg_gate.L_sec,
+                CFG.epg_gate.k_open, CFG.epg_gate.k_close, CFG.epg_gate.warmup_seconds,
+            )
     log.info(
         "Setup filter is the entry gate: q_threshold=%.2f admission_bars=%d removal_bars=%d "
         "warmup_provisional=%.2f/%d bars",
@@ -175,7 +187,7 @@ async def main() -> None:
         CFG.setup_filter.warmup_provisional_threshold, CFG.setup_filter.warmup_bars,
     )
     log.info(
-        "Exits: EXIT_D enabled=%s, LULD enabled=%s — strategy exit is EPG_CLOSE",
+        "Exits: EXIT_D enabled=%s, LULD enabled=%s",
         CFG.exit_d.enabled, CFG.luld.enabled,
     )
     log.info("Scanner: quartile gate removed — gap >= %.0f%% admits all quartiles",

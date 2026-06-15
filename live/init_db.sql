@@ -17,6 +17,10 @@ INSERT INTO strategies (id, display_name, active)
 VALUES ('epg_v1', 'EPG — Event Participation Gate', TRUE)
 ON CONFLICT (id) DO NOTHING;
 
+INSERT INTO strategies (id, display_name, active)
+VALUES ('scanner_vwap', 'Scanner × VWAP v1', TRUE)
+ON CONFLICT (id) DO NOTHING;
+
 -- Strategy-agnostic: one row per scanner poll with ≥1 qualifying ticker.
 CREATE TABLE IF NOT EXISTS scanner_snapshots (
     id              BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,

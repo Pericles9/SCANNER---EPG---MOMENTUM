@@ -41,6 +41,7 @@ class SignalResult:
     order_signal: Optional[str]   # 'ENTRY', 'EXIT_D', 'LULD', 'EPG_CLOSE', or None
     is_trade: bool
     disqualify: bool = False      # True → SF failed removal_bars consecutive bars; remove from universe
+    session_done: bool = False    # True → strategy finished session (vwap path only); triggers session_done_callback
     side: Optional[int] = None                          # Lee-Ready: 0=BUY, 1=SELL (trades only)
     signal_events: list = field(default_factory=list)   # per-transition only; tuples for batch writer
     hawkes_refit_record: Optional[tuple] = None         # set when a refit fires
