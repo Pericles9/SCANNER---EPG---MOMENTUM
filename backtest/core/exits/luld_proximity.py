@@ -1,40 +1,39 @@
-"""LULD halt-proximity exit (standalone, regular-hours only).
+"""LULD halt-proximity exit — quote-based, sticky 1% reference price.
 
-Reverse-engineered Tier 2 LULD bands. Active 09:30-16:00 ET only; pre-market and
-post-market halts are exchange-discretion events with no standardized formula and
-are out of scope (the module returns INACTIVE outside RTH).
+Tier 2 LULD bands. Active 09:30-16:00 ET only; pre-market and post-market
+are out of scope (module returns INACTIVE outside RTH).
 
 Tier 2 band_pct schedule (ET):
     09:30:00 - 09:45:00   0.20  (doubled)
     09:45:00 - 15:35:00   0.10  (normal)
     15:35:00 - 16:00:00   0.20  (doubled)
 
-Reference price = mean of trade prices in the trailing 5-minute window.
-lower_band = ref * (1 - band_pct), upper_band = ref * (1 + band_pct).
+Reference price — sticky SIP approximation:
+    Published reference price updates only when the new 5-minute rolling
+    arithmetic mean is ≥1% away from the current published reference price.
+    On cold start (first tick after warmup), the published reference is set
+    unconditionally. During an active Limit State proxy (EXIT_HALT), the
+    published reference is frozen; updates resume when the state clears.
 
-Exit trigger (Phase E symmetric spread-multiple):
-    buffer = n_spread_multiple * spread   (spread = ask - bid)
-    lower_trigger = lower_band + buffer
-    upper_trigger = upper_band - buffer
-    EXIT_HALT fires when price < lower_trigger OR price > upper_trigger.
-If spread is unavailable or invalid (ask <= bid), buffer = 0 (band-touch fallback).
+Exit signal — quote-based:
+    bid_proximity_pct = (upper_band - nbbo_bid) / upper_band
+    EXIT_HALT fires when bid_proximity_pct ≤ proximity_threshold AND nbbo_bid > 0.
+    If no valid quote is available (bid ≤ 0 or ask ≤ bid), falls back to
+    trade-price comparison: fire when (upper_band - price) / upper_band
+    ≤ proximity_threshold.
 
-Known approximations (per Phase T A.1):
-1. The LULD spec excludes certain "ineligible transactions" (e.g. odd lots,
-   certain VWAP prints) from the reference price calculation. We use all
-   trades -- a known approximation.
-2. The reference price is technically published by the SIP every second; we
-   recompute it on every tick. This is more responsive than the official
-   feed, not less.
-3. Bands round to the nearest penny per spec; we do not round (working in
-   float). Rounding error is at most $0.005 -- negligible relative to a 5%
-   proximity threshold.
+Lower band is permanently disabled. Only upper-band EXIT_HALT is produced.
 
-Module is self-contained -- only stdlib + numpy. No imports from backtest/,
-core/hawkes/, or core/events/.
+Known approximations:
+1. All trades are included in the reference price window, including odd lots and
+   ineligible transactions excluded by the SIP spec.
+2. The SIP publishes reference prices on a second-by-second cadence; we
+   recompute on each trade tick with a 1% sticky filter.
+3. Bands round to the nearest penny per spec; we apply round(..., 2).
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,14 +47,16 @@ from zoneinfo import ZoneInfo
 _ET = ZoneInfo("America/New_York")
 _NS_PER_SECOND = 1_000_000_000
 
-# Time-of-day band schedule in seconds-from-midnight ET
 _RTH_START_SEC = 9 * 3600 + 30 * 60        # 09:30:00 ET
 _DOUBLED_AM_END_SEC = 9 * 3600 + 45 * 60   # 09:45:00 ET
 _DOUBLED_PM_START_SEC = 15 * 3600 + 35 * 60  # 15:35:00 ET
-_RTH_END_SEC = 16 * 3600                   # 16:00:00 ET
+_RTH_END_SEC = 16 * 3600                    # 16:00:00 ET
 
 _BAND_PCT_NORMAL = 0.10
 _BAND_PCT_DOUBLED = 0.20
+
+# Minimum relative change in rolling mean required to update published ref price
+_STICKY_MIN_CHANGE = 0.01
 
 _DEQUE_CAP = 100_000
 
@@ -65,23 +66,21 @@ _DEQUE_CAP = 100_000
 
 class ProximityState(Enum):
     """Current state of the LULD proximity exit."""
-    INACTIVE = "INACTIVE"      # outside RTH, or in warmup
-    SAFE = "SAFE"              # within both triggers
-    EXIT_HALT = "EXIT_HALT"    # outside a trigger
+    INACTIVE = "INACTIVE"      # outside RTH, warmup, or invalid price
+    SAFE = "SAFE"              # bid not yet near upper band
+    EXIT_HALT = "EXIT_HALT"    # bid within proximity_threshold of upper band
 
 
 @dataclass
 class ProximityResult:
     """Single-tick proximity computation result."""
     state: ProximityState
-    reference_price: Optional[float]
-    lower_band: Optional[float]
-    upper_band: Optional[float]
-    lower_proximity_bps: Optional[float]   # (price - lower_band) / price * 10000
-    upper_proximity_bps: Optional[float]   # (upper_band - price) / price * 10000
-    fire_side: Optional[str]               # "lower", "upper", or None
-    band_pct: float
-    spread_used: Optional[float]           # actual spread (0.0 if fallback)
+    fire_side: Optional[str]       # "upper" or None (lower band permanently disabled)
+    reference_price: float         # current published sticky ref price (0.0 before warmup)
+    upper_band: float              # current upper band value (0.0 before warmup)
+    bid_proximity_pct: float       # (upper_band - nbbo_bid) / upper_band; NaN if fallback
+    spread_used: float             # ask - bid at this tick; 0.0 if no valid quote
+    band_pct: float                # current Tier 2 band percentage
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -113,48 +112,50 @@ def _is_regular_hours(et_sec_of_day: int) -> bool:
 
 
 class LuldProximityExit:
-    """Streaming LULD halt-proximity exit detector (symmetric spread-multiple trigger).
+    """Streaming LULD halt-proximity exit detector (quote-based, sticky reference price).
 
-    Maintains a 5-minute rolling deque of (timestamp_ns, price). On each
-    update():
-      1. Compute ET seconds-of-day. If outside 09:30-16:00 ET, return INACTIVE.
-      2. Append the new tick, expire entries older than ref_window_sec.
-      3. If less than warmup_sec of in-window data accumulated, return INACTIVE.
-      4. Compute reference_price = mean(in-window prices), bands.
-      5. Compute buffer = n_spread_multiple * spread (0 if spread invalid).
-      6. EXIT_HALT if price < lower_band + buffer OR price > upper_band - buffer.
+    Maintains a 5-minute rolling deque of trade prices for the reference price
+    calculation. The published reference price is sticky: it only updates when
+    the rolling mean moves ≥1% from the current published value. During an active
+    EXIT_HALT (Limit State proxy), the reference price is frozen.
 
-    When spread is None or invalid (ask <= bid), buffer = 0 (fires only at the
-    band itself). A warning is issued on the first such fallback per instance.
+    Exit signal uses the prevailing NBBO bid. If no valid bid is available
+    (bid ≤ 0 or ask ≤ bid), falls back to trade-price comparison.
+
+    Only upper-band exits are produced. Lower band is permanently disabled.
     """
 
     def __init__(
         self,
         ref_window_sec: float = 300.0,
-        n_spread_multiple: float = 2.0,
+        proximity_threshold: float = 0.02,
         warmup_sec: float = 60.0,
     ):
         if ref_window_sec <= 0:
             raise ValueError(f"ref_window_sec must be positive, got {ref_window_sec}")
-        if n_spread_multiple < 0:
+        if proximity_threshold < 0:
             raise ValueError(
-                f"n_spread_multiple must be >= 0, got {n_spread_multiple}"
+                f"proximity_threshold must be >= 0, got {proximity_threshold}"
             )
         if warmup_sec < 0:
             raise ValueError(f"warmup_sec must be >= 0, got {warmup_sec}")
 
         self.ref_window_sec = ref_window_sec
-        self.n_spread_multiple = n_spread_multiple
+        self.proximity_threshold = proximity_threshold
         self.warmup_sec = warmup_sec
 
         self._ref_window_ns = int(ref_window_sec * _NS_PER_SECOND)
         self._warmup_ns = int(warmup_sec * _NS_PER_SECOND)
         self._buffer: deque = deque(maxlen=_DEQUE_CAP)
-        self._warned_fallback = False
+        self._published_ref: float = 0.0   # 0.0 = not yet set (cold start)
+        self._in_limit_state: bool = False
+        self._warned_fallback: bool = False
 
     def reset(self) -> None:
         """Clear all state. Next update() returns INACTIVE until warmup completes."""
         self._buffer.clear()
+        self._published_ref = 0.0
+        self._in_limit_state = False
         self._warned_fallback = False
 
     def update(
@@ -171,20 +172,24 @@ class LuldProximityExit:
         timestamp_ns : int
             Trade timestamp in unix nanoseconds (UTC).
         price : float
-            Trade price.
+            Trade price (used as fallback when no valid quote is available).
         bid : float or None
-            Prevailing bid at this tick. None triggers band-touch fallback.
+            Prevailing NBBO bid at this tick. None triggers trade-price fallback.
         ask : float or None
-            Prevailing ask at this tick. None triggers band-touch fallback.
+            Prevailing NBBO ask at this tick. None triggers trade-price fallback.
         """
         et_sec = _et_seconds_of_day(timestamp_ns)
 
         if not _is_regular_hours(et_sec):
+            self._in_limit_state = False
             return ProximityResult(
                 state=ProximityState.INACTIVE,
-                reference_price=None, lower_band=None, upper_band=None,
-                lower_proximity_bps=None, upper_proximity_bps=None,
-                fire_side=None, band_pct=0.0, spread_used=None,
+                fire_side=None,
+                reference_price=0.0,
+                upper_band=0.0,
+                bid_proximity_pct=math.nan,
+                spread_used=0.0,
+                band_pct=0.0,
             )
 
         self._buffer.append((timestamp_ns, price))
@@ -195,67 +200,88 @@ class LuldProximityExit:
         oldest_ts = self._buffer[0][0]
         if (timestamp_ns - oldest_ts) < self._warmup_ns:
             band_pct = _band_pct_for_time(et_sec)
+            self._in_limit_state = False
             return ProximityResult(
                 state=ProximityState.INACTIVE,
-                reference_price=None, lower_band=None, upper_band=None,
-                lower_proximity_bps=None, upper_proximity_bps=None,
-                fire_side=None, band_pct=band_pct, spread_used=None,
+                fire_side=None,
+                reference_price=0.0,
+                upper_band=0.0,
+                bid_proximity_pct=math.nan,
+                spread_used=0.0,
+                band_pct=band_pct,
             )
 
+        # Compute rolling mean
         n = len(self._buffer)
         s = 0.0
         for _, p in self._buffer:
             s += p
-        ref_price = s / n
+        new_mean = s / n
+
+        # Sticky reference price update: frozen during active EXIT_HALT
+        if not self._in_limit_state:
+            if self._published_ref == 0.0:
+                # Cold start: set unconditionally on first post-warmup tick
+                self._published_ref = new_mean
+            else:
+                rel_change = abs(new_mean - self._published_ref) / self._published_ref
+                if rel_change >= _STICKY_MIN_CHANGE:
+                    self._published_ref = new_mean
 
         band_pct = _band_pct_for_time(et_sec)
-        lower_band = ref_price * (1.0 - band_pct)
-        upper_band = ref_price * (1.0 + band_pct)
+        upper_band = round(self._published_ref * (1.0 + band_pct), 2)
 
         if price <= 0:
+            self._in_limit_state = False
             return ProximityResult(
                 state=ProximityState.INACTIVE,
-                reference_price=ref_price, lower_band=lower_band,
+                fire_side=None,
+                reference_price=self._published_ref,
                 upper_band=upper_band,
-                lower_proximity_bps=None, upper_proximity_bps=None,
-                fire_side=None, band_pct=band_pct, spread_used=None,
+                bid_proximity_pct=math.nan,
+                spread_used=0.0,
+                band_pct=band_pct,
             )
 
-        # Compute spread; fallback to 0 if invalid
-        spread = 0.0
-        valid_spread = (
+        # Determine proximity using prevailing bid; fallback to trade price
+        valid_quote = (
             bid is not None and ask is not None
-            and ask > bid and bid > 0.0
+            and bid > 0.0 and ask > bid
         )
-        if valid_spread:
-            spread = ask - bid
-        elif not self._warned_fallback:
-            self._warned_fallback = True
-            # first fallback per instance -- caller may log if needed
 
-        buffer = self.n_spread_multiple * spread
-        lower_trigger = lower_band + buffer
-        upper_trigger = upper_band - buffer
+        if valid_quote:
+            spread_used = float(ask) - float(bid)
+            bid_prox = (
+                (upper_band - float(bid)) / upper_band
+                if upper_band > 0.0 else math.nan
+            )
+            fires = not math.isnan(bid_prox) and bid_prox <= self.proximity_threshold
+        else:
+            if not self._warned_fallback:
+                self._warned_fallback = True
+            spread_used = 0.0
+            bid_prox = math.nan
+            price_prox = (
+                (upper_band - price) / upper_band
+                if upper_band > 0.0 else math.nan
+            )
+            fires = not math.isnan(price_prox) and price_prox <= self.proximity_threshold
 
-        lower_prox_bps = (price - lower_band) / price * 10000.0
-        upper_prox_bps = (upper_band - price) / price * 10000.0
+        if fires:
+            state = ProximityState.EXIT_HALT
+            fire_side: Optional[str] = "upper"
+        else:
+            state = ProximityState.SAFE
+            fire_side = None
 
-        fire_side: Optional[str] = None
-        if price < lower_trigger:
-            fire_side = "lower"
-        elif price > upper_trigger:
-            fire_side = "upper"
-
-        state = ProximityState.EXIT_HALT if fire_side is not None else ProximityState.SAFE
+        self._in_limit_state = (state == ProximityState.EXIT_HALT)
 
         return ProximityResult(
             state=state,
-            reference_price=ref_price,
-            lower_band=lower_band,
-            upper_band=upper_band,
-            lower_proximity_bps=lower_prox_bps,
-            upper_proximity_bps=upper_prox_bps,
             fire_side=fire_side,
+            reference_price=self._published_ref,
+            upper_band=upper_band,
+            bid_proximity_pct=bid_prox,
+            spread_used=spread_used,
             band_pct=band_pct,
-            spread_used=spread,
         )

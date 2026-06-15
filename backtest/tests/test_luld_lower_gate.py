@@ -26,19 +26,16 @@ from core.exits.luld_proximity import LuldProximityExit, ProximityState, Proximi
 
 # ── Helper to build a ProximityResult with a known fire_side ─────────
 
-def _make_halt_result(fire_side: str, lower_band: float = 10.0,
-                      upper_band: float = 12.0) -> ProximityResult:
+def _make_halt_result(fire_side: str, upper_band: float = 12.0) -> ProximityResult:
     """Return a ProximityResult with state=EXIT_HALT and the given fire_side."""
     return ProximityResult(
         state=ProximityState.EXIT_HALT,
-        reference_price=11.0,
-        lower_band=lower_band,
-        upper_band=upper_band,
-        lower_proximity_bps=5.0,
-        upper_proximity_bps=5.0,
         fire_side=fire_side,
-        band_pct=0.10,
+        reference_price=11.0,
+        upper_band=upper_band,
+        bid_proximity_pct=0.01,
         spread_used=0.05,
+        band_pct=0.10,
     )
 
 
@@ -46,14 +43,12 @@ def _make_safe_result() -> ProximityResult:
     """Return a ProximityResult with state=SAFE."""
     return ProximityResult(
         state=ProximityState.SAFE,
-        reference_price=11.0,
-        lower_band=10.0,
-        upper_band=12.0,
-        lower_proximity_bps=900.0,
-        upper_proximity_bps=900.0,
         fire_side=None,
-        band_pct=0.10,
+        reference_price=11.0,
+        upper_band=12.0,
+        bid_proximity_pct=0.10,
         spread_used=0.05,
+        band_pct=0.10,
     )
 
 
@@ -117,14 +112,12 @@ class TestLuldLowerGate:
         # Manually set fire_side to None to test the `or "lower"` fallback
         result = ProximityResult(
             state=ProximityState.EXIT_HALT,
-            reference_price=result.reference_price,
-            lower_band=result.lower_band,
-            upper_band=result.upper_band,
-            lower_proximity_bps=result.lower_proximity_bps,
-            upper_proximity_bps=result.upper_proximity_bps,
             fire_side=None,
-            band_pct=result.band_pct,
+            reference_price=result.reference_price,
+            upper_band=result.upper_band,
+            bid_proximity_pct=result.bid_proximity_pct,
             spread_used=result.spread_used,
+            band_pct=result.band_pct,
         )
         # With lower disabled: None side defaults to lower -> suppressed
         assert _should_fire(result, luld_lower_band_enabled=False) is False

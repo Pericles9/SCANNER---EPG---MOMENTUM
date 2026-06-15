@@ -33,7 +33,7 @@ C_THIN = 2.50          # thinness ceiling multiplier
 C_BODY = 0.40          # body conviction floor multiplier
 Q_THRESHOLD = 0.65     # composite qualification threshold
 SUSTAIN_BARS = 1     # minutes of sustained qualification
-WARMUP_BARS = 65       # ~1/(1-rho_slow) before priors meaningful
+WARMUP_BARS = 1      # ~1/(1-rho_slow) before priors meaningful
 WARMUP_THRESHOLD = 0.75  # higher bar during warm-up
 BAR_SECONDS = 60       # 1-minute bars
 

@@ -377,10 +377,7 @@ def _process_event(args: dict) -> dict:
     exit_d_theta = args["exit_d_theta"]
     exit_d_tau_min_ns = args["exit_d_tau_min_ns"]   # pre-converted to int ns
     luld_ref_window_sec = args["luld_ref_window_sec"]
-    luld_proximity_pct_threshold = args["luld_proximity_pct_threshold"]
-    luld_n_spread_multiple = args.get("luld_n_spread_multiple", None)
-    if luld_n_spread_multiple is None:
-        luld_n_spread_multiple = luld_proximity_pct_threshold
+    luld_proximity_threshold = args.get("luld_proximity_threshold", 0.02)
     luld_lower_band_enabled = args.get("luld_lower_band_enabled", True)
     luld_warmup_sec = args["luld_warmup_sec"]
     reentry_enabled = args["reentry_enabled"]
@@ -522,7 +519,7 @@ def _process_event(args: dict) -> dict:
         # the current trade timestamp, then use the prevailing quote.
         luld_pre = LuldProximityExit(
             ref_window_sec=luld_ref_window_sec,
-            n_spread_multiple=luld_n_spread_multiple,
+            proximity_threshold=luld_proximity_threshold,
             warmup_sec=luld_warmup_sec,
         )
         luld_states = []
@@ -1351,8 +1348,10 @@ def parse_args():
                         help="Enable CVD since T_event filter (Phase C Option C)")
     parser.add_argument("--intra-window-watermark-threshold", type=float, default=None,
                         help="Phase D intra-window rolling high watermark threshold")
+    parser.add_argument("--luld-proximity-threshold", type=float, default=None,
+                        help="LULD proximity threshold (fraction, e.g. 0.02 = 2%% of upper band)")
     parser.add_argument("--luld-n-spread-multiple", type=float, default=None,
-                        help="Phase E LULD symmetric spread multiple N (replaces proximity_pct_threshold)")
+                        help="[DEPRECATED] Phase E spread multiple — use --luld-proximity-threshold")
     parser.add_argument("--luld-lower-disabled", action="store_true", default=False,
                         help="Phase F: disable lower-band LULD exit. EXIT_D owns downside.")
     return parser.parse_args()
@@ -1413,12 +1412,30 @@ def main():
     if args.intra_window_watermark_threshold is not None:
         intra_window_watermark_threshold = args.intra_window_watermark_threshold
 
-    # Phase E LULD symmetric spread multiple
-    luld_n_spread_multiple = luld_cfg.get("n_spread_multiple", None)
-    if luld_n_spread_multiple is None:
-        luld_n_spread_multiple = luld_cfg.get("proximity_pct_threshold", 2.0)
-    if args.luld_n_spread_multiple is not None:
-        luld_n_spread_multiple = args.luld_n_spread_multiple
+    # LULD proximity threshold: canonical key is `proximity_threshold` (fraction).
+    # Legacy fallback chain:
+    #   proximity_pct_threshold (pct form, divide by 100) → n_spread_multiple (incompatible,
+    #   warn and use default 0.02) → 0.02 hardcoded default.
+    if "proximity_threshold" in luld_cfg:
+        luld_proximity_threshold = float(luld_cfg["proximity_threshold"])
+    elif "proximity_pct_threshold" in luld_cfg:
+        luld_proximity_threshold = float(luld_cfg["proximity_pct_threshold"]) / 100.0
+    elif "n_spread_multiple" in luld_cfg:
+        log.warning(
+            "luld.n_spread_multiple in config is incompatible with the new quote-based "
+            "LULD module (bid-fraction threshold). Defaulting to proximity_threshold=0.02."
+        )
+        luld_proximity_threshold = 0.02
+    else:
+        luld_proximity_threshold = 0.02
+    if getattr(args, "luld_proximity_threshold", None) is not None:
+        luld_proximity_threshold = args.luld_proximity_threshold
+    elif getattr(args, "luld_n_spread_multiple", None) is not None:
+        log.warning(
+            "--luld-n-spread-multiple is deprecated; use --luld-proximity-threshold. "
+            "Treating the value as proximity_threshold directly."
+        )
+        luld_proximity_threshold = args.luld_n_spread_multiple
 
     # Phase F: lower-band gate. Default True (enabled) for backward compat with A-E configs.
     luld_lower_band_enabled = luld_cfg.get("lower_band_enabled", True)
@@ -1432,7 +1449,7 @@ def main():
         f"gap_gate_enabled={gap_gate_enabled} gap={gap_threshold:.2f} "
         f"watermark_threshold={watermark_threshold} cvd_filter={cvd_filter_enabled} "
         f"intra_window_watermark={intra_window_watermark_threshold} "
-        f"luld_n_spread_multiple={luld_n_spread_multiple} "
+        f"luld_proximity_threshold={luld_proximity_threshold:.4f} "
         f"luld_lower_band_enabled={luld_lower_band_enabled}"
     )
 
@@ -1536,8 +1553,7 @@ def main():
             "exit_d_theta": exit_d_theta,
             "exit_d_tau_min_ns": exit_d_tau_min_ns,
             "luld_ref_window_sec": luld_cfg["ref_window_sec"],
-            "luld_proximity_pct_threshold": luld_cfg.get("proximity_pct_threshold", 2.0),
-            "luld_n_spread_multiple": luld_n_spread_multiple,
+            "luld_proximity_threshold": luld_proximity_threshold,
             "luld_lower_band_enabled": luld_lower_band_enabled,
             "luld_warmup_sec": luld_cfg["warmup_sec"],
             "reentry_enabled": reentry_enabled,
@@ -1710,7 +1726,7 @@ def main():
         "intra_window_watermark_threshold": intra_window_watermark_threshold,
         "exit_d_theta": exit_d_theta,
         "exit_d_tau_min_sec": exit_d_tau_min_sec,
-        "luld_n_spread_multiple": luld_n_spread_multiple,
+        "luld_proximity_threshold": luld_proximity_threshold,
         "luld_lower_band_enabled": luld_lower_band_enabled,
         "n_events_input": len(events),
         "n_events_with_trades": len(results),

@@ -171,9 +171,11 @@ def replay_epg_for_event(
     t_event_fired = False
     t_event_ns: Optional[int] = None
 
+    _luld_prox_raw = luld_cfg.get("proximity_threshold",
+                        luld_cfg.get("proximity_pct_threshold", 2.0) / 100.0)
     luld_exit = LuldProximityExit(
         ref_window_sec=luld_cfg["ref_window_sec"],
-        proximity_pct_threshold=luld_cfg["proximity_pct_threshold"],
+        proximity_threshold=float(_luld_prox_raw),
         warmup_sec=luld_cfg["warmup_sec"],
     )
     luld_timeline: list[dict] = []
@@ -202,7 +204,7 @@ def replay_epg_for_event(
         luld_timeline.append({
             "ts": ts_ns,
             "state": _LULD_STATE_NUM[lr.state],
-            "lower_band": float(lr.lower_band) if lr.lower_band is not None else None,
+            "upper_band": float(lr.upper_band) if lr.upper_band > 0.0 else None,
         })
 
         # Track contiguous PASS windows
