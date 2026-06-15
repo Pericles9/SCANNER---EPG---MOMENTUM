@@ -206,26 +206,13 @@ class IBKRClient:
     async def account_values(self) -> list:
         return self._ib.accountValues()
 
-    async def snapshot_quote(self, ticker: str) -> tuple[float, float]:
-        """Return (bid, ask) snapshot from IBKR — execution source of truth.
-
-        Used by startup_position_triage to validate that a recovered position
-        is still tradable (price != (0, 0)). Returns (0.0, 0.0) on any failure
-        — caller treats that as "halted/suspended" and launches a watcher.
-        """
-        try:
-            contract = Stock(ticker, "SMART", "USD")
-            await self._ib.qualifyContractsAsync(contract)
-            tickers = await self._ib.reqTickersAsync(contract)
-            if not tickers:
-                return (0.0, 0.0)
-            t = tickers[0]
-            bid = float(t.bid) if t.bid is not None and t.bid > 0 else 0.0
-            ask = float(t.ask) if t.ask is not None and t.ask > 0 else 0.0
-            return (bid, ask)
-        except Exception:
-            log.exception("IBKR snapshot_quote failed for %s", ticker)
-            return (0.0, 0.0)
+    # NOTE: IBKR is execution-only. It deliberately exposes NO market-data /
+    # pricing method here (the former `snapshot_quote`, which called
+    # `reqTickersAsync`, was removed 2026-06-15). All pricing — including
+    # crash-recovery and flatten exits — comes from Massive REST
+    # (`live.feed.massive.fetch_mark`). Do not reintroduce a quote/price method on
+    # this client; it would silently re-create the paper-account 10089 stall.
+    # See CLAUDE.md locked decision "IBKR = portfolio/execution only".
 
     def has_open_order_for(self, ticker: str) -> bool:
         """Return True if IBKR has a live (unfilled, uncancelled) order for this ticker.

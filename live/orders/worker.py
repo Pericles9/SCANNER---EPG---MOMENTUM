@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from live.session_clock import SessionClock
 
 from live.config import CFG
+from live.feed.massive import fetch_mark
 from live.db.pool import get_pool
 from live.orders.ibkr import Fill, IBKRClient
 from live.orders.risk import FlattenAllRequest, FlattenTickerRequest, OrderRequest, RiskState
@@ -178,9 +179,13 @@ async def _execute_flatten_all(
         avg_cost = pos.get("avg_cost", 0.0)
         bkt = _bkt_now()
 
-        bid, _ask = await ibkr.snapshot_quote(ticker)
-        if bid > 0:
-            limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
+        # Price reference from Massive REST (NBBO bid, last-trade fallback). IBKR is
+        # execution-only — never its market data for pricing. avg_cost is the final
+        # emergency fallback when Massive has nothing.
+        bid, _ask, last = await fetch_mark(ticker)
+        ref = bid if (bid and bid > 0) else (last if (last and last > 0) else None)
+        if ref is not None:
+            limit_price = round(ref - CFG.order_execution.extended_exit_offset, 2)
         else:
             limit_price = round(max(0.01, avg_cost * 0.50), 2)
 
@@ -268,9 +273,13 @@ async def _execute_flatten_ticker(
     avg_cost = pos.get("avg_cost", 0.0)
     bkt = _bkt_now()
 
-    bid, _ask = await ibkr.snapshot_quote(ticker)
-    if bid > 0:
-        limit_price = round(bid - CFG.order_execution.extended_exit_offset, 2)
+    # Price reference from Massive REST (NBBO bid, last-trade fallback). IBKR is
+    # execution-only — never its market data for pricing. avg_cost is the final
+    # emergency fallback when Massive has nothing.
+    bid, _ask, last = await fetch_mark(ticker)
+    ref = bid if (bid and bid > 0) else (last if (last and last > 0) else None)
+    if ref is not None:
+        limit_price = round(ref - CFG.order_execution.extended_exit_offset, 2)
     else:
         limit_price = round(max(0.01, avg_cost * 0.50), 2)
 
@@ -522,10 +531,22 @@ async def hourly_pnl_alert(
         for ticker, pos in risk_state.open_positions.items():
             ctx = universe.get(ticker)
             if ctx and ctx.signal_state:
-                cur_price = ctx.signal_state.last_price
-                unreal = (cur_price - pos["avg_cost"]) * pos["qty"]
-                u_sign = "+" if unreal >= 0 else ""
-                lines.append(f"  Open: {ticker} {u_sign}${unreal:.2f} unrealised")
+                price, _src, _age = ctx.signal_state.mark(time.time_ns())
+                # Phase 0 diagnostic: one-shot dump when an open position resolves to a $0/None mark.
+                if not price:
+                    from live.bot.diag import dump_zero_mark
+                    await dump_zero_mark(
+                        where="hourly_pnl", ticker=ticker, signal_state=ctx.signal_state,
+                        in_universe=True,
+                        state_ready_set=(ctx.state_ready.is_set() if ctx.state_ready else None),
+                    )
+                # Guard: never compute unrealised P&L from a 0/None mark (prints a fake loss).
+                if price and price > 0:
+                    unreal = (price - pos["avg_cost"]) * pos["qty"]
+                    u_sign = "+" if unreal >= 0 else ""
+                    lines.append(f"  Open: {ticker} {u_sign}${unreal:.2f} unrealised")
+                else:
+                    lines.append(f"  Open: {ticker} (mark unavailable)")
             else:
                 lines.append(f"  Open: {ticker}")
 

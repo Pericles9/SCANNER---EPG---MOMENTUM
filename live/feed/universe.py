@@ -135,10 +135,10 @@ class UniverseManager:
             )
         )
 
-        # Subscribe WebSocket
+        # Subscribe WebSocket — trades, quotes, and real exchange LULD events.
         self._ws_send_queue.put_nowait({
             "action": "subscribe",
-            "params": f"T.{ticker},Q.{ticker}",
+            "params": f"T.{ticker},Q.{ticker},LULD.{ticker}",
         })
 
     async def _context_fetch_and_start(
@@ -266,7 +266,7 @@ class UniverseManager:
         ctx.task.cancel()
         self._ws_send_queue.put_nowait({
             "action": "unsubscribe",
-            "params": f"T.{ticker},Q.{ticker}",
+            "params": f"T.{ticker},Q.{ticker},LULD.{ticker}",
         })
         self._heartbeat.remove(ticker)
         log.info("Universe: removed %s", ticker)
@@ -287,6 +287,44 @@ class UniverseManager:
             ctx.queue.put_nowait(msg)
         except asyncio.QueueFull:
             log.warning("%s: queue full, dropping tick", ticker)
+
+    async def _dispatch_luld(self, msg: dict) -> None:
+        """Route a Massive LULD event to the ticker's signal_state.
+
+        LULD events carry the ticker in field `T` (NOT `sym`), so they must be keyed
+        separately from T/Q — otherwise every LULD message silently drops. The
+        signal_state is mutated synchronously here (no order/queue side effects);
+        detection/display/safety only. Late / unknown tickers drop cleanly.
+        """
+        ticker = msg.get("T")
+        if ticker is None or ticker not in self._universe:
+            return
+        ss = self._universe[ticker].signal_state
+        if ss is None or not hasattr(ss, "update_luld"):
+            return
+        try:
+            transition = ss.update_luld(msg)
+        except Exception:
+            log.exception("%s: update_luld failed", ticker)
+            return
+
+        if transition is None:
+            return
+        kind, duration = transition
+        upper, lower = msg.get("h"), msg.get("l")
+        if kind == "HALT":
+            log.warning("LULD HALT: %s bands=%s/%s", ticker, lower, upper)
+            if self._telegram is not None:
+                asyncio.create_task(self._telegram.send_silent(
+                    f"⛔ HALT: {ticker} — LULD halt (band ${lower}–${upper}). "
+                    f"Holding position; not force-exiting on halt alone."
+                ))
+        elif kind == "RESUME":
+            log.warning("LULD RESUME: %s after %.0fs", ticker, duration)
+            if self._telegram is not None:
+                asyncio.create_task(self._telegram.send_silent(
+                    f"▶️ RESUME: {ticker} — LULD halt cleared after {duration:.0f}s."
+                ))
 
     async def _ws_loop(self) -> None:
         """Maintain Polygon WebSocket connection with exponential backoff.
@@ -358,7 +396,7 @@ class UniverseManager:
                 # Re-subscribe all active tickers after reconnect
                 if self._universe:
                     subs = ",".join(
-                        f"T.{t},Q.{t}" for t in self._universe
+                        f"T.{t},Q.{t},LULD.{t}" for t in self._universe
                     )
                     await ws.send_str(json.dumps({"action": "subscribe", "params": subs}))
 
@@ -368,18 +406,23 @@ class UniverseManager:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             for item in json.loads(msg.data):
                                 ev = item.get("ev")
-                                if ev in ("T", "Q"):
-                                    _normalize_ws_timestamps(item)
-                                    self._ws_last_msg_t[0] = time.monotonic()
-                                    if disconnected[0] and not _reconnect_alerted:
-                                        _reconnect_alerted = True
-                                        disconnected[0] = False
-                                        if self._telegram is not None:
-                                            asyncio.create_task(
-                                                self._telegram.send_silent(
-                                                    "Polygon WS reconnected — feed restored"
-                                                )
+                                if ev not in ("T", "Q", "LULD"):
+                                    continue
+                                # LULD `t` is ms, same as T/Q — normalise ms→ns for all.
+                                _normalize_ws_timestamps(item)
+                                self._ws_last_msg_t[0] = time.monotonic()
+                                if disconnected[0] and not _reconnect_alerted:
+                                    _reconnect_alerted = True
+                                    disconnected[0] = False
+                                    if self._telegram is not None:
+                                        asyncio.create_task(
+                                            self._telegram.send_silent(
+                                                "Polygon WS reconnected — feed restored"
                                             )
+                                        )
+                                if ev == "LULD":
+                                    await self._dispatch_luld(item)
+                                else:
                                     await self._dispatch(item)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
@@ -460,6 +503,8 @@ class UniverseManager:
             order_queue=self._order_queue,
             risk_state=self._risk_state,
             heartbeat=self._heartbeat,
+            ws_last_msg_t=self._ws_last_msg_t,
+            telegram=self._telegram,
         )
 
 

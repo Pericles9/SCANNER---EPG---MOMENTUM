@@ -22,6 +22,23 @@ def _age_str(last_t: float) -> str:
     return f"{age/60:.1f}m ago"
 
 
+def format_mark(price: Optional[float], source: str, age_s: float = 0.0) -> str:
+    """Render a signal_state.mark() tuple consistently across all readouts.
+
+    Never renders a missing/zero mark as '$0.00' — uses '—' instead. A source tag
+    distinguishes a live trade from a quote mid or a stale/halted last trade.
+    """
+    if price is None or price <= 0 or source == "NONE":
+        return "—"
+    if source == "MID":
+        return f"${price:.2f} (mid)"
+    if source == "HALTED":
+        return f"${price:.2f} (halted)"
+    if source == "STALE":
+        return f"${price:.2f} (stale {age_s:.0f}s)"
+    return f"${price:.2f}"
+
+
 def format_trade_row(trade: dict) -> str:
     ticker = trade.get("ticker", "?")
     bucket = (trade.get("session_bucket") or "?")[:3].upper()
@@ -63,15 +80,26 @@ def format_position_block(
     avg_cost: float,
     qty: int,
     entry_ns: Optional[int],
-    current_price: float,
+    current_price: Optional[float],
     epg_gate: str,
     lambda_hat: float,
     lambda_ref: float,
     scanner_context: dict,
+    mark_str: Optional[str] = None,
+    halted: bool = False,
+    luld_bands: Optional[tuple] = None,
 ) -> str:
-    unreal = (current_price - avg_cost) * qty
-    unreal_pct = (current_price - avg_cost) / avg_cost * 100 if avg_cost > 0 else 0.0
-    sign = "+" if unreal >= 0 else ""
+    # Never render a missing/zero mark as $0.00 — show the mark tag (or '—') and
+    # suppress the (fake) unrealised P&L rather than printing a catastrophic loss.
+    if current_price is None or current_price <= 0:
+        cur_disp = mark_str if mark_str else "—"
+        unreal_disp = "—"
+    else:
+        unreal = (current_price - avg_cost) * qty
+        unreal_pct = (current_price - avg_cost) / avg_cost * 100 if avg_cost > 0 else 0.0
+        sign = "+" if unreal >= 0 else ""
+        cur_disp = mark_str if mark_str else f"${current_price:.2f}"
+        unreal_disp = f"{sign}${unreal:.2f} ({sign}{unreal_pct:.2f}%)"
 
     hold_str = "?"
     if entry_ns:
@@ -84,14 +112,19 @@ def format_position_block(
     n_total = scanner_context.get("scanner_n", "?")
     pct = scanner_context.get("pct_change", 0.0)
 
-    lines = [
-        f"POSITION: {ticker}",
+    lines = [f"POSITION: {ticker}"]
+    if halted:
+        if luld_bands and luld_bands[1] is not None and luld_bands[0] is not None:
+            lines.append(f"  ⛔ HALTED (LULD band ${luld_bands[1]}–${luld_bands[0]})")
+        else:
+            lines.append("  ⛔ HALTED")
+    lines.extend([
         f"  Entry: ${avg_cost:.2f} × {qty} shares",
-        f"  Current: ${current_price:.2f}",
-        f"  Unrealised: {sign}${unreal:.2f} ({sign}{unreal_pct:.2f}%)",
+        f"  Current: {cur_disp}",
+        f"  Unrealised: {unreal_disp}",
         f"  Hold: {hold_str}",
         f"  EPG gate: {epg_gate}",
         f"  λ_v / λ_ref: {lv_ratio}",
         f"  Scanner: Q{quartile} rank={rank}/{n_total} gap={pct:+.1f}%",
-    ]
+    ])
     return "\n".join(lines)

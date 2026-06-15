@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
@@ -128,6 +129,17 @@ class LiveSignalState:
         self._last_bid: Optional[float] = None
         self._last_ask: Optional[float] = None
 
+        # Authoritative mark source — dedicated last-trade field, decoupled from the
+        # setup-filter bar buffer (_sf_prices) so a degraded/empty buffer never forces
+        # a $0 display. Seeded from the last historical tick; updated on every live trade.
+        last_seed = self._sf_prices[-1] if self._sf_prices else None
+        self._last_trade_price: Optional[float] = (
+            last_seed if last_seed is not None and last_seed > 0 else None
+        )
+        self._last_trade_ts_ns: int = self._sf_ts[-1] if self._sf_ts else 0
+        # Real exchange halt flag — set by update_luld() (Phase 2). Used by mark().
+        self._halted: bool = False
+
         # Scanner context
         self._intraday_pct: float = scanner_context.get("pct_change", 0.0) / 100.0
         self._scanner_context: dict = scanner_context
@@ -136,8 +148,15 @@ class LiveSignalState:
         self._sf_fail_bars: int = 0
         self._sf_disqualified: bool = False
 
-        # LULD freeze state
+        # LULD freeze state (quote-derived proximity heuristic — LuldProximityExit)
         self._luld_frozen: bool = False
+
+        # Real exchange LULD state (Massive WS) — detection / display / safety only.
+        # _halted is initialised above (Phase 1, used by mark()).
+        self._luld_bands: tuple[Optional[float], Optional[float]] = (None, None)
+        self._luld_indicators: list[int] = []
+        self._halt_started_ns: int = 0
+        self._luld_last_seen: float = 0.0   # monotonic; halt-suspected detection (Phase 3)
 
         # Last Hawkes state — for i_entry recording at order fill
         self._last_imbalance: float = 0.5
@@ -154,6 +173,40 @@ class LiveSignalState:
         self._luld_frozen = False
         self._engine.resume(halt_duration_sec)
         log.info("%s: signal state resumed", self._ticker)
+
+    def is_halted(self) -> bool:
+        """True while a real exchange (Massive LULD) halt is in effect."""
+        return self._halted
+
+    def update_luld(self, msg: dict) -> Optional[tuple[str, float]]:
+        """Process a Massive LULD event. Detection / display / safety ONLY — never
+        emits an order signal. Indicators 17 (halt) / 18 (resume) are NASDAQ-only
+        (z == 3); other tapes carry only bands and are inferred in the heartbeat
+        monitor (Phase 3). `t` is already ns (normalised at dispatch). Returns
+        ('HALT', 0.0) or ('RESUME', duration_sec) on a state transition, else None.
+        """
+        h = msg.get("h")
+        l = msg.get("l")
+        self._luld_bands = (h, l)
+        indicators = msg.get("i") or []
+        self._luld_indicators = list(indicators)
+        self._luld_last_seen = time.monotonic()
+        ts_ns = msg.get("t", 0)
+
+        if 17 in indicators and not self._halted:
+            self._halted = True
+            self._halt_started_ns = ts_ns
+            self.freeze()
+            return ("HALT", 0.0)
+        if 18 in indicators and self._halted:
+            self._halted = False
+            duration = (
+                max(0.0, (ts_ns - self._halt_started_ns) / 1e9)
+                if self._halt_started_ns else 0.0
+            )
+            self.resume(duration)
+            return ("RESUME", duration)
+        return None
 
     def record_entry(self, session_bkt: str, i_entry: float) -> None:
         """Called by signal_loop after entry is queued (optimistic — entry fills are expected)."""
@@ -223,6 +276,10 @@ class LiveSignalState:
 
         price: float = tick.get("p", 0.0)
         size: int = tick.get("s", 0)
+        # Authoritative mark update — every valid live trade, before any signal logic.
+        if price > 0:
+            self._last_trade_price = price
+            self._last_trade_ts_ns = ts_ns
         t_sec = (ts_ns - self._session_start_ns) / _NS_PER_SEC
         events: list = []
 
@@ -597,10 +654,49 @@ class LiveSignalState:
     def last_lambda_ref(self) -> float:
         return self._lambda_ref
 
+    def mark(self, now_ns: int, stale_s: float = 5.0) -> tuple[Optional[float], str, float]:
+        """Return (price, source, age_s) for display/P&L. Never returns 0.0 as a real price.
+
+        source ∈ {'LIVE','MID','STALE','HALTED','NONE'}. Priority:
+        fresh last-trade → LIVE; else two-sided mid → MID; else stale last-trade →
+        STALE (or HALTED while halted); else (None,'NONE',0.0).
+        """
+        ltp = self._last_trade_price
+        age_s = 0.0
+        if ltp is not None and ltp > 0:
+            age_s = max(0.0, (now_ns - self._last_trade_ts_ns) / 1e9)
+            if age_s <= stale_s:
+                return ltp, "LIVE", age_s
+        # Not fresh — prefer a two-sided quote mid.
+        if self._last_bid and self._last_ask and self._last_bid > 0 and self._last_ask > 0:
+            return (self._last_bid + self._last_ask) / 2.0, "MID", 0.0
+        # Else a stale last trade, if we have one.
+        if ltp is not None and ltp > 0:
+            return ltp, ("HALTED" if self._halted else "STALE"), age_s
+        return None, "NONE", 0.0
+
     @property
-    def last_price(self) -> float:
-        return self._sf_prices[-1] if self._sf_prices else 0.0
+    def last_price(self) -> Optional[float]:
+        """Backward-compatible mark. Never a silent 0.0: prefers last trade, then a
+        two-sided mid, then the SF buffer tail; None when nothing is known."""
+        if self._last_trade_price is not None and self._last_trade_price > 0:
+            return self._last_trade_price
+        if self._last_bid and self._last_ask and self._last_bid > 0 and self._last_ask > 0:
+            return (self._last_bid + self._last_ask) / 2.0
+        if self._sf_prices and self._sf_prices[-1] > 0:
+            return self._sf_prices[-1]
+        return None
 
     @property
     def epg_gate_state(self) -> str:
         return self._prev_gate_state.value
+
+    @property
+    def luld_bands(self) -> tuple[Optional[float], Optional[float]]:
+        """Last known LULD (upper, lower) price bands. (None, None) until first LULD event."""
+        return self._luld_bands
+
+    @property
+    def luld_last_seen(self) -> float:
+        """Monotonic time of the last LULD event for this ticker (0.0 = never)."""
+        return self._luld_last_seen

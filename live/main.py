@@ -161,9 +161,10 @@ async def main() -> None:
     )
     if CFG.strategy.active_strategy == "scanner_vwap":
         log.info(
-            "scanner_vwap params: setup_filter_gate=%s vwap_anchor=%s "
+            "scanner_vwap params: setup_filter_gate=%s vwap_anchor=%s vwap_exit_mode=%s "
             "hard_stop_pct=%.2f one_shot=%s skip_hawkes=%s [HEURISTIC/UNVALIDATED]",
             CFG.scanner_vwap.setup_filter_gate, CFG.scanner_vwap.vwap_anchor,
+            CFG.scanner_vwap.vwap_exit_mode,
             CFG.scanner_vwap.hard_stop_pct, CFG.scanner_vwap.one_shot_per_session,
             CFG.scanner_vwap.skip_hawkes,
         )
@@ -258,7 +259,10 @@ async def main() -> None:
     # resume — EPG windows are 30-120s and any restart outlives them.
     from live.recovery import run_crash_recovery
     try:
-        recovery = await run_crash_recovery(ibkr.ib, pool, telegram, clock.date)
+        recovery = await run_crash_recovery(
+            ibkr.ib, pool, telegram, clock.date,
+            polygon_api_key=os.environ["POLYGON_API_KEY"],
+        )
     except Exception:
         log.critical("Crash recovery raised — halting startup", exc_info=True)
         await telegram.send_silent("🔴 STARTUP HALTED — crash recovery raised an exception.")

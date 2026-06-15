@@ -152,7 +152,7 @@ def _build_order_request(
             expected_price=limit_price,
         )
 
-    if signal in ("EXIT_D", "LULD", "EPG_CLOSE", "VWAP_CLOSE", "HARD_STOP"):
+    if signal in ("EXIT_D", "LULD", "EPG_CLOSE", "VWAP_CLOSE", "VWAP_CROSS", "HARD_STOP"):
         bid = (
             ctx.signal_state.last_bid
             if ctx.signal_state.last_bid is not None
@@ -196,9 +196,28 @@ async def heartbeat_monitor(
     order_queue: asyncio.Queue,
     risk_state: RiskState,
     heartbeat: HeartbeatMonitor,
+    ws_last_msg_t: Optional[list] = None,
+    telegram=None,
 ) -> None:
-    """Periodic dead man's switch check."""
+    """Periodic dead man's switch check — halt-aware.
+
+    A real exchange halt produces exactly the same per-ticker tick gap as feed death,
+    so flattening on a stale heartbeat alone would force-exit on a halt (violating the
+    locked rule "do not force-exit on halt alone"). Disambiguation per stale ticker
+    with an open position:
+
+      • Real LULD halt (`is_halted()`) or halt-suspected (LULD still arriving while T/Q
+        stopped — covers NYSE/AMEX where indicators 17/18 don't exist) → HOLD, alert
+        once, keep a grace timer. Escalate a single FlattenTicker only if the hold
+        exceeds `CFG.luld.max_halt_hold_s`.
+      • Otherwise true symbol-level feed death (no T/Q/LULD) while the global WS is
+        healthy → FlattenTicker. If the global WS is also stale, defer to the
+        WS-disconnect path (it owns that scenario).
+    """
     from live.feed import market_status
+    _halt_since: dict[str, float] = {}   # ticker → monotonic time hold began
+    _alerted: set[str] = set()
+    _escalated: set[str] = set()
     while True:
         await asyncio.sleep(_HEARTBEAT_CHECK_INTERVAL_S)
         # The dead man's switch guards against a frozen feed during the session.
@@ -206,13 +225,99 @@ async def heartbeat_monitor(
         # heartbeat is expected — do not flatten (it can't fill and only spams).
         if not market_status.is_tradable_now():
             continue
-        stale = heartbeat.stale_tickers(CFG.risk.dead_man_timeout_s)
-        for ticker in stale:
-            if risk_state.has_position(ticker):
+
+        now = time.monotonic()
+        # The ws_healthy gate only *suppresses* a flatten when we positively know the
+        # global WS is down (the WS-disconnect path owns that). With no WS box, or a
+        # fresh WS, default to healthy so true symbol feed-death still flattens.
+        if ws_last_msg_t is None:
+            ws_age = 0.0
+            ws_healthy = True
+        else:
+            ws_age = now - ws_last_msg_t[0] if ws_last_msg_t[0] > 0 else float("inf")
+            ws_healthy = ws_age < CFG.risk.dead_man_timeout_s
+        stale = set(heartbeat.stale_tickers(CFG.risk.dead_man_timeout_s))
+
+        _dead_mans_switch_pass(
+            stale=stale, universe=universe, risk_state=risk_state, order_queue=order_queue,
+            now=now, ws_healthy=ws_healthy, ws_age=ws_age,
+            halt_since=_halt_since, alerted=_alerted, escalated=_escalated, telegram=telegram,
+        )
+
+
+def _dead_mans_switch_pass(
+    stale: set,
+    universe: dict,
+    risk_state: RiskState,
+    order_queue: asyncio.Queue,
+    now: float,
+    ws_healthy: bool,
+    ws_age: float,
+    halt_since: dict,
+    alerted: set,
+    escalated: set,
+    telegram=None,
+) -> None:
+    """One halt-aware dead-man's-switch pass over the stale tickers. Extracted for
+    testability; mutates `order_queue` and the bookkeeping sets/dicts in place."""
+    # Forget bookkeeping for tickers whose feed recovered (no longer stale).
+    for t in [t for t in halt_since if t not in stale]:
+        halt_since.pop(t, None)
+        alerted.discard(t)
+        escalated.discard(t)
+
+    for ticker in stale:
+        if not risk_state.has_position(ticker):
+            continue
+
+        ctx = universe.get(ticker)
+        ss = ctx.signal_state if ctx else None
+        halted = bool(ss is not None and hasattr(ss, "is_halted") and ss.is_halted())
+        luld_seen = getattr(ss, "luld_last_seen", 0.0) if ss is not None else 0.0
+        luld_fresh = bool(luld_seen and (now - luld_seen) < CFG.risk.dead_man_timeout_s)
+        halt_or_suspected = halted or luld_fresh
+
+        if halt_or_suspected:
+            start = halt_since.setdefault(ticker, now)
+            held = now - start
+            if held >= CFG.luld.max_halt_hold_s and ticker not in escalated:
+                escalated.add(ticker)
                 log.critical(
-                    "DEAD MAN'S SWITCH: no heartbeat for %s in %ds with open position — flattening ticker only",
-                    ticker, CFG.risk.dead_man_timeout_s,
+                    "HALT CAP: %s held %.0fs >= max_halt_hold_s (%.0fs) — flattening ticker",
+                    ticker, held, CFG.luld.max_halt_hold_s,
                 )
+                if telegram is not None:
+                    asyncio.create_task(telegram.send_silent(
+                        f"HALT CAP: {ticker} halted/stalled {held:.0f}s — flattening (cap exceeded)."
+                    ))
                 order_queue.put_nowait(
-                    FlattenTickerRequest(ticker=ticker, reason="dead_mans_switch")
+                    FlattenTickerRequest(ticker=ticker, reason="halt_hold_cap_exceeded")
                 )
+            elif ticker not in alerted:
+                alerted.add(ticker)
+                kind = "HALT" if halted else "HALT-SUSPECTED"
+                log.warning(
+                    "%s: %s — holding (T/Q gap is a halt, not feed death; LULD active)",
+                    ticker, kind,
+                )
+                if telegram is not None:
+                    asyncio.create_task(telegram.send_silent(
+                        f"{kind} — holding {ticker} (feed gap is a halt, not feed death)."
+                    ))
+            continue   # never force-exit a halted / halt-suspected ticker
+
+        # No halt evidence. Flatten only on true symbol-level feed death while the
+        # global WS is healthy; otherwise the WS-disconnect path owns it.
+        if ws_healthy:
+            log.critical(
+                "DEAD MAN'S SWITCH: no T/Q/LULD for %s in %ds (global WS healthy) — flattening ticker only",
+                ticker, int(CFG.risk.dead_man_timeout_s),
+            )
+            order_queue.put_nowait(
+                FlattenTickerRequest(ticker=ticker, reason="dead_mans_switch")
+            )
+        else:
+            log.warning(
+                "%s: stale but global WS also down (age %.0fs) — deferring to WS-disconnect path",
+                ticker, ws_age,
+            )

@@ -77,6 +77,7 @@ class ExitDConfig:
 class LuldConfig:
     enabled: bool
     rth_only: bool
+    max_halt_hold_s: float
 
 
 @dataclass
@@ -138,6 +139,7 @@ class StrategyConfig:
 class ScannerVwapConfig:
     setup_filter_gate: bool
     vwap_anchor: str          # "per_bucket" | "rth_only"
+    vwap_exit_mode: str       # "tick" | "bar_close"
     hard_stop_pct: float
     one_shot_per_session: bool
     skip_hawkes: bool
@@ -244,6 +246,7 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
         scanner_vwap=ScannerVwapConfig(
             setup_filter_gate=sv.get("setup_filter_gate", True),
             vwap_anchor=sv.get("vwap_anchor", "per_bucket"),
+            vwap_exit_mode=sv.get("vwap_exit_mode", "tick"),
             hard_stop_pct=sv.get("hard_stop_pct", 0.12),
             one_shot_per_session=sv.get("one_shot_per_session", True),
             skip_hawkes=sv.get("skip_hawkes", False),
@@ -301,6 +304,7 @@ def load_config(path: Path = _STRATEGY_JSON) -> Config:
         luld=LuldConfig(
             enabled=raw["luld"]["enabled"],
             rth_only=raw["luld"]["rth_only"],
+            max_halt_hold_s=raw["luld"].get("max_halt_hold_s", 1800.0),
         ),
         order_execution=OrderExecutionConfig(
             pre_market_limit_offset=raw["order_execution"]["pre_market_limit_offset"],

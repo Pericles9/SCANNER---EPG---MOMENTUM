@@ -152,14 +152,18 @@ def test_flatten_ticker_closes_only_named_ticker():
         fill = _make_fill("AAPL", 100)
         ibkr = MagicMock()
         ibkr.submit = AsyncMock(return_value=fill)
-        ibkr.snapshot_quote = AsyncMock(return_value=(149.9, 150.1))
         telegram = AsyncMock()
 
         with patch("live.orders.worker.get_pool", return_value=_MockPool()), \
+             patch("live.orders.worker.fetch_mark",
+                   AsyncMock(return_value=(149.9, 150.1, 150.0))), \
              patch("live.feed.market_status.is_tradable_now", return_value=True):
             await _execute_flatten_ticker(
                 "AAPL", ibkr, risk_state, telegram, "test", date.today()
             )
+
+        # IBKR market data must never be used for pricing.
+        assert not hasattr(ibkr, "snapshot_quote") or not ibkr.snapshot_quote.called
 
         assert "AAPL" not in risk_state.open_positions, "AAPL should be removed after flatten"
         assert "NVDA" in risk_state.open_positions, "NVDA must remain untouched"
@@ -273,13 +277,14 @@ def test_flatten_all_concurrent():
         ibkr = MagicMock()
         ibkr.submit = _slow_submit
         ibkr.cancel_all_orders = AsyncMock()
-        ibkr.snapshot_quote = AsyncMock(return_value=(150.0, 151.0))
 
         telegram = AsyncMock()
         session_clock = MagicMock()
         session_clock.date = date.today()
 
         with patch("live.orders.worker.get_pool", return_value=_MockPool()), \
+             patch("live.orders.worker.fetch_mark",
+                   AsyncMock(return_value=(150.0, 151.0, 150.5))), \
              patch("live.feed.market_status.is_tradable_now", return_value=True):
             start = time.monotonic()
             await _execute_flatten_all(ibkr, risk_state, telegram, "test_concurrent", session_clock)

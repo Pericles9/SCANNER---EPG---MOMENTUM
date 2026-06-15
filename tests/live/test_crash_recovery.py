@@ -246,6 +246,14 @@ def test_single_rth_position_market_order(monkeypatch):
     assert notes["final_status"] == "CLOSED"
 
 
+# ── Massive price stub (crash recovery prices from Massive REST, not IBKR) ──────
+
+def _mark_stub(bid, ask, last):
+    async def _fm(ticker, api_key=None, **kw):
+        return (bid, ask, last)
+    return _fm
+
+
 # ── 3. Single pre-market position → marketable EXT limit ────────────────────────
 
 def test_single_pre_market_position_ext_limit(monkeypatch):
@@ -255,6 +263,8 @@ def test_single_pre_market_position_ext_limit(monkeypatch):
         fill_plans=[{"fill": True, "price": 239.9}],
         ticker=_Ticker(bid=240.0, ask=240.04, last=240.0),
     )
+    monkeypatch.setattr("live.recovery.crash_recovery.fetch_mark",
+                        _mark_stub(240.0, 240.04, 240.0))
     conn = FakeConn(owned=["TSLA"], open_count=1)
 
     result = asyncio.run(run_crash_recovery(ib, FakePool(conn), None, _SD))
@@ -277,6 +287,8 @@ def test_illiquid_pre_market_reprices_once(monkeypatch):
         fill_plans=[{"fill": False}, {"fill": True, "price": 5.05}],
         ticker=_Ticker(bid=5.10, ask=5.14, last=5.10),
     )
+    monkeypatch.setattr("live.recovery.crash_recovery.fetch_mark",
+                        _mark_stub(5.10, 5.14, 5.10))
     conn = FakeConn(owned=["ABC"], open_count=1)
 
     result = asyncio.run(run_crash_recovery(ib, FakePool(conn), None, _SD))
@@ -299,6 +311,8 @@ def test_stuck_position_when_never_fills(monkeypatch):
         fill_plans=[],            # every placeOrder → no fill
         ticker=_Ticker(bid=5.0, ask=5.04, last=5.0),
     )
+    monkeypatch.setattr("live.recovery.crash_recovery.fetch_mark",
+                        _mark_stub(5.0, 5.04, 5.0))
     conn = FakeConn(owned=["ZZZ"], open_count=1)
 
     result = asyncio.run(run_crash_recovery(ib, FakePool(conn), None, _SD))

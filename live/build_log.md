@@ -413,3 +413,204 @@ Kelly formula: `f* = win_rate/avg_loss - (1-win_rate)/avg_win`. Fractional: `f* 
 `main.py` spawns `equity_refresher()` as a named asyncio task. Queries `ibkr.get_account_equity()` (IBKR `NetLiquidation` account value) every 300 seconds. Updates `risk_state.account_equity` — used for Kelly sizing in subsequent orders. Errors are logged but do not halt the system.
 
 ---
+
+## 2026-06-15 — Feed Reliability + LULD WS Integration
+
+### Feed reliability — $0 mark
+
+**GATE 0 root cause (confirmed by static analysis; live instrumentation added for corroboration).**
+
+An open position up >30% intraday displayed as `$0` on Telegram `/positions`. Root cause
+is hypothesis **(a): empty / zero-state `_sf_prices` buffer falling back to a hard `0.0`,
+compounded by missing `cur_price > 0` guards in the readouts.** It is **independent of LULD
+halts** — LULD will not fix it.
+
+**The mark source.** Every readout sources the displayed mark from
+`signal_state.last_price`:
+- `LiveSignalState.last_price` → `self._sf_prices[-1] if self._sf_prices else 0.0`
+  (`live/signals/live_state.py:600-602`).
+- `VwapSignalState.last_price` → `self._last_price` (initialised `0.0`,
+  `live/signals/scanner_vwap.py:48,398`).
+
+`_sf_prices` is the **setup-filter bar buffer**, not a dedicated last-trade field. It is
+seeded from `ctx.tick_prices` at construction and appended only on non-deduped, non-frozen
+trade ticks inside `update_trade`. It returns a hard `0.0` whenever the buffer is empty.
+
+**When the buffer is empty for an open position:**
+- A **degraded / zero-state session** (`cold_start_n` below `degraded_min_trades`, or a
+  context-fetch timeout — `context_fetch.py:464-465` returns `cold_start_n=0`) seeds an empty
+  or near-empty buffer.
+- A **position recovered at startup** (`existing_position` path in
+  `universe.py:_context_fetch_and_start`) calls `record_entry()` immediately; until the first
+  live trade prints, `last_price == 0.0`.
+- During a **halt at/around the open**, no trades print, so the buffer never primes and the
+  `0.0` persists for the whole halt.
+
+**Why it printed a fake catastrophic loss.** The buffer `0.0` then flowed unguarded into the
+unrealised-P&L math:
+- `/risk` (`handlers.py:269-271`) — `unreal_total += (cur - avg_cost) * qty` with **no
+  `cur > 0` guard**.
+- hourly P&L (`worker.py:524-526`) — same, **no guard**.
+- `/status` (`handlers.py:136-139`) and `/summary` (`handlers.py:399-406`) — same, no guard.
+- `/positions` (`handlers.py:226-251`) guards the *total* (`if cur_price > 0`) but still
+  renders `format_position_block(current_price=0.0)` → `Current: $0.00` and
+  `Unrealised: (0 − avg_cost) × qty` = the full notional as a loss in the per-ticker block.
+
+**Causes ruled out:**
+- **(b) ctx evicted while position open** — `handle_snapshot_dropoffs` and the SF/VWAP
+  disqualify paths all guard on `not has_position` / state `FLAT`, so an open position's ctx
+  stays in `universe`. Only the 20:00 ET `session_close` sweep removes it, and that flattens
+  first.
+- **(c) signal_state recreated on WS reconnect** — `_ws_connect_and_run` only re-subscribes;
+  the `TickerContext` and its `signal_state` persist in `self._universe`. No re-priming gap.
+
+**Instrumentation added (Phase 0, diagnostic-only, no logic change):** `live/bot/diag.py`
+`dump_zero_mark()` — a one-shot (per where/ticker) WARNING dump fired from `/positions`,
+`/risk`, and the hourly-P&L loop whenever an open position resolves to a `0`/`None` mark. It
+reports `last_price`, `len(_sf_prices)`, `last_bid/ask`, `_in_position`, universe membership,
+`state_ready`, `degraded_mode`/`cold_start_n` (from `sessions`), WS/heartbeat ages, and
+`is_tradable_now()`. The fix is robust to all of (a)/(b)/(c).
+
+
+### Phase 1 — Price-source hardening (the $0 fix)
+
+#### [BUG] $0 mark fixed by a dedicated last-trade field + a never-zero mark() ladder
+
+**Change.** Added an authoritative mark source to both `LiveSignalState` and
+`VwapSignalState`, decoupled from the setup-filter bar buffer:
+- `self._last_trade_price` / `self._last_trade_ts_ns` — set on every valid (`price > 0`)
+  live trade in `update_trade()`; `LiveSignalState` also seeds `_last_trade_price` from the
+  last historical SF tick. `VwapSignalState` keeps its internal `_last_price` (VWAP/bar-close
+  math) untouched and tracks the display mark separately.
+- `mark(now_ns, stale_s=5.0) -> (price, source, age_s)`, `source ∈
+  {LIVE, MID, STALE, HALTED, NONE}`. Priority: fresh last-trade → `LIVE`; else two-sided
+  quote mid → `MID`; else stale last-trade → `STALE` (or `HALTED` when `_halted`, set in
+  Phase 2); else `(None, 'NONE', 0.0)`. **Never returns 0.0 as a real price.**
+- `last_price` property retained for back-compat but re-backed by the same ladder
+  (last-trade → mid → buffer tail), returning `None` instead of a silent `0.0`.
+
+**Readouts.** New `format_mark()` in `live/bot/formatters.py` renders the tuple with a source
+tag and renders a missing/zero mark as `—`, never `$0.00`. `format_position_block` now takes
+`Optional[current_price]` + `mark_str` and suppresses the (fake) unrealised line when the mark
+is absent. All readouts route through `mark()` + `format_mark()`: `/positions`, `/status`,
+`/risk`, `/summary`, and the hourly P&L loop. The unguarded unrealised-P&L math in `/risk`,
+`/summary`, and hourly P&L now skips a `0`/`None` mark — eliminating the fake catastrophic-loss
+print.
+
+**Tests.** `tests/live/test_mark_source.py` (25 tests): the `mark()` ladder on both signal
+states (LIVE/MID/STALE/HALTED/NONE, never 0.0), `update_trade` wiring the last-trade fields,
+and `format_mark` / `format_position_block` rendering `—` (never `$0.00`) for a missing mark.
+Full `tests/live` suite: **179 passed, 5 skipped**.
+
+
+### Phase 2 — Massive LULD WS integration (detection / display / safety only)
+
+#### [DECISION] LULD WS added for halt awareness; the LULD exit signal stays disabled
+
+**Subscriptions.** `universe.py` now subscribes `LULD.{ticker}` alongside `T.`/`Q.` in the
+initial subscribe, the post-reconnect re-subscribe, and the unsubscribe-on-remove. The WS
+message loop was refactored to accept `ev ∈ {T, Q, LULD}`, normalise timestamps (LULD `t` is
+ms, same as T/Q — `_normalize_ws_timestamps` already converts the `t` field), and update the
+global `ws_last_msg_t` heartbeat for any of the three.
+
+**Routing.** LULD events carry the ticker in field **`T`** (not `sym`), so the existing
+`_dispatch` (keyed on `sym`) would silently drop every LULD message. Added `_dispatch_luld`
+which resolves the ticker from `T`, looks up the ctx, and calls
+`signal_state.update_luld(msg)` synchronously. Late / unknown tickers drop cleanly. Telegram
+HALT / RESUME alerts (deduped — fired only on the state-transition edge, RESUME includes the
+halt duration) are sent from the dispatch layer, keeping the signal_state free of broker/DB/
+telegram coupling.
+
+**Signal state.** `update_luld(msg)` (on both `LiveSignalState` and `VwapSignalState`) stores
+`_luld_bands`, `_luld_indicators`, and a monotonic `_luld_last_seen` (used by Phase 3). It sets
+`_halted=True` on indicator **17** (and calls the existing `freeze()` on `LiveSignalState`),
+clears it on **18** (calls `resume(duration)`), and **returns only a `('HALT'|'RESUME', dur)`
+marker or `None` — never an order signal.** Indicators 17/18 are NASDAQ-only (`z==3`); other
+tapes carry only bands (Phase 3 infers halt for those). `is_halted()` exposes the flag;
+`mark()` reports source `HALTED` for a stale trade while halted.
+
+**Display.** `/positions` shows a `⛔ HALTED (LULD band $l–$h)` badge and `/status` appends a
+`[HALTED]` tag when `is_halted()`.
+
+**Tests.** `tests/live/test_luld_ws.py` (14 tests): ms→ns normalisation, `T`-field routing
+(+ unknown/missing-`T` clean drops), band/indicator storage, 17→halt / 18→resume with
+duration, duplicate-17 no re-trigger, non-Nasdaq (`z!=3`) band breach does NOT halt, and no
+order signal produced. Full `tests/live`: **193 passed, 5 skipped**.
+
+
+### Phase 3 — Halt vs feed-death disambiguation (stop halts triggering flatten)
+
+#### [BUG] Dead-man's switch force-flattened on a halt; now halt-aware
+
+**Problem.** A halt produces the same per-ticker T/Q gap as feed death, so the
+dead-man's switch (`heartbeat_monitor`) would `FlattenTicker` a halted position —
+contradicting the locked rule "do not force-exit on halt alone".
+
+**Fix.** `heartbeat_monitor` now threads the global `ws_last_msg_t` box and `telegram` in
+(from `UniverseManager._heartbeat_loop`). The per-pass decision was extracted into the
+testable `_dead_mans_switch_pass`. For each stale ticker with an open position:
+- **Real halt** (`signal_state.is_halted()`, indicator 17) **or halt-suspected** (T/Q stale
+  but `luld_last_seen` fresh — covers NYSE/AMEX where 17/18 don't exist) → **HOLD**, alert once,
+  start a grace timer. Escalate a single `FlattenTicker(reason="halt_hold_cap_exceeded")` only
+  if the hold exceeds `CFG.luld.max_halt_hold_s` (new config, default 1800s).
+- **No halt evidence** → flatten X only when the global WS is healthy (true symbol feed
+  death); if the global WS is also stale, **defer to the WS-disconnect path** (it owns that).
+  Bookkeeping (`halt_since`/`alerted`/`escalated`) is cleared when a ticker recovers.
+
+**`ws_healthy` default.** When no WS box is supplied (e.g. legacy call sites / tests),
+`ws_healthy` defaults to True so true feed-death still flattens — preserving prior behavior;
+the gate only *suppresses* a flatten when the global WS is positively known to be down.
+
+**Flatten-escalation coordination.** `fix_flatten_escalation.md` has **already landed** — the
+dead-man path was already issuing `FlattenTickerRequest` (per-ticker), not an account-wide
+`FlattenAllRequest`. No request-type change needed; only the halt-aware skip was added.
+
+**Tests.** `tests/live/test_dead_mans_switch.py` (7 tests): halted → no flatten; halt-suspected
+(LULD fresh) → no flatten; true feed death (WS healthy) → flatten (`dead_mans_switch`); feed
+death with WS down → defer; no position → skip; hard-cap escalates exactly once; recovery clears
+bookkeeping. Full `tests/live`: **200 passed, 5 skipped**.
+
+
+## 2026-06-15 — Pricing from Massive, never IBKR (fix stuck crash-recovery exit)
+
+### [BUG] Crash recovery priced exits from IBKR market data → 10089 stall wedged startup
+
+**Locked principle (now in CLAUDE.md):** IBKR is **portfolio / positions / account /
+order-execution only**. All market-data pricing comes from **Massive (Polygon)**.
+
+**Root cause.** `recovery/crash_recovery.py::_get_quote` called `ib.reqMktData`, and the
+flatten paths (`worker.py::_execute_flatten_all`/`_execute_flatten_ticker`) called
+`IBKRClient.snapshot_quote` (`reqTickersAsync`) — both IBKR **market data**. On the paper
+account post-market there is no live data subscription: IBKR returns **Error 10089** and
+`(0,0)`. Crash recovery then priced limits off `avg_cost`, never filled, marked positions
+STUCK, and `main.py` `sys.exit(1)`-halted startup → Docker restart loop, `/tmp/epg_alive`
+never written → container **unhealthy**. (This is what surfaced after the LULD rebuild.)
+
+**Fix.**
+- **`live/feed/massive.py::fetch_mark(ticker, api_key)`** — single-ticker Polygon snapshot
+  → `(bid, ask, last_trade)`; NBBO-preferred, last-trade fallback; never raises. Reuses
+  `POLYGON_API_KEY`. Pure `_parse_snapshot` for testability.
+- **crash_recovery** — `_get_quote` (IBKR `reqMktData`) removed; replaced by
+  `_get_quote_massive` (bounded retry budget: `_MASSIVE_PRICE_RETRIES`, so recovery can
+  never wedge the heartbeat). `run_crash_recovery` takes `polygon_api_key` (threaded from
+  `main.py`). If Massive has **no** price after the budget, recovery does **not** blind-fire
+  an `avg_cost` order or mark STUCK — it routes to **DEFERRED** (manual review, non-halting)
+  so recovery finishes and the main loop starts.
+- **worker flatten paths** — `snapshot_quote` → `fetch_mark`; NBBO bid (last-trade fallback,
+  `avg_cost*0.5` emergency last resort). `expected_price` still set for slippage.
+- **`IBKRClient.snapshot_quote` removed** — replaced by a guard comment forbidding any
+  IBKR quote/price method, so the 10089 path cannot be reintroduced. Execution calls
+  (`positions`, `get_open_positions`, `get_account_equity`, `openOrders`/`openTrades`,
+  `has_open_order_for`, `cancel_all_orders`, `submit`) are untouched.
+
+**Audit (Task 3).** Grep for `reqMktData` / `reqTickers*` / `snapshot_quote` across `live/`:
+the only remaining references are the guard comment in `ibkr.py`. No pricing/signal path
+uses IBKR market data.
+
+**Tests.** `tests/live/test_massive.py` (5), `tests/live/test_crash_recovery_pricing.py` (4:
+Massive-priced submit with IBKR market data never called; Massive-empty → DEFER, no blind
+order, no STUCK, alert; 10089-no-longer-blocks; module-has-no-IBKR-quote guard). Existing
+`test_crash_recovery.py` extended-hours tests + `test_flatten_escalation.py` repointed to
+mock `fetch_mark` and assert IBKR market data is never called. Full `tests/live`: **209
+passed, 5 skipped**.
+

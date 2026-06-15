@@ -279,12 +279,14 @@ Runs before any trading begins. A crash == dead man's switch scenario: cancel al
 | Position sizing (paper v1) | Flat $1,000 RTH / $500 pre-market. |
 | Unfilled limit cancel | 5 seconds — do not chase. |
 | Timestamps | All nanoseconds UTC throughout. No timezone assumptions in data layer. |
-| IBKR data | Execution quotes only. Not the primary feed. |
+| IBKR data | [SUPERSEDED 2026-06-15] Execution quotes only. Not the primary feed. |
+| IBKR = execution only; pricing from Massive | [2026-06-15] IBKR is used for **portfolio / positions / account / order execution ONLY**. **All** market-data pricing — context fetch, signal, **crash-recovery exits**, and the **flatten paths** (kill / dead-man / pending-close) — comes from **Massive (Polygon) REST/WS** (`live/feed/massive.py::fetch_mark`). `IBKRClient` exposes **no** quote/price method (`snapshot_quote` / `reqMktData` / `reqTickersAsync` removed). Rationale: the paper account has no live market-data subscription, so IBKR `reqMktData` returns Error 10089 / `(0,0)` — this stalled crash recovery and wedged startup (`/tmp/epg_alive` never written → unhealthy restart loop). IBKR needs no data subscription to *execute* a marketable limit, so pricing from Massive and submitting to IBKR is sufficient. |
 | PDT Rule | Paper trading only until rule change. Do not remove paper trading constraints. |
-| `exit_reason` codes (scanner_vwap) | `vwap_close`, `hard_stop` — additive VARCHARs; no schema migration required. |
+| `exit_reason` codes (scanner_vwap) | `vwap_close`, `vwap_cross`, `hard_stop` — additive VARCHARs; no schema migration required. |
 | `signal_events.event_type` (scanner_vwap) | `VWAP_ARMED`, `VWAP_ENTRY`, `VWAP_EXIT`, `HARD_STOP` — additive; EPG fields NULL. |
 | `scanner_vwap` strategy registration | `id = 'scanner_vwap'` in `strategies` table — inserted idempotently in `init_db.sql`. |
 | `CFG.strategy_id` derivation | Auto-derived in `load_config()` from `active_strategy`: `"epg"` → `"epg_v1"`, `"scanner_vwap"` → `"scanner_vwap"`. |
+| LULD WS (Massive) | Subscribed as `LULD.{ticker}` alongside `T.`/`Q.` (initial subscribe, post-reconnect re-subscribe, and unsubscribe). **Detection / display / safety only.** `signal_state.update_luld(msg)` (routed by field `T`, not `sym`) sets `_halted`/bands and returns a HALT/RESUME marker for alerting — it never emits an order signal. The LULD *exit* signal stays disabled (`CFG.luld.enabled=False`, quote-derived `LuldProximityExit`); the order/exit path is byte-for-byte unchanged. Indicators 17 (halt) / 18 (resume) are NASDAQ-only (`z==3`); other tapes carry only bands. |
 
 ---
 
@@ -305,12 +307,15 @@ These were identified in research but are not active:
 | Failure | Required Response |
 |---|---|
 | Context fetch timeout (> 10s) | Global `lambda_ref` fallback. SlopeGate from zero state. Log DEGRADED. Continue. |
-| LULD halt during position | Freeze signal state. Resume on first post-halt tick. Do not exit on halt alone. |
+| LULD halt during position | [SUPERSEDED 2026-06-15 — quote-proximity only] Freeze signal state. Resume on first post-halt tick. Do not exit on halt alone. |
+| LULD halt during position | [2026-06-15 halt-aware] Real Massive LULD WS sets `is_halted()` (indicator 17) and freezes `LiveSignalState`; cleared on 18. The dead-man's switch does NOT flatten a halted (or halt-suspected: T/Q stale but LULD still arriving — covers NYSE/AMEX) ticker. Still no order-path exit on halt alone. Escalates a single `FlattenTicker` only if the hold exceeds `CFG.luld.max_halt_hold_s` (1800s). `/positions` shows a `⛔ HALTED` badge + bands; halt/resume Telegram alerts are deduped (resume includes duration). |
 | Pre-market — no quote > 30s | Soft halt. Pause processing. Do not force-exit. |
 | Queue full | `put_nowait` drops tick. Log WARNING. Bounded by design. |
 | Open positions on startup | Crash recovery runs. Flattens all before trading begins. |
+| Open position displays `$0` mark | [FIXED 2026-06-15] `signal_state.mark(now_ns)` returns `(price, source, age)` from a dedicated last-trade field (then quote mid, then buffer) — never a silent `0.0`. Readouts render `—` via `format_mark()`; `/risk`, `/status`, `/summary`, hourly P&L skip unrealised P&L when the mark is `0`/`None`. Root cause was the empty-`_sf_prices`→`0.0` fallback + missing guards (see build_log.md). |
 | Dead man's switch | [SUPERSEDED — see build_log.md 2026-06-08] No heartbeat > 30s during open position → flatten all immediately. |
-| Dead man's switch | No heartbeat >30s for ticker X with open position → FlattenTickerRequest for X only. FlattenAllRequest reserved for kill switch, daily loss auto-kill, and WS disconnect (60s) only. |
+| Dead man's switch | [SUPERSEDED 2026-06-15 — halt-unaware] No heartbeat >30s for ticker X with open position → FlattenTickerRequest for X only. FlattenAllRequest reserved for kill switch, daily loss auto-kill, and WS disconnect (60s) only. |
+| Dead man's switch | [2026-06-15 halt-aware] Stale ticker X with open position: if `is_halted()` or halt-suspected (LULD still arriving) → HOLD (do not flatten); escalate one `FlattenTicker` only past `CFG.luld.max_halt_hold_s`. Else flatten X only when the global WS is healthy (true symbol feed death); if the global WS is also stale, defer to the WS-disconnect path. `FlattenTickerRequest` still per-ticker; `FlattenAllRequest` reserved for kill / daily-loss auto-kill / WS-disconnect (60s). |
 | Unfilled limit order | Cancel after 5s. Do not chase. Do not resubmit. |
 | `dv=0` in setup filter | `τ_t = μ_τ(t-1)` — handled in `setup_filter.py`. Do not add logic. |
 
@@ -356,14 +361,21 @@ DATA_ROOT=/data
 | Parameter | Value | Notes |
 |---|---|---|
 | `vwap_anchor` | `per_bucket` | VWAP resets at each session bucket boundary (pre-market → RTH). |
-| Entry | Bar-close strictly above VWAP | Requires `_armed=True` (SF gate or always-armed). |
-| Exit | Bar-close strictly below VWAP | `VWAP_CLOSE` signal. |
+| Entry | Bar-close strictly above VWAP | Unchanged in all modes. Requires `_armed=True`. |
+| Exit (`vwap_exit_mode=tick`) | **First trade below running VWAP** | `VWAP_CROSS` signal. **Current live behavior.** HEURISTIC/UNVALIDATED. |
+| ~~Exit (`vwap_exit_mode=bar_close`)~~ | ~~Bar-close strictly below VWAP~~ | ~~`VWAP_CLOSE` signal.~~ **SUPERSEDED** by tick mode as live default. Code retained — flip `vwap_exit_mode` to restore. |
 | `hard_stop_pct` | 0.12 | Intra-bar crash backstop. Not the working stop. |
 | `one_shot_per_session` | true | After any exit: `session_done_callback` → `closed_today.add(ticker)` for the day. |
 | `setup_filter_gate` | true | SF gates arming. Same admission (1-bar, `q_tilde >= 0.65`) and removal (15 consecutive bars) as EPG. |
 | `skip_hawkes` | false | Context fetch runs Hawkes replay as-is. VwapSignalState ignores the Hawkes output. |
 
+**Exit reason codes:**
+- `VWAP_CROSS` — tick-level exit (price < running VWAP); `vwap_exit_mode="tick"`.
+- `VWAP_CLOSE` — bar-close exit (bar close < VWAP); `vwap_exit_mode="bar_close"`. Both modes supported; `bar_close` is the pre-June-2026 behavior.
+- `HARD_STOP` — intra-bar crash backstop; either mode.
+
 **Open config forks (pending live validation):**
+- `vwap_exit_mode`: `"tick"` vs `"bar_close"` — tick is tighter and faster; bar_close may reduce noise. Pending live comparison.
 - `setup_filter_gate`: true/false — is SF arming necessary for VWAP entry quality?
 - `vwap_anchor`: `"per_bucket"` vs `"rth_only"` — does including pre-market ticks in VWAP help or hurt?
 

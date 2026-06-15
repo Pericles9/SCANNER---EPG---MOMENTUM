@@ -42,13 +42,16 @@ from typing import Optional
 from ib_insync import IB, LimitOrder, MarketOrder, Stock
 
 from live.config import CFG
+from live.feed.massive import fetch_mark
 from live.feed.market_status import current_session_bucket, is_tradable_now
 
 log = logging.getLogger(__name__)
 
 # ── Tunable timeouts (module-level so tests can monkeypatch to small values) ──
 _CANCEL_CONFIRM_TIMEOUT_S = 5.0    # per-order cancel confirmation
-_QUOTE_TIMEOUT_S = 5.0             # reqMktData wait for a usable quote
+_QUOTE_TIMEOUT_S = 5.0             # Massive REST price fetch timeout
+_MASSIVE_PRICE_RETRIES = 2         # bounded — recovery must never wedge liveness
+_MASSIVE_PRICE_RETRY_S = 0.5
 _FILL_POLL_S = 1.0                 # poll cadence while waiting on a fill
 _PRIMARY_TIMEOUT_S = 30.0          # first close attempt
 _SECONDARY_TIMEOUT_S = 30.0        # re-priced close attempt
@@ -96,6 +99,7 @@ async def run_crash_recovery(
     pool,
     telegram=None,
     session_date: Optional[date] = None,
+    polygon_api_key: Optional[str] = None,
 ) -> CrashRecoveryResult:
     """Cancel all orders, flatten all positions, reconcile the DB to flat.
 
@@ -131,7 +135,7 @@ async def run_crash_recovery(
         strat = CFG.strategy_id if ticker in owned else "UNKNOWN"
         rec = _CloseRecord(ticker=ticker, ibkr_qty=pos["qty"], strategy_id=strat)
         try:
-            await _close_one(ib, pos, rec, tradable, telegram)
+            await _close_one(ib, pos, rec, tradable, telegram, polygon_api_key)
         except Exception:
             log.critical("Crash recovery: unhandled error closing %s", ticker, exc_info=True)
             rec.final_status = "ERROR"
@@ -250,6 +254,7 @@ async def _fetch_positions(ib: IB) -> list[dict]:
 
 async def _close_one(
     ib: IB, pos: dict, rec: _CloseRecord, tradable: bool, telegram,
+    api_key: Optional[str] = None,
 ) -> None:
     ticker = pos["ticker"]
     qty = pos["qty"]
@@ -283,7 +288,7 @@ async def _close_one(
         await _close_with_market(ib, contract, action, abs_qty, rec, ticker, telegram)
     else:
         await _close_with_limits(
-            ib, contract, action, abs_qty, is_long, pos["avg_cost"], rec, ticker, telegram,
+            ib, contract, action, abs_qty, is_long, pos["avg_cost"], rec, ticker, telegram, api_key,
         )
 
 
@@ -311,11 +316,34 @@ async def _close_with_market(
 async def _close_with_limits(
     ib: IB, contract, action: str, qty: int, is_long: bool,
     avg_cost: float, rec: _CloseRecord, ticker: str, telegram,
+    api_key: Optional[str] = None,
 ) -> None:
     """Extended-hours close: marketable limit ladder, tif=EXT, outsideRth.
-    Cross the spread aggressively, widen on each failed attempt, then STUCK."""
+
+    Price reference comes from Massive REST (NBBO bid/ask, last-trade fallback) —
+    IBKR is execution-only and its market data is never used for pricing. Cross the
+    spread aggressively, widen on each failed attempt, then STUCK.
+
+    If Massive has no price after a bounded budget, do NOT blind-fire an avg_cost
+    order into an illiquid post-market book (it cannot fill → wedges startup):
+    leave the position open for manual handling (DEFERRED, non-halting) so recovery
+    finishes and the main loop can start.
+    """
     rec.order_type = "LMT"
-    bid, ask, last = await _get_quote(ib, contract)
+    bid, ask, last = await _get_quote_massive(ticker, api_key)
+    if not (bid > 0 or ask > 0 or last > 0):
+        rec.final_status = "DEFERRED"
+        log.critical(
+            "Crash recovery: %s — no Massive price after %d attempts; leaving OPEN for manual handling",
+            ticker, _MASSIVE_PRICE_RETRIES,
+        )
+        if telegram is not None:
+            await telegram.send_silent(
+                f"🔴 CRASH RECOVERY: {ticker} ({rec.ibkr_qty:+d}) — no Massive price available; "
+                f"position left OPEN for manual handling. MANUAL REVIEW NEEDED."
+            )
+        return
+
     ladder = (
         (_AGGR_PRIMARY, _PRIMARY_TIMEOUT_S),
         (_AGGR_SECONDARY, _SECONDARY_TIMEOUT_S),
@@ -335,7 +363,7 @@ async def _close_with_limits(
             _mark_filled(rec, trade)
             return
         _safe_cancel(ib, trade)
-        bid, ask, last = await _get_quote(ib, contract)  # refresh before widening
+        bid, ask, last = await _get_quote_massive(ticker, api_key)  # refresh before widening
 
     await _mark_stuck(rec, ticker, telegram)
 
@@ -359,41 +387,19 @@ def _ext_limit_price(
 
 # ── Quote + fill helpers ──────────────────────────────────────────────────────
 
-async def _get_quote(ib: IB, contract) -> tuple[float, float, float]:
-    """Return (bid, ask, last). Best-effort via reqMktData with a timeout."""
-    try:
-        ticker = ib.reqMktData(contract, "", False, False)
-    except Exception:
-        log.exception("Crash recovery: reqMktData failed for %s",
-                      getattr(contract, "symbol", "?"))
-        return (0.0, 0.0, 0.0)
-
-    bid = ask = last = 0.0
-    try:
-        elapsed = 0.0
-        poll = min(0.25, _QUOTE_TIMEOUT_S) or 0.25
-        while True:
-            bid = _valid_px(getattr(ticker, "bid", None))
-            ask = _valid_px(getattr(ticker, "ask", None))
-            last = _valid_px(getattr(ticker, "last", None))
-            if bid > 0 and ask > 0:
-                break
-            if elapsed >= _QUOTE_TIMEOUT_S:
-                break
-            await asyncio.sleep(poll)
-            elapsed += poll
-        if bid <= 0 or ask <= 0:
-            log.warning(
-                "Crash recovery: %s incomplete quote bid=%.2f ask=%.2f last=%.2f — "
-                "using available proxy",
-                getattr(contract, "symbol", "?"), bid, ask, last,
-            )
-        return (bid, ask, last)
-    finally:
-        try:
-            ib.cancelMktData(contract)
-        except Exception:
-            pass
+async def _get_quote_massive(ticker: str, api_key: Optional[str]) -> tuple[float, float, float]:
+    """Return (bid, ask, last) from Massive REST. IBKR is execution-only — its market
+    data is never used for pricing. Bounded retry budget so recovery never wedges the
+    health heartbeat; returns (0.0, 0.0, 0.0) when Massive has nothing."""
+    for attempt in range(_MASSIVE_PRICE_RETRIES):
+        bid, ask, last = await fetch_mark(ticker, api_key, timeout_s=_QUOTE_TIMEOUT_S)
+        if (bid and bid > 0) or (ask and ask > 0) or (last and last > 0):
+            return (bid or 0.0, ask or 0.0, last or 0.0)
+        if attempt + 1 < _MASSIVE_PRICE_RETRIES:
+            await asyncio.sleep(_MASSIVE_PRICE_RETRY_S)
+    log.warning("Crash recovery: %s — Massive returned no price after %d attempts",
+                ticker, _MASSIVE_PRICE_RETRIES)
+    return (0.0, 0.0, 0.0)
 
 
 def _valid_px(x) -> float:
