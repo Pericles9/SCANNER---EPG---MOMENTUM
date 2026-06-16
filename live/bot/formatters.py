@@ -32,6 +32,8 @@ def format_mark(price: Optional[float], source: str, age_s: float = 0.0) -> str:
         return "—"
     if source == "MID":
         return f"${price:.2f} (mid)"
+    if source == "REST":
+        return f"${price:.2f} (REST)"
     if source == "HALTED":
         return f"${price:.2f} (halted)"
     if source == "STALE":

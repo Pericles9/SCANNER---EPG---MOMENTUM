@@ -226,6 +226,8 @@ def test_pending_close_monitor_enqueues_flatten_ticker():
 
         ibkr = MagicMock()
         ibkr.has_open_order_for = MagicMock(return_value=False)
+        # IBKR still reports the position held → auto-reconcile leaves it; monitor retries.
+        ibkr.get_open_positions = MagicMock(return_value={"STUCK": (100, 10.0)})
         telegram = AsyncMock()
 
         sleep_calls = [0]

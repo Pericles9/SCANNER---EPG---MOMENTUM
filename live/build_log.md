@@ -614,3 +614,81 @@ order, no STUCK, alert; 10089-no-longer-blocks; module-has-no-IBKR-quote guard).
 mock `fetch_mark` and assert IBKR market data is never called. Full `tests/live`: **209
 passed, 5 skipped**.
 
+
+### [BUG] scanner_vwap orphaned just-opened positions (no price, unmanaged)
+
+**Symptom.** `/positions` showed `Current: —` for 3 of 4 open positions (and a 75-min
+`STALE` mark for the 4th). The three had `EPG gate: ?` / `Scanner: Q?` → no `TickerContext`
+in the universe at all, so nothing to price them from — and, worse, no signal_state means
+**no VWAP/hard-stop exit is ever generated** for them (unmanaged until session close).
+
+**Root cause (race).** `VwapSignalState.update_trade` had an external-close reconciliation:
+`if _state=="LONG" and not risk_state.has_position(ticker): → CLOSED + session_done`. But
+`signal_loop` calls `record_entry()` **optimistically** when the ENTRY order is *queued*
+(`_state="LONG"`), before the BUY fills. In the fill-in-flight window the strategy is `LONG`
+while `risk_state` has no position yet → the next tick misread this as an external close →
+`session_done` → `_vwap_session_done_callback` removed the ctx and added the ticker to
+`closed_today`. Then the entry filled: position open in `risk_state`, ctx gone, locked out.
+Logs confirmed: `external close detected` fired ~120 ms *before* the BUY `placeOrder`.
+
+**Fix.** Added a `_position_confirmed` latch (set once `has_position` is observed True while
+`LONG`). The external-close branch now requires `_position_confirmed` — so the entry-fill-in-
+flight window can no longer be mistaken for an external close. Genuine external closes (kill
+switch / EOD / manual flatten after the fill) still fire correctly. Exit checks
+(VWAP_CROSS/HARD_STOP) were deliberately NOT gated on the latch (HARD_STOP already requires an
+avg_cost from risk_state; VWAP_CROSS is bar/price-driven).
+
+**Display robustness.** Added `live/feed/massive.py::resolve_mark(signal_state, ticker,
+now_ns)` — prefers the live WS-fed `signal_state.mark()`, falls back to a Massive REST
+`fetch_mark` when the WS mark is stale/absent OR there is no signal_state (orphaned position).
+Wired into `/positions`, `/status`, `/risk`, `/summary`, and hourly P&L; `format_mark` renders
+the fallback as `$X.XX (REST)`. An open position now always shows a real mark.
+
+**Current orphans.** The already-orphaned positions are cleaned up on the next restart:
+crash recovery (now Massive-priced) flattens all open IBKR positions. The race fix prevents
+new orphans; a periodic "adopt untracked open position into the universe" reconciler remains a
+recommended follow-up (so a mid-session orphan would be re-managed without a restart).
+
+**Tests.** `TestEntryFillRace` (2: in-flight not closed; external-close only after confirmed),
+`resolve_mark` (4), `format_mark` REST tag (1). Full `tests/live`: **216 passed, 5 skipped**.
+
+## 2026-06-16 — Exit-timeout retry loop fix (YYGH)
+
+### [BUG] A non-filling exit spun in an infinite retry + Telegram-spam loop
+
+**Symptom.** YYGH spammed `EXIT TIMEOUT: YYGH — added to pending_close for retry` every ~6 s.
+
+**Root cause (two compounding issues).**
+1. **Two retry authorities in parallel.** On each 5 s `unfilled_cancel_sec` timeout the
+   `order_worker` main path added the ticker to `pending_close` AND called
+   `request.on_fill_failed()` (= `clear_exit_pending`), **re-arming the strategy**. The next
+   tick below VWAP re-emitted VWAP_CROSS → another exit → another timeout → another alert.
+   Meanwhile `pending_close_monitor` *also* retried. No dedup between them, no alert throttle.
+2. **Unfillable order.** YYGH is a real 5,952-share position (~$0.13). The exit is a marketable
+   SELL **limit** at $0.08 the IBKR paper simulator won't fill for a thin sub-$1 name.
+   `IBKRClient.submit()` is all-limit; crash recovery (which fills) uses **market** orders.
+
+**Fix A — single retry authority + throttle (`order_worker`).**
+- Skip an exit whose ticker is already in `pending_close` (and still held): `pending_close_monitor`
+  is the sole retry authority.
+- Send the EXIT TIMEOUT Telegram only when the ticker *first* enters `pending_close`.
+- Stop re-arming the strategy on timeout (removed the `on_fill_failed()` call) — once committed to
+  exit, `pending_close` owns it; `scanner_vwap`'s `_position_confirmed`-gated external-close
+  reconciliation marks it CLOSED once it actually flattens.
+
+**Fix B — actually flatten / never loop forever.**
+- `OrderRequest.order_type` ("LMT"|"MKT"); `ibkr.submit` builds a `MarketOrder` for "MKT".
+- `_execute_flatten_ticker` (+ shared `_build_flatten_request`): after
+  `_MARKET_ESCALATION_FAILS` (2) limit timeouts AND during RTH, escalate to a MARKET order
+  (mirrors crash recovery, fills illiquid names). Extended hours stay marketable-limit (market
+  orders are rejected outside RTH).
+- Hard cap `_MANUAL_REVIEW_FAILS` (6): park the ticker (→ `manual_review_required`, out of
+  `pending_close`), one manual-review alert, stop auto-retrying.
+- `pending_close_monitor`: auto-reconcile against `ibkr.get_open_positions()` (drop a phantom
+  that IBKR reports flat); skip parked tickers; throttle the "STUCK POSITION" alert to once;
+  throttle the per-retry "FLATTEN triggered" / market-closed alerts.
+
+**Tests.** `tests/live/test_exit_retry.py` (7): dedup-skip, alert-once + no-rearm, MKT submit,
+`_build_flatten_request` MKT/LMT, RTH market escalation, extended-hours stays limit, hard-cap
+park, monitor phantom-reconcile. `test_flatten_escalation.py` monitor test updated to report the
+position held at IBKR. Full `tests/live`: **224 passed, 5 skipped**.

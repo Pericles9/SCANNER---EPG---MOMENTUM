@@ -18,6 +18,7 @@ class OrderRequest:
     session_bucket: str     # 'pre_market', 'regular_hours', 'post_market'
     is_entry: bool
     exit_reason: Optional[str] = None  # 'EXIT_D', 'LULD', 'EPG_CLOSE', 'KILL', 'EOD'
+    order_type: str = "LMT"            # 'LMT' (default) | 'MKT' — MKT only valid during RTH
     limit_price: Optional[float] = None  # set for pre-market limit orders
     intraday_pct: float = 0.0           # for DB record
     expected_price: float = 0.0         # signal-time price estimate for slippage tracking

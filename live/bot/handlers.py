@@ -23,6 +23,7 @@ from live.bot.formatters import (
 )
 from live.bot.probes import run_all_probes
 from live.bot.ratelimit import is_debounced
+from live.feed.massive import resolve_mark
 
 _ET = ZoneInfo("America/New_York")
 
@@ -134,19 +135,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ticker = next(iter(open_pos))
         pos = open_pos[ticker]
         ctx = state.universe.get(ticker)
-        if ctx and ctx.signal_state:
-            ss = ctx.signal_state
-            price, src, age = ss.mark(time.time_ns())
-            mark_disp = format_mark(price, src, age)
-            halt_tag = " [HALTED]" if (hasattr(ss, "is_halted") and ss.is_halted()) else ""
-            if price and price > 0:
-                unreal = (price - pos["avg_cost"]) * pos["qty"]
-                sign = "+" if unreal >= 0 else ""
-                pos_line = f"{ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp} ({sign}${unreal:.2f}){halt_tag}"
-            else:
-                pos_line = f"{ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp}{halt_tag}"
+        ss = ctx.signal_state if ctx else None
+        price, src, age = await resolve_mark(ss, ticker, time.time_ns())
+        mark_disp = format_mark(price, src, age)
+        halt_tag = " [HALTED]" if (ss is not None and hasattr(ss, "is_halted") and ss.is_halted()) else ""
+        if price and price > 0:
+            unreal = (price - pos["avg_cost"]) * pos["qty"]
+            sign = "+" if unreal >= 0 else ""
+            pos_line = f"{ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp} ({sign}${unreal:.2f}){halt_tag}"
         else:
-            pos_line = f"{ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f}"
+            pos_line = f"{ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp}{halt_tag}"
 
     daily_pnl = state.risk_state.daily_pnl
     limit = state.risk_state.max_daily_loss
@@ -231,18 +229,18 @@ async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pos = open_pos[ticker]
         ctx = state.universe.get(ticker)
 
-        cur_price: Optional[float] = None
-        mark_str = "—"
+        ss = ctx.signal_state if ctx else None
+        # Live WS mark, falling back to a Massive REST fetch for stale-feed or
+        # orphaned (no-ctx) positions so an open position always shows a real price.
+        cur_price, _src, _age = await resolve_mark(ss, ticker, time.time_ns())
+        mark_str = format_mark(cur_price, _src, _age)
         epg_gate = "?"
         lambda_hat = 0.0
         lambda_ref = 0.0
         sc: dict = {}
         halted = False
         luld_bands = None
-        if ctx and ctx.signal_state:
-            ss = ctx.signal_state
-            cur_price, _src, _age = ss.mark(time.time_ns())
-            mark_str = format_mark(cur_price, _src, _age)
+        if ss is not None:
             epg_gate = ss.epg_gate_state
             lambda_hat = ss.last_lambda_hat
             lambda_ref = ss.last_lambda_ref
@@ -295,22 +293,23 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     unreal_total = 0.0
     for ticker, pos in rs.open_positions.items():
         ctx = state.universe.get(ticker)
-        if ctx and ctx.signal_state:
-            price, _src, _age = ctx.signal_state.mark(time.time_ns())
-            # Phase 0 diagnostic: one-shot dump when an open position resolves to a $0/None mark.
-            if not price:
-                from live.bot.diag import dump_zero_mark
-                from live.config import CFG
-                hb = state.heartbeat._last_seen.get(ticker) if hasattr(state, "heartbeat") else None
-                await dump_zero_mark(
-                    where="risk", ticker=ticker, signal_state=ctx.signal_state,
-                    in_universe=True, state_ready_set=ctx.state_ready.is_set(),
-                    ws_last_msg_t=state.ws_last_msg_t[0], heartbeat_last_seen=hb,
-                    pool=state.pool, session_date=state.session_clock.date, strategy_id=CFG.strategy_id,
-                )
-            # Guard: never compute unrealised P&L from a 0/None mark (prints a fake loss).
-            if price and price > 0:
-                unreal_total += (price - pos["avg_cost"]) * pos["qty"]
+        ss = ctx.signal_state if ctx else None
+        price, _src, _age = await resolve_mark(ss, ticker, time.time_ns())
+        # Phase 0 diagnostic: one-shot dump when an open position resolves to a $0/None mark.
+        if not price:
+            from live.bot.diag import dump_zero_mark
+            from live.config import CFG
+            hb = state.heartbeat._last_seen.get(ticker) if hasattr(state, "heartbeat") else None
+            await dump_zero_mark(
+                where="risk", ticker=ticker, signal_state=ss,
+                in_universe=(ctx is not None),
+                state_ready_set=(ctx.state_ready.is_set() if ctx else None),
+                ws_last_msg_t=state.ws_last_msg_t[0], heartbeat_last_seen=hb,
+                pool=state.pool, session_date=state.session_clock.date, strategy_id=CFG.strategy_id,
+            )
+        # Guard: never compute unrealised P&L from a 0/None mark (prints a fake loss).
+        if price and price > 0:
+            unreal_total += (price - pos["avg_cost"]) * pos["qty"]
 
     combined = rs.daily_pnl + unreal_total
     runway = rs.daily_pnl - rs.max_daily_loss
@@ -438,20 +437,18 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pos_lines: list[str] = []
     for ticker, pos in rs.open_positions.items():
         ctx = state.universe.get(ticker)
-        if ctx and ctx.signal_state:
-            price, src, age = ctx.signal_state.mark(time.time_ns())
-            mark_disp = format_mark(price, src, age)
-            if price and price > 0:
-                u = (price - pos["avg_cost"]) * pos["qty"]
-                unreal += u
-                s = "+" if u >= 0 else ""
-                pos_lines.append(
-                    f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp} ({s}${u:.2f})"
-                )
-            else:
-                pos_lines.append(f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp}")
+        ss = ctx.signal_state if ctx else None
+        price, src, age = await resolve_mark(ss, ticker, time.time_ns())
+        mark_disp = format_mark(price, src, age)
+        if price and price > 0:
+            u = (price - pos["avg_cost"]) * pos["qty"]
+            unreal += u
+            s = "+" if u >= 0 else ""
+            pos_lines.append(
+                f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp} ({s}${u:.2f})"
+            )
         else:
-            pos_lines.append(f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f}")
+            pos_lines.append(f"  {ticker} {pos['qty']}sh @ ${pos['avg_cost']:.2f} → {mark_disp}")
 
     combined = rs.daily_pnl + unreal
     runway = rs.daily_pnl - rs.max_daily_loss

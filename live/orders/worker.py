@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from live.session_clock import SessionClock
 
 from live.config import CFG
-from live.feed.massive import fetch_mark
+from live.feed.massive import fetch_mark, resolve_mark
 from live.db.pool import get_pool
 from live.orders.ibkr import Fill, IBKRClient
 from live.orders.risk import FlattenAllRequest, FlattenTickerRequest, OrderRequest, RiskState
@@ -22,6 +22,14 @@ log = logging.getLogger(__name__)
 _ET = ZoneInfo("America/New_York")
 _ALERT_START_HOUR = 4   # 04:00 ET inclusive
 _ALERT_END_HOUR = 20    # 20:00 ET exclusive
+
+# Flatten-retry escalation (per-ticker, counted via risk_state.pending_close_failures).
+# After this many consecutive limit-order timeouts, escalate the flatten to a MARKET
+# order — but only during RTH (market orders are rejected in extended hours).
+_MARKET_ESCALATION_FAILS = 2
+# Hard cap: after this many total failed flatten attempts, stop auto-retrying, park the
+# ticker for manual review, and alert once. Guarantees no infinite retry loop.
+_MANUAL_REVIEW_FAILS = 6
 
 _last_wake_t: list[float] = [0.0]
 
@@ -83,6 +91,18 @@ async def order_worker(
                     order_queue.put_nowait(FlattenAllRequest(reason="auto_kill_daily_loss"))
             continue
 
+        # Dedup against pending_close: pending_close_monitor is the SINGLE retry
+        # authority for a failed exit. A strategy that re-arms after a timeout would
+        # otherwise re-emit an exit every few seconds, hammering the broker and
+        # spamming alerts (the YYGH exit-timeout loop). Skip the duplicate here.
+        if (not request.is_entry and request.ticker in risk_state.pending_close
+                and risk_state.has_position(request.ticker)):
+            log.info(
+                "Exit for %s already in pending_close — skipping duplicate (monitor owns retry)",
+                request.ticker,
+            )
+            continue
+
         # Resolve qty for exit orders (sentinel qty=0)
         if not request.is_entry and request.qty == 0:
             pos = risk_state.open_positions.get(request.ticker)
@@ -94,16 +114,20 @@ async def order_worker(
         fill: Optional[Fill] = await ibkr.submit(request)
         if fill is None:
             if not request.is_entry:
+                # Hand off to pending_close_monitor (the single retry authority) and
+                # do NOT re-arm the strategy — once we've decided to exit we commit to
+                # flattening via pending_close, not per-tick re-fires. Alert only on the
+                # first entry to pending_close so a stuck exit can't spam Telegram.
+                newly_added = request.ticker not in risk_state.pending_close
                 log.critical(
                     "Exit order timed out: %s %s — adding to pending_close",
                     request.side, request.ticker,
                 )
                 risk_state.pending_close.add(request.ticker)
-                if request.on_fill_failed is not None:
-                    request.on_fill_failed()
-                asyncio.create_task(telegram.send_silent(
-                    f"EXIT TIMEOUT: {request.ticker} — added to pending_close for retry"
-                ))
+                if newly_added:
+                    asyncio.create_task(telegram.send_silent(
+                        f"EXIT TIMEOUT: {request.ticker} — added to pending_close for retry"
+                    ))
             else:
                 log.warning("Entry order timed out: %s %s — skipping",
                             request.side, request.ticker)
@@ -242,6 +266,31 @@ async def _execute_flatten_all(
     asyncio.create_task(telegram.send_silent(summary))
 
 
+async def _build_flatten_request(
+    ticker: str, qty: int, avg_cost: float, reason: str, bkt: str, use_market: bool,
+) -> OrderRequest:
+    """Build a SELL flatten order. MARKET (RTH escalation, guaranteed fill) or a
+    marketable limit priced from Massive REST (IBKR is execution-only — never its
+    market data for pricing; avg_cost is the final emergency fallback)."""
+    if use_market:
+        return OrderRequest(
+            ticker=ticker, side="SELL", qty=qty, session_bucket=bkt, is_entry=False,
+            exit_reason=reason, order_type="MKT", limit_price=None,
+            intraday_pct=0.0, expected_price=0.0,
+        )
+    bid, _ask, last = await fetch_mark(ticker)
+    ref = bid if (bid and bid > 0) else (last if (last and last > 0) else None)
+    if ref is not None:
+        limit_price = round(ref - CFG.order_execution.extended_exit_offset, 2)
+    else:
+        limit_price = round(max(0.01, avg_cost * 0.50), 2)
+    return OrderRequest(
+        ticker=ticker, side="SELL", qty=qty, session_bucket=bkt, is_entry=False,
+        exit_reason=reason, order_type="LMT", limit_price=limit_price,
+        intraday_pct=0.0, expected_price=limit_price,
+    )
+
+
 async def _execute_flatten_ticker(
     ticker: str,
     ibkr: IBKRClient,
@@ -250,18 +299,28 @@ async def _execute_flatten_ticker(
     reason: str,
     session_date: date,
 ) -> None:
-    """Close a single ticker position. Does not touch other open positions."""
+    """Close a single ticker position. Does not touch other open positions.
+
+    On repeated limit-order timeouts (illiquid sub-$1 names) it escalates to a MARKET
+    order during RTH, and after a hard cap it parks the ticker for manual review — so a
+    non-filling exit can never spin in an infinite retry/alert loop.
+    """
     from live.feed import market_status
 
-    log.critical("FLATTEN TICKER: %s reason=%s", ticker, reason)
-    await telegram.send_silent(f"CRITICAL: FLATTEN {ticker} triggered — {reason}")
+    prior_fails = risk_state.pending_close_failures.get(ticker, 0)
+    log.critical("FLATTEN TICKER: %s reason=%s (prior_fails=%d)", ticker, reason, prior_fails)
+    # Throttle the "triggered" alert — only on the first attempt, not every retry.
+    if prior_fails == 0:
+        await telegram.send_silent(f"CRITICAL: FLATTEN {ticker} triggered — {reason}")
 
     if not market_status.is_tradable_now():
+        newly = ticker not in risk_state.pending_close
         risk_state.pending_close.add(ticker)
         log.warning("FLATTEN TICKER: %s market closed — deferred to pending_close", ticker)
-        await telegram.send_silent(
-            f"FLATTEN {ticker}: market closed — deferred to pending_close"
-        )
+        if newly:
+            await telegram.send_silent(
+                f"FLATTEN {ticker}: market closed — deferred to pending_close"
+            )
         return
 
     pos = risk_state.open_positions.get(ticker)
@@ -273,42 +332,41 @@ async def _execute_flatten_ticker(
     avg_cost = pos.get("avg_cost", 0.0)
     bkt = _bkt_now()
 
-    # Price reference from Massive REST (NBBO bid, last-trade fallback). IBKR is
-    # execution-only — never its market data for pricing. avg_cost is the final
-    # emergency fallback when Massive has nothing.
-    bid, _ask, last = await fetch_mark(ticker)
-    ref = bid if (bid and bid > 0) else (last if (last and last > 0) else None)
-    if ref is not None:
-        limit_price = round(ref - CFG.order_execution.extended_exit_offset, 2)
-    else:
-        limit_price = round(max(0.01, avg_cost * 0.50), 2)
-
-    req = OrderRequest(
-        ticker=ticker,
-        side="SELL",
-        qty=qty,
-        session_bucket=bkt,
-        is_entry=False,
-        exit_reason=reason,
-        limit_price=limit_price,
-        intraday_pct=0.0,
-        expected_price=limit_price,
-    )
+    # RTH market escalation: after repeated limit timeouts, force a MARKET order (only
+    # during RTH — extended hours reject market orders, so stay on the limit ladder).
+    use_market = prior_fails >= _MARKET_ESCALATION_FAILS and bkt == "regular_hours"
+    if use_market:
+        log.critical("FLATTEN TICKER: %s — escalating to MARKET order (RTH, %d prior fails)",
+                     ticker, prior_fails)
+    req = await _build_flatten_request(ticker, qty, avg_cost, reason, bkt, use_market)
 
     fill: Optional[Fill] = await ibkr.submit(req)
 
     if fill is None:
-        fails = risk_state.pending_close_failures.get(ticker, 0) + 1
+        fails = prior_fails + 1
         risk_state.pending_close_failures[ticker] = fails
-        risk_state.pending_close.add(ticker)
         log.critical(
-            "FLATTEN TICKER: %s — no fill within timeout (attempt %d), adding to pending_close",
-            ticker, fails,
+            "FLATTEN TICKER: %s — no fill within timeout (attempt %d, type=%s)",
+            ticker, fails, req.order_type,
         )
-        if fails == 3:
+        # Hard cap → park for manual review; stop auto-retrying (never loop forever).
+        if fails >= _MANUAL_REVIEW_FAILS:
+            risk_state.pending_close.discard(ticker)
+            risk_state.manual_review_required.add(ticker)
+            log.critical(
+                "FLATTEN TICKER: %s — %d failed attempts (incl. RTH market) — PARKING for manual review",
+                ticker, fails,
+            )
             await telegram.send_silent(
-                f"FLATTEN {ticker}: {fails} consecutive timeouts — likely illiquid "
-                f"or halted. Switching to 5-min retry. May need manual close at RTH."
+                f"🔴 {ticker}: {fails} failed flatten attempts (incl. RTH market order) — "
+                f"PARKED for MANUAL REVIEW. Auto-retry stopped; close manually."
+            )
+            return
+        risk_state.pending_close.add(ticker)
+        if fails == _MARKET_ESCALATION_FAILS:
+            await telegram.send_silent(
+                f"FLATTEN {ticker}: {fails} consecutive timeouts — escalating to RTH market "
+                f"order / 5-min retry. May need manual close."
             )
     else:
         pool = get_pool()
@@ -465,6 +523,7 @@ async def pending_close_monitor(
     """
     from live.feed import market_status
     _last_attempt: dict[str, float] = {}   # ticker → monotonic time of last retry
+    _alerted: set[str] = set()             # tickers already alerted (throttle STUCK spam)
     _BACKOFF_THRESHOLD = 3                 # failures before switching to slow retry
     _BACKOFF_INTERVAL_S = 300.0            # 5 minutes between retries once backed off
 
@@ -473,12 +532,36 @@ async def pending_close_monitor(
         if not market_status.is_tradable_now():
             continue
         now = time.monotonic()
+
+        # Auto-reconcile against IBKR (the position source of truth): if a pending_close
+        # ticker is no longer held at the broker, our risk_state is stale — clear it and
+        # stop chasing a phantom (prevents a never-filling retry loop on a desync).
+        if risk_state.pending_close:
+            try:
+                ibkr_positions = ibkr.get_open_positions()  # {ticker: (qty, avg_cost)}
+            except Exception:
+                ibkr_positions = None
+            if ibkr_positions is not None:
+                for ticker in list(risk_state.pending_close):
+                    if ticker not in ibkr_positions:
+                        log.warning("pending_close: %s flat at IBKR — reconciling risk_state", ticker)
+                        risk_state.open_positions.pop(ticker, None)
+                        risk_state.pending_close.discard(ticker)
+                        risk_state.pending_close_failures.pop(ticker, None)
+                        _last_attempt.pop(ticker, None)
+                        _alerted.discard(ticker)
+
         for ticker in list(risk_state.pending_close):
+            # Parked for manual review (hard cap reached) — do not auto-retry.
+            if ticker in risk_state.manual_review_required:
+                continue
+
             if not risk_state.has_position(ticker):
                 log.info("pending_close: %s now flat — clearing", ticker)
                 risk_state.pending_close.discard(ticker)
                 risk_state.pending_close_failures.pop(ticker, None)
                 _last_attempt.pop(ticker, None)
+                _alerted.discard(ticker)
                 continue
 
             if ibkr.has_open_order_for(ticker):
@@ -497,9 +580,12 @@ async def pending_close_monitor(
 
             if failures < _BACKOFF_THRESHOLD:
                 log.critical("pending_close: %s open, no live order — re-queuing FlattenTicker", ticker)
-                asyncio.create_task(
-                    telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenTicker")
-                )
+                # Throttle: one STUCK alert per ticker, not every 30s retry.
+                if ticker not in _alerted:
+                    _alerted.add(ticker)
+                    asyncio.create_task(
+                        telegram.send_silent(f"STUCK POSITION: {ticker} — retrying FlattenTicker")
+                    )
             else:
                 log.warning(
                     "pending_close: %s open, attempt %d (5-min backoff) — re-queuing FlattenTicker",
@@ -530,24 +616,23 @@ async def hourly_pnl_alert(
 
         for ticker, pos in risk_state.open_positions.items():
             ctx = universe.get(ticker)
-            if ctx and ctx.signal_state:
-                price, _src, _age = ctx.signal_state.mark(time.time_ns())
-                # Phase 0 diagnostic: one-shot dump when an open position resolves to a $0/None mark.
-                if not price:
-                    from live.bot.diag import dump_zero_mark
-                    await dump_zero_mark(
-                        where="hourly_pnl", ticker=ticker, signal_state=ctx.signal_state,
-                        in_universe=True,
-                        state_ready_set=(ctx.state_ready.is_set() if ctx.state_ready else None),
-                    )
-                # Guard: never compute unrealised P&L from a 0/None mark (prints a fake loss).
-                if price and price > 0:
-                    unreal = (price - pos["avg_cost"]) * pos["qty"]
-                    u_sign = "+" if unreal >= 0 else ""
-                    lines.append(f"  Open: {ticker} {u_sign}${unreal:.2f} unrealised")
-                else:
-                    lines.append(f"  Open: {ticker} (mark unavailable)")
+            ss = ctx.signal_state if ctx else None
+            # Live WS mark with a Massive REST fallback (stale-feed / orphaned positions).
+            price, _src, _age = await resolve_mark(ss, ticker, time.time_ns())
+            # Phase 0 diagnostic: one-shot dump when an open position resolves to a $0/None mark.
+            if not price:
+                from live.bot.diag import dump_zero_mark
+                await dump_zero_mark(
+                    where="hourly_pnl", ticker=ticker, signal_state=ss,
+                    in_universe=(ctx is not None),
+                    state_ready_set=(ctx.state_ready.is_set() if (ctx and ctx.state_ready) else None),
+                )
+            # Guard: never compute unrealised P&L from a 0/None mark (prints a fake loss).
+            if price and price > 0:
+                unreal = (price - pos["avg_cost"]) * pos["qty"]
+                u_sign = "+" if unreal >= 0 else ""
+                lines.append(f"  Open: {ticker} {u_sign}${unreal:.2f} unrealised")
             else:
-                lines.append(f"  Open: {ticker}")
+                lines.append(f"  Open: {ticker} (mark unavailable)")
 
         asyncio.create_task(telegram.send_silent("\n".join(lines)))

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from ib_insync import IB, LimitOrder, Stock, Trade
+from ib_insync import IB, LimitOrder, MarketOrder, Stock, Trade
 
 from live.config import CFG
 from live.orders.risk import OrderRequest
@@ -102,22 +102,28 @@ class IBKRClient:
         contract = Stock(request.ticker, "SMART", "USD")
         await self._ib.qualifyContractsAsync(contract)
 
-        # All orders are limit orders active outside RTH.
-        # Market orders are rejected by IBKR outside regular trading hours.
-        if request.limit_price is None:
-            log.error(
-                "%s: order missing limit_price — cannot submit without a limit",
-                request.ticker,
+        # Default: marketable limit, active outside RTH (market orders are rejected by
+        # IBKR outside regular trading hours). A MARKET order is used only as an
+        # escalation for an exit that won't fill on a limit (illiquid sub-$1 names) and
+        # only during RTH — the caller (flatten retry) guarantees that.
+        if request.order_type == "MKT":
+            order = MarketOrder(request.side, request.qty, tif="DAY")
+            order_type = "MKT"
+        else:
+            if request.limit_price is None:
+                log.error(
+                    "%s: order missing limit_price — cannot submit without a limit",
+                    request.ticker,
+                )
+                return None
+            order = LimitOrder(
+                request.side,
+                request.qty,
+                request.limit_price,
+                tif="DAY",
+                outsideRth=True,
             )
-            return None
-        order = LimitOrder(
-            request.side,
-            request.qty,
-            request.limit_price,
-            tif="DAY",
-            outsideRth=True,
-        )
-        order_type = "LMT"
+            order_type = "LMT"
 
         submitted_ns = time.time_ns()
         trade: Trade = self._ib.placeOrder(contract, order)
