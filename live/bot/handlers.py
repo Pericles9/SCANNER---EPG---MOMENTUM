@@ -12,6 +12,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from live.bot.auth import authorised_only
+from live.config import CFG
 from live.bot.formatters import (
     _age_str,
     _hold_str,
@@ -88,7 +89,7 @@ async def trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 WHERE strategy_id=$1 AND session_date=$2
                 ORDER BY entry_ns ASC
                 """,
-                "epg_v1",
+                CFG.strategy_id,
                 today,
             )
     except Exception as exc:
@@ -462,7 +463,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 FROM trades
                 WHERE strategy_id=$1 AND session_date=$2
                 """,
-                "epg_v1", today,
+                CFG.strategy_id, today,
             )
     except Exception:
         rows = []

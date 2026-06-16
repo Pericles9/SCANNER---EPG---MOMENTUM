@@ -692,3 +692,36 @@ recommended follow-up (so a mid-session orphan would be re-managed without a res
 `_build_flatten_request` MKT/LMT, RTH market escalation, extended-hours stays limit, hard-cap
 park, monitor phantom-reconcile. `test_flatten_escalation.py` monitor test updated to report the
 position held at IBKR. Full `tests/live`: **224 passed, 5 skipped**.
+
+## 2026-06-16 — Telegram command continuity across restarts
+
+### [BUG] Trades/summary blank + realised P&L reset to $0 after a mid-session restart
+
+**Root cause.**
+1. `/trades` and `/summary` queried the `trades` table with a hardcoded `"epg_v1"`
+   (`handlers.py:91,465`). In `scanner_vwap` mode the day's trades are stored under
+   `"scanner_vwap"`, so both showed nothing/wrong stats — independent of restart.
+2. `risk_state` is rebuilt fresh each boot (`daily_pnl=0`, empty `_trade_history`,
+   `theoretical_equity` reset, `_loss_limit_hit=False`) with no DB reconstruction, so `/status`,
+   `/risk`, `/summary` showed `$0` realised P&L after a mid-day restart while the `trades` /
+   `sessions` tables still held the real figures.
+
+**Fix.**
+- `handlers.py`: module-level `from live.config import CFG`; `/trades` + `/summary` now query
+  `CFG.strategy_id` (strategy-agnostic; matches `cli.py`).
+- New `live/recovery/state_recovery.py::reconstruct_daily_state()` — best-effort (never raises)
+  rebuild from the DB for the current `session_date` / `strategy_id`: `daily_pnl` =
+  `sum(trades.pnl_dollar)`; `_trade_history` = last `kelly_lookback` `pnl_pct` (oldest→newest,
+  for Kelly); `_loss_limit_hit` re-armed when `daily_pnl <= max_daily_loss`; `theoretical_equity`
+  carried from the latest non-null `sessions.theoretical_equity_end` (else the account-equity
+  seed). Called once in `main.py` after crash recovery + the equity seed, before the task group
+  starts — live fills then accumulate on top (no double counting; crash recovery writes
+  `signal_events`, not `trades`).
+- Positions intentionally NOT reconstructed: crash recovery flattens on restart, so
+  `open_positions` correctly reflects the flat post-recovery state; the scanner rebuilds the
+  universe.
+
+**Tests.** `tests/live/test_state_recovery.py` (6): daily_pnl + Kelly-history (oldest→newest)
+reconstruction, loss-limit re-arm, null-theo keeps the equity seed, empty-DB flat start, DB-error
+safety, and a regression guard that `handlers.py` has no hardcoded `"epg_v1"`. Full `tests/live`:
+**230 passed, 5 skipped**.

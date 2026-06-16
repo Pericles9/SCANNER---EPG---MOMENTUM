@@ -306,6 +306,15 @@ async def main() -> None:
     else:
         log.warning("Account equity unavailable at startup — buying_power mode will use equity * leverage fallback")
 
+    # Reconstruct realised daily P&L, Kelly history, loss-limit flag, and theoretical
+    # equity from the DB so Telegram readouts stay continuous across a mid-session restart.
+    # Runs after the equity seed so the persisted theoretical_equity can override it.
+    from live.recovery.state_recovery import reconstruct_daily_state
+    await reconstruct_daily_state(
+        risk_state, pool, clock.date, CFG.strategy_id,
+        CFG.position_sizing.kelly_lookback_trades,
+    )
+
     # Shared state
     universe_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     order_queue: asyncio.Queue = asyncio.Queue(maxsize=100)

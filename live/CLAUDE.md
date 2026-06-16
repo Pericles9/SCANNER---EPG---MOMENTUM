@@ -279,6 +279,7 @@ Runs before any trading begins. A crash == dead man's switch scenario: cancel al
 | Position sizing (paper v1) | Flat $1,000 RTH / $500 pre-market. |
 | Unfilled limit cancel | 5 seconds — do not chase. |
 | Failed-exit retry authority | `pending_close_monitor` is the SINGLE retry authority for a failed exit. The order-worker main path must not re-submit or re-arm a ticker already in `pending_close`. EXIT TIMEOUT alert is sent once (on first entry to `pending_close`). |
+| Restart continuity (Telegram readouts) | On startup (after crash recovery + equity seed) `reconstruct_daily_state` rebuilds realised `daily_pnl`, Kelly `_trade_history`, `_loss_limit_hit`, and `theoretical_equity` from the DB for the current `session_date` so `/status`/`/risk`/`/summary` are continuous across restarts. Positions are NOT reconstructed (crash recovery flattens on restart; scanner rebuilds the universe). All trade/summary DB queries use `CFG.strategy_id` — never a hardcoded id. |
 | Unfillable-exit escalation | Escalate to a MARKET order during RTH only (after `_MARKET_ESCALATION_FAILS=2`); extended hours stay marketable-limit (market orders rejected outside RTH). Hard cap `_MANUAL_REVIEW_FAILS=6` → park (`manual_review_required`) + one alert; never loop. `pending_close_monitor` auto-reconciles against IBKR positions to drop phantoms. |
 | Timestamps | All nanoseconds UTC throughout. No timezone assumptions in data layer. |
 | IBKR data | [SUPERSEDED 2026-06-15] Execution quotes only. Not the primary feed. |
