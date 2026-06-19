@@ -7,11 +7,17 @@ Priority chain:
      before 20:00 ET on the prior trading day
   4. Returns None if all sources fail.
 
-Caller is responsible for caching: each lookup hits disk. Cache the result per
-(ticker, date) at the runner level so the chain runs once per session.
+Performance notes (SEB run — 6395+ sessions):
+  - DuckDB usability is checked once and cached (_DUCKDB_HAS_DAILY_BARS flag).
+  - Daily parquet is loaded once per ticker and cached in memory (_load_daily_parquet).
+  - Prior-trades lookup uses a pre-built per-ticker index (_TICKER_EVENT_IDX) so
+    it avoids re-scanning FILTERED_DIR (17K+ dirs) on every call.
+  - Top-level get_prev_close should be wrapped with functools.lru_cache at the
+    caller level for per-(ticker,date) deduplication.
 """
 from __future__ import annotations
 
+import functools
 import logging
 from datetime import date as dt_date
 from pathlib import Path
@@ -29,20 +35,42 @@ _DAILY_DIR = DATA_ROOT / "daily"
 _DUCKDB_PATH = DATA_ROOT / "duckdb" / "main.duckdb"
 _RTH_CLOSE_HOUR_ET = 20  # 8 PM ET — use this as the cutoff for "prior session close"
 
+# Set to False after the first check reveals daily_bars is absent/empty; avoids
+# re-opening DuckDB on every subsequent call when the table is a placeholder.
+# None = not yet checked.
+_DUCKDB_HAS_DAILY_BARS: Optional[bool] = None
+
+# Per-ticker index of prior event directories: ticker → [(ev_date, Path), ...]
+# sorted DESCENDING by ev_date.  Built lazily on first call to the prior-trades
+# fallback; avoids iterating 17K+ dirs on every get_prev_close call.
+_TICKER_EVENT_IDX: Optional[dict[str, list]] = None
+
 
 def _try_duckdb_daily_bars(ticker: str, date: str) -> Optional[float]:
     """Priority 1: DuckDB daily_bars table.
 
-    Returns None if the table does not exist, the connection fails, or no row matches.
+    Returns None if the table does not exist, is empty, the connection fails,
+    or no row matches.  Checks usability once and short-circuits all future
+    calls if the table is absent or empty.
     """
+    global _DUCKDB_HAS_DAILY_BARS
+    if _DUCKDB_HAS_DAILY_BARS is False:
+        return None
     if not _DUCKDB_PATH.exists():
+        _DUCKDB_HAS_DAILY_BARS = False
         return None
     try:
         con = duckdb.connect(str(_DUCKDB_PATH), read_only=True)
         try:
             tables = {r[0].lower() for r in con.execute("SHOW TABLES").fetchall()}
             if "daily_bars" not in tables:
+                _DUCKDB_HAS_DAILY_BARS = False
                 return None
+            count_row = con.execute("SELECT COUNT(*) FROM daily_bars LIMIT 1").fetchone()
+            if count_row is None or count_row[0] == 0:
+                _DUCKDB_HAS_DAILY_BARS = False
+                return None
+            _DUCKDB_HAS_DAILY_BARS = True
             row = con.execute(
                 "SELECT close FROM daily_bars "
                 "WHERE ticker = ? AND session_date < ? "
@@ -58,12 +86,19 @@ def _try_duckdb_daily_bars(ticker: str, date: str) -> Optional[float]:
         finally:
             con.close()
     except Exception as e:
-        log.debug(f"daily_bars query failed for {ticker} {date}: {e}")
+        _DUCKDB_HAS_DAILY_BARS = False
+        log.debug("daily_bars query failed for %s %s: %s", ticker, date, e)
         return None
 
 
-def _try_daily_parquet(ticker: str, date: str) -> Optional[float]:
-    """Priority 2: data/daily/{TICKER}_daily.parquet — last close strictly before event date."""
+@functools.lru_cache(maxsize=None)
+def _load_daily_parquet(ticker: str) -> Optional[tuple]:
+    """Load (dates_list, closes_array) from data/daily/{TICKER}_daily.parquet.
+
+    Cached per ticker so the parquet is only read once regardless of how many
+    date queries are made for the same ticker.  Returns None if the file is
+    absent or unreadable.
+    """
     path = _DAILY_DIR / f"{ticker}_daily.parquet"
     if not path.exists():
         return None
@@ -71,60 +106,86 @@ def _try_daily_parquet(ticker: str, date: str) -> Optional[float]:
         table = pq.read_table(str(path), columns=["date", "close"])
         dates = table.column("date").to_pylist()
         closes = table.column("close").to_numpy()
-        target = dt_date.fromisoformat(date)
-
-        best_idx = -1
-        best_date: Optional[dt_date] = None
-        for i, d in enumerate(dates):
-            if hasattr(d, "date"):
-                d = d.date()
-            if d < target and (best_date is None or d > best_date):
-                best_date = d
-                best_idx = i
-
-        if best_idx < 0:
-            return None
-        close = float(closes[best_idx])
-        if close > 0 and np.isfinite(close):
-            return close
-        return None
+        return (dates, closes)
     except Exception as e:
-        log.debug(f"daily parquet read failed for {ticker} {date}: {e}")
+        log.debug("daily parquet load failed for %s: %s", ticker, e)
         return None
+
+
+def _try_daily_parquet(ticker: str, date: str) -> Optional[float]:
+    """Priority 2: data/daily/{TICKER}_daily.parquet — last close strictly before event date."""
+    data = _load_daily_parquet(ticker)
+    if data is None:
+        return None
+    dates, closes = data
+    target = dt_date.fromisoformat(date)
+
+    best_idx = -1
+    best_date: Optional[dt_date] = None
+    for i, d in enumerate(dates):
+        if hasattr(d, "date"):
+            d = d.date()
+        if d < target and (best_date is None or d > best_date):
+            best_date = d
+            best_idx = i
+
+    if best_idx < 0:
+        return None
+    close = float(closes[best_idx])
+    if close > 0 and np.isfinite(close):
+        return close
+    return None
+
+
+def _build_ticker_event_idx() -> dict[str, list]:
+    """Build per-ticker sorted index of (ev_date, path) tuples from FILTERED_DIR.
+
+    Scanned once; subsequent calls return the cached dict.  Sorted descending
+    by date so _try_prior_trades_parquet can iterate most-recent first.
+    """
+    global _TICKER_EVENT_IDX
+    if _TICKER_EVENT_IDX is not None:
+        return _TICKER_EVENT_IDX
+
+    from data.loaders.trades import parse_event_dir  # avoid circular at module level
+
+    idx: dict[str, list] = {}
+    if FILTERED_DIR.exists():
+        for d in FILTERED_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            p = parse_event_dir(d.name)
+            if p is None or p["date"] is None:
+                continue
+            try:
+                ev_date = dt_date.fromisoformat(p["date"])
+            except ValueError:
+                continue
+            tk = p["ticker"]
+            if tk not in idx:
+                idx[tk] = []
+            idx[tk].append((ev_date, d))
+
+    for tk in idx:
+        idx[tk].sort(key=lambda x: x[0], reverse=True)
+
+    log.debug("prev_close: indexed %d tickers from FILTERED_DIR", len(idx))
+    _TICKER_EVENT_IDX = idx
+    return idx
 
 
 def _try_prior_trades_parquet(ticker: str, date: str) -> Optional[float]:
     """Priority 3: last trade in a prior event-day trades.parquet, before 20:00 ET on T-1.
 
-    Scans `filtered/{TICKER}_*/` for prior dates, takes the most recent, and returns the
-    last trade price strictly before 20:00 ET on the prior session.
+    Uses a pre-built per-ticker index (one FILTERED_DIR scan for all tickers)
+    instead of scanning the full directory on every call.
     """
-    if not FILTERED_DIR.exists():
-        return None
+    idx = _build_ticker_event_idx()
     target = dt_date.fromisoformat(date)
-    prefix = f"{ticker}_"
 
-    candidates: list[tuple[dt_date, Path]] = []
-    for d in FILTERED_DIR.iterdir():
-        if not d.is_dir() or not d.name.startswith(prefix):
-            continue
-        parts = d.name.split("_")
-        if len(parts) < 2:
-            continue
-        try:
-            ev_date = dt_date.fromisoformat(parts[1])
-        except ValueError:
-            continue
-        if ev_date < target:
-            candidates.append((ev_date, d))
-
-    if not candidates:
-        return None
-
-    candidates.sort(reverse=True)
-
-    # Compute 20:00 ET cutoff on the candidate's date in unix nanoseconds (UTC)
-    for ev_date, ev_dir in candidates:
+    for ev_date, ev_dir in idx.get(ticker, []):
+        if ev_date >= target:
+            continue  # index is descending; once we see ev_date < target, all rest are too
         trades_path = ev_dir / "trades.parquet"
         if not trades_path.exists():
             continue
@@ -155,7 +216,7 @@ def _try_prior_trades_parquet(ticker: str, date: str) -> Optional[float]:
             if last_price > 0 and np.isfinite(last_price):
                 return last_price
         except Exception as e:
-            log.debug(f"prior trades parquet read failed for {ev_dir.name}: {e}")
+            log.debug("prior trades parquet read failed for %s: %s", ev_dir.name, e)
             continue
 
     return None
