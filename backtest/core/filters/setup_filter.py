@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numba import njit
 
-from data.schemas.mom_db import NS_PER_SECOND
+NS_PER_SECOND = 1_000_000_000
 
 # ── Constants ───────────────────────────────────────────────────────────
 
@@ -32,8 +32,8 @@ C_VOL = 0.30           # volume floor multiplier
 C_THIN = 2.50          # thinness ceiling multiplier
 C_BODY = 0.40          # body conviction floor multiplier
 Q_THRESHOLD = 0.65     # composite qualification threshold
-SUSTAIN_BARS = 1     # minutes of sustained qualification
-WARMUP_BARS = 1      # ~1/(1-rho_slow) before priors meaningful
+SUSTAIN_BARS = 15      # minutes of sustained qualification
+WARMUP_BARS = 65       # ~1/(1-rho_slow) before priors meaningful
 WARMUP_THRESHOLD = 0.75  # higher bar during warm-up
 BAR_SECONDS = 60       # 1-minute bars
 
@@ -154,6 +154,7 @@ def _compute_setup_signals(
     closes: np.ndarray,
     volumes: np.ndarray,
     dollar_volumes: np.ndarray,
+    rho_fast: float = RHO_FAST,
 ):
     """Compute the 4 setup filter signals and composite Q trajectory.
 
@@ -244,7 +245,7 @@ def _compute_setup_signals(
         q = product ** 0.25 if product > 0 else 0.0
         q_raw[i] = q
 
-        qt = RHO_FAST * qt + (1.0 - RHO_FAST) * q
+        qt = rho_fast * qt + (1.0 - rho_fast) * q
         q_tilde[i] = qt
 
     return range_scores, vol_scores, thin_scores, body_scores, q_raw, q_tilde
@@ -376,6 +377,7 @@ def run_setup_filter(
     session_end_ns: int,
     lookback_low: float | None = None,
     event_close: float | None = None,
+    rho_fast: float = RHO_FAST,
 ) -> SetupFilterResult:
     """Run the full setup filter on a single event.
 
@@ -425,7 +427,7 @@ def run_setup_filter(
 
     # Compute signals
     range_scores, vol_scores, thin_scores, body_scores, q_raw, q_tilde = (
-        _compute_setup_signals(opens, highs, lows, closes, volumes, dvols)
+        _compute_setup_signals(opens, highs, lows, closes, volumes, dvols, rho_fast)
     )
 
     # Check sustained qualification
