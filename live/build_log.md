@@ -10,6 +10,34 @@ Running record of decisions made during the build, deviations from the architect
 
 ---
 
+## 2026-06-19 — Pre-flight Wipe of Prior EPG-Rapid Work
+
+### [DECISION] Pre-flight: full wipe of prior EPG-Rapid work
+
+The original EPG-Rapid implementation ran under a bundled-phase structure (single R0
+covering setup_filter, LULD, halt-clock, and ROC changes together). That structure has
+been replaced with isolated component-validation phases (C1–C4) followed by integration
+(R0–R5), per the updated `EPG_Rapid_Test_Phases.md`.
+
+**What was removed:**
+
+- Branch: `epg-rapid` (local and remote) — 4 commits
+- Files deleted with branch: `backtest/runner_rapid.py`, `backtest/core/filters/rapid_entry.py`,
+  modified `backtest/core/exits/luld_proximity.py` (n_spread_multiple params added),
+  modified `backtest/setup_filter.py` and `backtest/core/filters/setup_filter.py`
+  (rho_fast param added), `backtest/results/.gitignore`, `backtest/results/phase_r0/.gitkeep`
+- Untracked artifacts removed: `backtest/chart_rapid.py`, all contents of
+  `backtest/results/phase_r0/` (84 per-event HTML charts, r0_index.html, 3 parquet files,
+  5 JSON files across parity_classic/, parity_rapid/, t4_baseline_classic_entry/ dirs)
+
+**Rationale:** The bundled approach could not isolate which component caused a parity
+or behavior failure. Starting fresh under the component-isolated structure avoids
+carrying forward that risk.
+
+**Impact:** No code from the prior run is reused. C1 begins from a clean `main`.
+
+---
+
 ## 2026-06-08 — Flatten Escalation Feedback Loop Fix
 
 ### [BUG] Single stuck exit froze the order worker and triggered a continuous flatten cycle
