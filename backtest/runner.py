@@ -171,11 +171,21 @@ def _hawkes_replay_with_refit(
     refit_interval: int = REFIT_INTERVAL,
     window_size: int = REFIT_WINDOW,
     beta_fixed: float = BETA_FIXED,
+    halt_intervals=None,
+    halt_gap_threshold: float = 60.0,
 ) -> "HawkesParams | None":
-    """Replay Hawkes with online MLE refitting every refit_interval trades."""
+    """Replay Hawkes with online MLE refitting every refit_interval trades.
+
+    halt_intervals: list of (start_sec, end_sec) in the same frame as t_sec
+        (seconds since first trade). Gaps > halt_gap_threshold that overlap any
+        interval get dt_eff = 1e-6, preventing Hawkes decay across a halt.
+        None (default) is 100% identical to the original implementation.
+    """
     N = len(t_sec)
     if N == 0:
         return None
+
+    _halt_ivs: list = halt_intervals or []
 
     cold_end = min(cold_start_size, N)
     if cold_end < 100:
@@ -285,8 +295,15 @@ def _hawkes_replay_with_refit(
                 E_prev = E_val
             else:
                 dt = t_sec[i] - t_sec[i - 1]
-                if dt > 0:
-                    decay = np.exp(-params.beta * dt)
+                dt_eff = dt
+                if _halt_ivs and dt_eff > halt_gap_threshold:
+                    t_prev, t_curr = t_sec[i - 1], t_sec[i]
+                    for h_s, h_e in _halt_ivs:
+                        if t_prev < h_e and t_curr > h_s:
+                            dt_eff = 1e-6
+                            break
+                if dt_eff > 0:
+                    decay = np.exp(-params.beta * dt_eff)
                     R_buy *= decay
                     R_sell *= decay
 
@@ -300,7 +317,7 @@ def _hawkes_replay_with_refit(
                 lam_total = lam_b + lam_s
                 E_val = lam_total / mu_total
 
-                dt_capped = min(dt, 1.0)
+                dt_capped = min(dt_eff, 1.0)
                 if dt_capped < 1e-12:
                     dt_capped = 1e-12
                 raw_slope = (E_val - E_prev) / dt_capped
@@ -378,6 +395,7 @@ def _process_event(args: dict) -> dict:
     exit_d_tau_min_ns = args["exit_d_tau_min_ns"]   # pre-converted to int ns
     luld_ref_window_sec = args["luld_ref_window_sec"]
     luld_proximity_threshold = args.get("luld_proximity_threshold", 0.02)
+    luld_exit_duration_sec = args.get("luld_exit_duration_sec", 0.0)
     luld_lower_band_enabled = args.get("luld_lower_band_enabled", True)
     luld_warmup_sec = args["luld_warmup_sec"]
     reentry_enabled = args["reentry_enabled"]
@@ -521,6 +539,7 @@ def _process_event(args: dict) -> dict:
             ref_window_sec=luld_ref_window_sec,
             proximity_threshold=luld_proximity_threshold,
             warmup_sec=luld_warmup_sec,
+            luld_exit_duration_sec=luld_exit_duration_sec,
         )
         luld_states = []
         luld_fire_sides = []
@@ -1354,6 +1373,8 @@ def parse_args():
                         help="[DEPRECATED] Phase E spread multiple — use --luld-proximity-threshold")
     parser.add_argument("--luld-lower-disabled", action="store_true", default=False,
                         help="Phase F: disable lower-band LULD exit. EXIT_D owns downside.")
+    parser.add_argument("--luld-exit-duration", type=float, default=None,
+                        help="LULD V3: seconds bid must stay in proximity zone before EXIT_HALT fires (0=immediate)")
     return parser.parse_args()
 
 
@@ -1442,6 +1463,11 @@ def main():
     if args.luld_lower_disabled:
         luld_lower_band_enabled = False
 
+    # V3: pin+duration clock — read from config, override with CLI
+    luld_exit_duration_sec = float(luld_cfg.get("luld_exit_duration_sec", 0.0))
+    if getattr(args, "luld_exit_duration", None) is not None:
+        luld_exit_duration_sec = float(args.luld_exit_duration)
+
     log.info(
         f"Config: phase={phase_label} exit_d_enabled={exit_d_enabled} "
         f"theta={exit_d_theta:.2f} tau_min={exit_d_tau_min_sec:.1f}s "
@@ -1450,6 +1476,7 @@ def main():
         f"watermark_threshold={watermark_threshold} cvd_filter={cvd_filter_enabled} "
         f"intra_window_watermark={intra_window_watermark_threshold} "
         f"luld_proximity_threshold={luld_proximity_threshold:.4f} "
+        f"luld_exit_duration_sec={luld_exit_duration_sec:.1f} "
         f"luld_lower_band_enabled={luld_lower_band_enabled}"
     )
 
@@ -1554,6 +1581,7 @@ def main():
             "exit_d_tau_min_ns": exit_d_tau_min_ns,
             "luld_ref_window_sec": luld_cfg["ref_window_sec"],
             "luld_proximity_threshold": luld_proximity_threshold,
+            "luld_exit_duration_sec": luld_exit_duration_sec,
             "luld_lower_band_enabled": luld_lower_band_enabled,
             "luld_warmup_sec": luld_cfg["warmup_sec"],
             "reentry_enabled": reentry_enabled,
@@ -1727,6 +1755,7 @@ def main():
         "exit_d_theta": exit_d_theta,
         "exit_d_tau_min_sec": exit_d_tau_min_sec,
         "luld_proximity_threshold": luld_proximity_threshold,
+        "luld_exit_duration_sec": luld_exit_duration_sec,
         "luld_lower_band_enabled": luld_lower_band_enabled,
         "n_events_input": len(events),
         "n_events_with_trades": len(results),
