@@ -10,6 +10,31 @@ Running record of decisions made during the build, deviations from the architect
 
 ---
 
+## 2026-06-20 — LULD Exit Dropped from EPG-Rapid
+
+### [DECISION] LULD exit removed from EPG-Rapid exit stack permanently
+
+After reverse-engineering the Nasdaq halt system and completing the LULD-V3c audit,
+the LULD exit mechanism as designed is infeasible for EPG-Rapid.
+
+**Root cause (V3c T5a FN diagnostic):** Halt labeler detects limit-state entry via
+trade-price ≥ upper band; the exit module fires on NBBO-bid within proximity_threshold
+of upper band. During limit-up, the bid evaporates — the exit is blind to ~70% of
+trade-based halts. Widening lead window 15s → 300s: recall 0.25 → 0.31 only.
+Structural ceiling, not a threshold problem.
+
+**Impact on EPG-Rapid:**
+- C2 (LuldProximityExit independent thresholds) — DROPPED
+- R4 (LULD Halt-Avoidance Tuning) — DROPPED
+- EPG-Rapid exit stack: EPG PASS→FAIL only (EPG_CLOSE). EXIT_D and LULD both off.
+- New phase sequence: C3 → C4 → R0 → R1 → R2 → R3 → R5
+
+**Classic EPG runner:** unaffected. `LuldProximityExit` retained as-is in
+`backtest/core/exits/luld_proximity.py`. Phase LULD-REBUILD T6 winner selection
+question remains open for the classic runner (separate track).
+
+---
+
 ## 2026-06-19 — Pre-flight Wipe of Prior EPG-Rapid Work
 
 ### [DECISION] Pre-flight: full wipe of prior EPG-Rapid work
