@@ -105,6 +105,9 @@ def _compute_signals(td, qd, fp, rho_E, epg_cfg, session_start_ns, session_end_n
         C=C,
     )
 
+    # GateState uses string values ("INACTIVE","WARMUP","PASS","FAIL") — map to int
+    _STATE_INT = {"INACTIVE": 0, "WARMUP": 1, "PASS": 2, "FAIL": 3}
+
     epg_state_ints = np.zeros(N, dtype=np.int32)
     t_event_ns: int | None = None
     t_event_fired = False
@@ -115,7 +118,8 @@ def _compute_signals(td, qd, fp, rho_E, epg_cfg, session_start_ns, session_end_n
             t_event_fired = True
             t_event_ns = int(td.timestamps[i])
         dv = float(td.prices[i]) * float(td.sizes[i])
-        epg_state_ints[i] = int(gate.update(dv, td.t_sec[i]).value)
+        state = gate.update(dv, td.t_sec[i])
+        epg_state_ints[i] = _STATE_INT.get(state.name, 0)
 
     return sf, bar_starts, lam_buy, lam_sell, epg_state_ints, t_event_ns
 
