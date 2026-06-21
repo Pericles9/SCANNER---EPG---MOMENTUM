@@ -19,8 +19,14 @@ from pathlib import Path
 
 
 def load_trades(results_dir: Path) -> list[dict]:
-    p = results_dir / "per_trade.json"
-    with open(p) as f:
+    parquet_p = results_dir / "per_trade.parquet"
+    json_p = results_dir / "per_trade.json"
+    if parquet_p.exists():
+        import pyarrow.parquet as pq
+        tbl = pq.read_table(str(parquet_p))
+        cols = tbl.schema.names
+        return [{k: tbl.column(k)[i].as_py() for k in cols} for i in range(tbl.num_rows)]
+    with open(json_p) as f:
         return json.load(f)
 
 
