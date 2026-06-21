@@ -523,8 +523,9 @@ def _process_event_rapid(args: dict) -> dict:
 
         # ── 6. Entry/exit state machine (EPG-Rapid) ──
         # Exit stack: EPG window close only.
-        # Entry: rising_edge or cross_and_hold, gated by entry_eligible().
-        # Hard re-entry off: closed_today=True after first entry.
+        # Entry state machine. Hard re-entry off: closed_today=True after first entry.
+        # rising_edge (classic): FAIL→PASS rising edge only. NEVER calls entry_eligible.
+        # cross_and_hold: any PASS tick, gated by n_hold bars of entry_eligible.
         session_start_ns, _ = _session_ns_bounds(date)
 
         trades = []
@@ -543,44 +544,44 @@ def _process_event_rapid(args: dict) -> dict:
             cur = epg_states[i]
 
             if not in_position and not closed_today:
+                entry_accepted = False
+
                 if entry_mode == "rising_edge":
-                    candidate = (
-                        cur == GateState.PASS
-                        and prev_state in (GateState.INACTIVE, GateState.WARMUP,
-                                           GateState.FAIL)
-                    )
-                    if candidate:
+                    # Classic: rising-edge only; zero SF involvement (§1.1 constraint)
+                    if (cur == GateState.PASS and
+                            prev_state in (GateState.INACTIVE, GateState.WARMUP,
+                                           GateState.FAIL)):
                         n_pass_edges += 1
-                else:  # cross_and_hold: fire on any PASS tick
-                    candidate = (cur == GateState.PASS)
-
-                if candidate:
-                    # entry_eligible: check last n_hold bars AT current bar, not end-of-session
-                    # (sf is computed over the full session; slicing to bar_idx avoids look-ahead)
-                    _bar_idx = max(0, int(np.searchsorted(
-                        bar_starts_sf, td.timestamps[i], side="right")) - 1)
-                    _q_at_entry = sf.q_tilde[:_bar_idx + 1]
-                    if (len(_q_at_entry) < n_hold or
-                            not bool(np.all(_q_at_entry[-n_hold:] >= Q_THRESHOLD))):
-                        n_entry_eligible_blocks += 1
-                    else:
-                        # Gap gate check (optional, off by default in rapid mode)
-                        cur_price = float(td.prices[i])
-                        if gap_gate_enabled:
-                            intraday_pct = (cur_price - prev_close) / prev_close
-                            if intraday_pct < gap_threshold:
-                                n_gap_gate_blocks += 1
-                                prev_state = cur
-                                continue
+                        entry_accepted = True
+                else:  # cross_and_hold: any PASS tick, gated by entry_eligible
+                    if cur == GateState.PASS:
+                        _bar_idx = max(0, int(np.searchsorted(
+                            bar_starts_sf, td.timestamps[i], side="right")) - 1)
+                        _q_at_entry = sf.q_tilde[:_bar_idx + 1]
+                        if (len(_q_at_entry) < n_hold or
+                                not bool(np.all(_q_at_entry[-n_hold:] >= Q_THRESHOLD))):
+                            n_entry_eligible_blocks += 1
                         else:
-                            intraday_pct = (cur_price - prev_close) / prev_close
+                            entry_accepted = True
 
-                        entry_price = float(td.prices[min(i + 1, N - 1)])
-                        entry_idx = i
-                        entry_t_sec = td.t_sec[i]
-                        intraday_pct_at_entry = intraday_pct
-                        in_position = True
-                        closed_today = True  # hard re-entry off
+                if entry_accepted:
+                    # Gap gate check (optional, off by default in rapid mode)
+                    cur_price = float(td.prices[i])
+                    if gap_gate_enabled:
+                        intraday_pct = (cur_price - prev_close) / prev_close
+                        if intraday_pct < gap_threshold:
+                            n_gap_gate_blocks += 1
+                            prev_state = cur
+                            continue
+                    else:
+                        intraday_pct = (cur_price - prev_close) / prev_close
+
+                    entry_price = float(td.prices[min(i + 1, N - 1)])
+                    entry_idx = i
+                    entry_t_sec = td.t_sec[i]
+                    intraday_pct_at_entry = intraday_pct
+                    in_position = True
+                    closed_today = True  # hard re-entry off
 
             elif in_position:
                 # EPG window close: PASS → not-PASS
@@ -646,6 +647,13 @@ def _process_event_rapid(args: dict) -> dict:
                 "exit_reason": "session_end",
                 "n_halt_windows": len(halt_intervals),
             })
+
+        # Hard assertion: classic mode must never call entry_eligible
+        if entry_mode == "rising_edge" and n_entry_eligible_blocks != 0:
+            raise AssertionError(
+                f"[§1.1] rising_edge mode called entry_eligible {n_entry_eligible_blocks}x"
+                f" in {ticker} {date} — code bug, entry paths not separated"
+            )
 
         return {
             **base,
@@ -999,7 +1007,12 @@ def main():
         }
         work_items.append(item)
 
-    mode_label = "parity" if args.parity else f"rapid/{args.entry_mode}/n_hold={args.n_hold}"
+    if args.parity:
+        mode_label = "parity"
+    elif args.entry_mode == "rising_edge":
+        mode_label = "rapid/classic"
+    else:
+        mode_label = f"rapid/cross_and_hold/n_hold={args.n_hold}"
     log.info(f"Mode={mode_label} | {len(work_items)} events")
 
     # ── Process in parallel ──
