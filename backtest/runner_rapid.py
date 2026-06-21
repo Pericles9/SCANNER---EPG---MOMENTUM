@@ -411,6 +411,8 @@ def _process_event_rapid(args: dict) -> dict:
     gate_mode = epg_cfg.get("gate_mode", "peak")
     epg_tau_peak = epg_cfg.get("tau_peak", 600.0)
     epg_C = epg_cfg.get("C", 2.0)
+    epg_p_open = float(epg_cfg.get("p_open", EPG_P))
+    epg_p_close = float(epg_cfg.get("p_close", epg_p_open))
 
     base = {"ticker": ticker, "date": date, "event_idx": event_idx}
 
@@ -498,22 +500,26 @@ def _process_event_rapid(args: dict) -> dict:
                 anchor.set_lambda_ref(lref_epg)
         gate = ParticipationGate(
             half_life_seconds=EPG_TAU,
-            peak_threshold_p=EPG_P,
+            peak_threshold_p=epg_p_open,
             warmup_seconds=EPG_WARMUP,
             gate_mode=gate_mode,
             tau_peak=epg_tau_peak,
             C=epg_C,
+            p_open=epg_p_open,
+            p_close=epg_p_close,
         )
 
         epg_states = [GateState.INACTIVE] * N
         t_event_fired = False
         t_event_idx = None
+        t_event_sec = 0.0
         for i in range(N):
             t_ev = anchor.update(lambda_hat[i], td.t_sec[i])
             if t_ev is not None and not t_event_fired:
                 gate.activate(t_ev)
                 t_event_fired = True
                 t_event_idx = i
+                t_event_sec = td.t_sec[i]
             dv = float(td.prices[i]) * float(td.sizes[i])
             epg_states[i] = gate.update(dv, td.t_sec[i])
 
@@ -539,9 +545,13 @@ def _process_event_rapid(args: dict) -> dict:
         n_pass_edges = 0
         n_entry_eligible_blocks = 0
         n_gap_gate_blocks = 0
+        n_passtofail = 0  # total PASS→not-PASS transitions across entire event
 
         for i in range(N):
             cur = epg_states[i]
+
+            if prev_state == GateState.PASS and cur != GateState.PASS:
+                n_passtofail += 1
 
             if not in_position and not closed_today:
                 entry_accepted = False
@@ -602,6 +612,7 @@ def _process_event_rapid(args: dict) -> dict:
                         "entry_t_sec": float(entry_t_sec),
                         "exit_t_sec": float(exit_t_sec),
                         "hold_sec": float(exit_t_sec - entry_t_sec),
+                        "entry_lag_sec": float(entry_t_sec - t_event_sec),
                         "entry_price": float(entry_price),
                         "exit_price": float(exit_price),
                         "pnl_pct": float(pnl_pct),
@@ -637,6 +648,7 @@ def _process_event_rapid(args: dict) -> dict:
                 "entry_t_sec": float(entry_t_sec),
                 "exit_t_sec": float(exit_t_sec),
                 "hold_sec": float(exit_t_sec - entry_t_sec),
+                "entry_lag_sec": float(entry_t_sec - t_event_sec),
                 "entry_price": float(entry_price),
                 "exit_price": float(exit_price),
                 "pnl_pct": float(pnl_pct),
@@ -665,6 +677,7 @@ def _process_event_rapid(args: dict) -> dict:
             "n_gap_gate_blocks": int(n_gap_gate_blocks),
             "n_halt_windows": int(len(halt_intervals)),
             "n_event_trades": int(N),
+            "n_passtofail_transitions": int(n_passtofail),
             "prev_close": float(prev_close),
             "first_price": float(td.prices[0]),
             "last_price": float(td.prices[-1]),
@@ -745,6 +758,19 @@ def compute_run_summary(events: list[dict]) -> dict:
         ev.get("n_halt_windows", 0) for ev in events if ev.get("status") == "event"
     )
 
+    entry_lags = [t.get("entry_lag_sec") for t in all_trades
+                  if t.get("entry_lag_sec") is not None]
+    mean_entry_lag_sec = round(float(np.mean(entry_lags)), 2) if entry_lags else None
+
+    n_events_total = sum(1 for ev in events if ev.get("status") == "event")
+    total_passtofail = sum(
+        ev.get("n_passtofail_transitions", 0)
+        for ev in events if ev.get("status") == "event"
+    )
+    mean_passtofail_per_event = (
+        round(total_passtofail / n_events_total, 3) if n_events_total > 0 else None
+    )
+
     return {
         "n_trades": int(n_trades),
         "profit_factor": round(pf, 4),
@@ -757,6 +783,8 @@ def compute_run_summary(events: list[dict]) -> dict:
         "max_loss_pct": round(float(np.min(pnl)), 4),
         "mean_hold_sec": round(float(np.mean(hold)), 2),
         "median_hold_sec": round(float(np.median(hold)), 2),
+        "mean_entry_lag_sec": mean_entry_lag_sec,
+        "mean_passtofail_per_event": mean_passtofail_per_event,
         "session_breakdown": session_breakdown,
         "exit_reason_breakdown": exit_breakdown,
         "n_events_with_halt_windows": int(n_halt_windows),
@@ -855,6 +883,10 @@ def parse_args():
     # Parity mode options (forwarded to runner._process_event)
     parser.add_argument("--luld-lower-disabled", action="store_true", default=False,
                         help="Parity: pass luld_lower_band_enabled=False to runner")
+    parser.add_argument("--p-open", type=float, default=None,
+                        help="EPG gate open threshold (default: 0.65 from EPG_P)")
+    parser.add_argument("--p-close", type=float, default=None,
+                        help="EPG gate close threshold (default: same as --p-open)")
     return parser.parse_args()
 
 
@@ -982,7 +1014,12 @@ def main():
             "rho": hawkes_median.get("rho", 0.99),
             "rho_E": hawkes_median.get("rho", 0.99),
             "q_bar_cfg": q_bar_cfg,
-            "epg_cfg": phase_cfg.get("epg", {}),
+            "epg_cfg": {
+                **phase_cfg.get("epg", {}),
+                **({"p_open": args.p_open} if args.p_open is not None else {}),
+                **({"p_close": args.p_close} if args.p_close is not None else
+                   ({"p_close": args.p_open} if args.p_open is not None else {})),
+            },
             # rapid-mode params
             "parity": args.parity,
             "entry_mode": args.entry_mode,
@@ -1071,6 +1108,9 @@ def main():
         "mode": mode_label,
         "entry_mode": args.entry_mode,
         "n_hold": args.n_hold,
+        "p_open": args.p_open if args.p_open is not None else EPG_P,
+        "p_close": (args.p_close if args.p_close is not None
+                    else (args.p_open if args.p_open is not None else EPG_P)),
         "roc_min": args.roc_min,
         "n_events_sampled": len(events),
         "seed": args.seed,

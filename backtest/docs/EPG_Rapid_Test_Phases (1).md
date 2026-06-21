@@ -1,3 +1,4 @@
+<!-- fullWidth: false tocVisible: true tableWrap: true -->
 ---
 tags:
   - type/plan
