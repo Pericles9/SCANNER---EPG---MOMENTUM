@@ -33,7 +33,9 @@ def _make_halt_result(fire_side: str, upper_band: float = 12.0) -> ProximityResu
         fire_side=fire_side,
         reference_price=11.0,
         upper_band=upper_band,
+        lower_band=0.0,
         bid_proximity_pct=0.01,
+        ask_proximity_pct=math.nan,
         spread_used=0.05,
         band_pct=0.10,
     )
@@ -46,7 +48,9 @@ def _make_safe_result() -> ProximityResult:
         fire_side=None,
         reference_price=11.0,
         upper_band=12.0,
+        lower_band=0.0,
         bid_proximity_pct=0.10,
+        ask_proximity_pct=math.nan,
         spread_used=0.05,
         band_pct=0.10,
     )
@@ -115,7 +119,9 @@ class TestLuldLowerGate:
             fire_side=None,
             reference_price=result.reference_price,
             upper_band=result.upper_band,
+            lower_band=0.0,
             bid_proximity_pct=result.bid_proximity_pct,
+            ask_proximity_pct=math.nan,
             spread_used=result.spread_used,
             band_pct=result.band_pct,
         )

@@ -10,6 +10,39 @@ Running record of decisions made during the build, deviations from the architect
 
 ---
 
+## 2026-06-21 — LULD module V3+C2 complete; runner_rapid look-ahead fix
+
+### [FINDING] luld_proximity.py completed: V3 pin+duration clock + C2 independent thresholds
+
+`LuldProximityExit` now has two independent proximity params (`proximity_threshold_upper`,
+`proximity_threshold_lower`) and a `lower_enabled: bool = False` flag. All existing callers
+pass only `proximity_threshold` (backward-compatible: both thresholds default to it). Lower
+band: uses NBBO ask; fires immediately (no pin clock). Upper band retains V3 pin+duration
+clock (`luld_exit_duration_sec`). `ProximityResult` now carries `lower_band` and
+`ask_proximity_pct` fields. The module is NOT used in EPG-Rapid (exit = EPG PASS→FAIL
+only, C2 DROPPED as EPG-Rapid phase). Retained for the classic EPG runner only.
+
+### [BUG] luld_halt_detection.py: 30s VWAP replaced with 5-min sticky mean
+
+The halt labeler used 30-second VWAP as its reference price. `LuldProximityExit` uses a
+5-minute arithmetic mean with a 1% sticky filter. This mismatch caused band divergence up
+to 35.80% in V3b, making confusion-matrix scoring meaningless. Fixed: labeler now uses
+`rolling("300s").mean()` + the same 1% sticky filter as the proximity exit module. Also
+adds `HaltWindow.limit_state_start` field (the onset of the limit-state proxy, for the
+V3c T3 anchor fix). Changes committed for completeness; labeler output feeds V3c audit
+only — not used in EPG-Rapid runner.
+
+### [BUG] runner_rapid.py: look-ahead bias in entry_eligible check
+
+`entry_eligible(sf, n_hold)` was checking `sf.q_tilde[-15:]` — the last 15 bars of the
+session, not the last 15 bars AT the entry tick. This used post-entry bars, invalidating
+the entry check. Fix: bar-aware check via `np.searchsorted(bar_starts_sf, timestamp,
+side='right') - 1` to find the current bar index at each tick, then slice
+`sf.q_tilde[:bar_idx+1]`. Inline in the state machine; `entry_eligible` helper import
+replaced with direct `Q_THRESHOLD` constant.
+
+---
+
 ## 2026-06-20 — LULD Exit Dropped from EPG-Rapid
 
 ### [DECISION] LULD exit removed from EPG-Rapid exit stack permanently

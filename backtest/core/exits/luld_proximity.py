@@ -16,13 +16,23 @@ Reference price — sticky SIP approximation:
     published reference is frozen; updates resume when the state clears.
 
 Exit signal — quote-based:
-    bid_proximity_pct = (upper_band - nbbo_bid) / upper_band
-    EXIT_HALT fires when bid_proximity_pct ≤ proximity_threshold AND nbbo_bid > 0.
+    Upper band (NBB approaching upper band):
+        bid_proximity_pct = (upper_band - nbbo_bid) / upper_band
+        When luld_exit_duration_sec == 0 (default / V2 behaviour):
+            EXIT_HALT fires immediately when bid_proximity_pct ≤ proximity_threshold_upper.
+        When luld_exit_duration_sec > 0 (V3 pin+duration clock):
+            EXIT_HALT fires only after the proximity condition is sustained for
+            at least luld_exit_duration_sec seconds without interruption. If the
+            bid leaves the proximity zone, the clock resets to zero.
+    Lower band (NBA approaching lower band, when lower_enabled=True):
+        ask_proximity_pct = (nbbo_ask - lower_band) / lower_band
+        EXIT_HALT fires immediately when ask_proximity_pct ≤ proximity_threshold_lower.
+        (No pin+duration clock on lower band.)
     If no valid quote is available (bid ≤ 0 or ask ≤ bid), falls back to
-    trade-price comparison: fire when (upper_band - price) / upper_band
-    ≤ proximity_threshold.
+    trade-price comparison on the affected side.
+    If both upper and lower fire on the same tick: fire_side = "upper".
 
-Lower band is permanently disabled. Only upper-band EXIT_HALT is produced.
+lower_enabled=False (default): lower band disabled. All existing callers unaffected.
 
 Known approximations:
 1. All trades are included in the reference price window, including odd lots and
@@ -75,12 +85,15 @@ class ProximityState(Enum):
 class ProximityResult:
     """Single-tick proximity computation result."""
     state: ProximityState
-    fire_side: Optional[str]       # "upper" or None (lower band permanently disabled)
+    fire_side: Optional[str]       # "upper", "lower", or None
     reference_price: float         # current published sticky ref price (0.0 before warmup)
     upper_band: float              # current upper band value (0.0 before warmup)
+    lower_band: float              # current lower band value (0.0 before warmup or disabled)
     bid_proximity_pct: float       # (upper_band - nbbo_bid) / upper_band; NaN if fallback
+    ask_proximity_pct: float       # (nbbo_ask - lower_band) / lower_band; NaN if disabled/fallback
     spread_used: float             # ask - bid at this tick; 0.0 if no valid quote
     band_pct: float                # current Tier 2 band percentage
+    pin_duration_sec: float = 0.0  # seconds bid has been within proximity_threshold_upper (V3)
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -119,10 +132,12 @@ class LuldProximityExit:
     the rolling mean moves ≥1% from the current published value. During an active
     EXIT_HALT (Limit State proxy), the reference price is frozen.
 
-    Exit signal uses the prevailing NBBO bid. If no valid bid is available
-    (bid ≤ 0 or ask ≤ bid), falls back to trade-price comparison.
+    Upper band: uses prevailing NBBO bid. Lower band (when lower_enabled=True): uses
+    prevailing NBBO ask. Falls back to trade-price comparison when no valid quote.
 
-    Only upper-band exits are produced. Lower band is permanently disabled.
+    Backward-compatible: existing callers that pass only proximity_threshold continue
+    to work unchanged — proximity_threshold_upper and proximity_threshold_lower both
+    default to proximity_threshold; lower_enabled=False disables the lower band.
     """
 
     def __init__(
@@ -130,6 +145,10 @@ class LuldProximityExit:
         ref_window_sec: float = 300.0,
         proximity_threshold: float = 0.02,
         warmup_sec: float = 60.0,
+        luld_exit_duration_sec: float = 0.0,
+        proximity_threshold_upper: Optional[float] = None,
+        proximity_threshold_lower: Optional[float] = None,
+        lower_enabled: bool = False,
     ):
         if ref_window_sec <= 0:
             raise ValueError(f"ref_window_sec must be positive, got {ref_window_sec}")
@@ -139,10 +158,24 @@ class LuldProximityExit:
             )
         if warmup_sec < 0:
             raise ValueError(f"warmup_sec must be >= 0, got {warmup_sec}")
+        if luld_exit_duration_sec < 0:
+            raise ValueError(
+                f"luld_exit_duration_sec must be >= 0, got {luld_exit_duration_sec}"
+            )
 
         self.ref_window_sec = ref_window_sec
         self.proximity_threshold = proximity_threshold
         self.warmup_sec = warmup_sec
+        self.luld_exit_duration_sec = luld_exit_duration_sec
+        self.proximity_threshold_upper = (
+            proximity_threshold_upper if proximity_threshold_upper is not None
+            else proximity_threshold
+        )
+        self.proximity_threshold_lower = (
+            proximity_threshold_lower if proximity_threshold_lower is not None
+            else proximity_threshold
+        )
+        self.lower_enabled = lower_enabled
 
         self._ref_window_ns = int(ref_window_sec * _NS_PER_SECOND)
         self._warmup_ns = int(warmup_sec * _NS_PER_SECOND)
@@ -150,6 +183,7 @@ class LuldProximityExit:
         self._published_ref: float = 0.0   # 0.0 = not yet set (cold start)
         self._in_limit_state: bool = False
         self._warned_fallback: bool = False
+        self._pin_start_ns: Optional[int] = None  # wall-clock when pin started
 
     def reset(self) -> None:
         """Clear all state. Next update() returns INACTIVE until warmup completes."""
@@ -157,6 +191,7 @@ class LuldProximityExit:
         self._published_ref = 0.0
         self._in_limit_state = False
         self._warned_fallback = False
+        self._pin_start_ns = None
 
     def update(
         self,
@@ -182,12 +217,15 @@ class LuldProximityExit:
 
         if not _is_regular_hours(et_sec):
             self._in_limit_state = False
+            self._pin_start_ns = None
             return ProximityResult(
                 state=ProximityState.INACTIVE,
                 fire_side=None,
                 reference_price=0.0,
                 upper_band=0.0,
+                lower_band=0.0,
                 bid_proximity_pct=math.nan,
+                ask_proximity_pct=math.nan,
                 spread_used=0.0,
                 band_pct=0.0,
             )
@@ -198,15 +236,23 @@ class LuldProximityExit:
             self._buffer.popleft()
 
         oldest_ts = self._buffer[0][0]
-        if (timestamp_ns - oldest_ts) < self._warmup_ns:
+        in_warmup = (timestamp_ns - oldest_ts) < self._warmup_ns
+        # Return INACTIVE only on a genuine cold start (no reference price ever established).
+        # If _published_ref > 0, the module was previously warm: per SIP §4 the reference
+        # price stays in effect during gaps, so we use the persisted value instead of
+        # returning INACTIVE just because the buffer is sparse after a gap.
+        if in_warmup and self._published_ref == 0.0:
             band_pct = _band_pct_for_time(et_sec)
             self._in_limit_state = False
+            self._pin_start_ns = None
             return ProximityResult(
                 state=ProximityState.INACTIVE,
                 fire_side=None,
                 reference_price=0.0,
                 upper_band=0.0,
+                lower_band=0.0,
                 bid_proximity_pct=math.nan,
+                ask_proximity_pct=math.nan,
                 spread_used=0.0,
                 band_pct=band_pct,
             )
@@ -230,20 +276,24 @@ class LuldProximityExit:
 
         band_pct = _band_pct_for_time(et_sec)
         upper_band = round(self._published_ref * (1.0 + band_pct), 2)
+        lower_band = round(self._published_ref * (1.0 - band_pct), 2) if self.lower_enabled else 0.0
 
         if price <= 0:
             self._in_limit_state = False
+            self._pin_start_ns = None
             return ProximityResult(
                 state=ProximityState.INACTIVE,
                 fire_side=None,
                 reference_price=self._published_ref,
                 upper_band=upper_band,
+                lower_band=lower_band,
                 bid_proximity_pct=math.nan,
+                ask_proximity_pct=math.nan,
                 spread_used=0.0,
                 band_pct=band_pct,
             )
 
-        # Determine proximity using prevailing bid; fallback to trade price
+        # Determine proximity using prevailing bid/ask; fallback to trade price
         valid_quote = (
             bid is not None and ask is not None
             and bid > 0.0 and ask > bid
@@ -255,22 +305,65 @@ class LuldProximityExit:
                 (upper_band - float(bid)) / upper_band
                 if upper_band > 0.0 else math.nan
             )
-            fires = not math.isnan(bid_prox) and bid_prox <= self.proximity_threshold
+            upper_fires = not math.isnan(bid_prox) and bid_prox <= self.proximity_threshold_upper
+            if self.lower_enabled and lower_band > 0.0:
+                ask_prox = (float(ask) - lower_band) / lower_band
+                lower_fires = not math.isnan(ask_prox) and ask_prox <= self.proximity_threshold_lower
+            else:
+                ask_prox = math.nan
+                lower_fires = False
         else:
             if not self._warned_fallback:
                 self._warned_fallback = True
             spread_used = 0.0
             bid_prox = math.nan
-            price_prox = (
+            price_prox_upper = (
                 (upper_band - price) / upper_band
                 if upper_band > 0.0 else math.nan
             )
-            fires = not math.isnan(price_prox) and price_prox <= self.proximity_threshold
+            upper_fires = not math.isnan(price_prox_upper) and price_prox_upper <= self.proximity_threshold_upper
+            if self.lower_enabled and lower_band > 0.0:
+                price_prox_lower = (price - lower_band) / lower_band
+                ask_prox = math.nan
+                lower_fires = not math.isnan(price_prox_lower) and price_prox_lower <= self.proximity_threshold_lower
+            else:
+                ask_prox = math.nan
+                lower_fires = False
 
-        if fires:
+        # Upper band: apply pin+duration clock (V3). Lower band: immediate fire only.
+        pin_duration_sec = 0.0
+        fire_side: Optional[str] = None
+        state: ProximityState
+
+        if upper_fires:
+            if self._in_limit_state:
+                if self._pin_start_ns is not None:
+                    pin_duration_sec = (timestamp_ns - self._pin_start_ns) / _NS_PER_SECOND
+                state = ProximityState.EXIT_HALT
+                fire_side = "upper"
+            elif self.luld_exit_duration_sec <= 0.0:
+                if self._pin_start_ns is None:
+                    self._pin_start_ns = timestamp_ns
+                pin_duration_sec = (timestamp_ns - self._pin_start_ns) / _NS_PER_SECOND
+                state = ProximityState.EXIT_HALT
+                fire_side = "upper"
+            else:
+                if self._pin_start_ns is None:
+                    self._pin_start_ns = timestamp_ns
+                pin_duration_sec = (timestamp_ns - self._pin_start_ns) / _NS_PER_SECOND
+                if pin_duration_sec >= self.luld_exit_duration_sec:
+                    state = ProximityState.EXIT_HALT
+                    fire_side = "upper"
+                else:
+                    state = ProximityState.SAFE
+                    fire_side = None
+        elif lower_fires:
+            # Lower band fires immediately; upper takes precedence if both fire
+            self._pin_start_ns = None
             state = ProximityState.EXIT_HALT
-            fire_side: Optional[str] = "upper"
+            fire_side = "lower"
         else:
+            self._pin_start_ns = None
             state = ProximityState.SAFE
             fire_side = None
 
@@ -281,7 +374,10 @@ class LuldProximityExit:
             fire_side=fire_side,
             reference_price=self._published_ref,
             upper_band=upper_band,
+            lower_band=lower_band,
             bid_proximity_pct=bid_prox,
+            ask_proximity_pct=ask_prox,
             spread_used=spread_used,
             band_pct=band_pct,
+            pin_duration_sec=pin_duration_sec,
         )

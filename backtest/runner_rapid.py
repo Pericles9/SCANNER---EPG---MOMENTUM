@@ -56,10 +56,10 @@ from data.loaders.prev_close import get_prev_close
 from core.ofi.trade_ofi import compute_trade_ofi
 from core.epg.anchor import EventAnchor
 from core.epg.gate import ParticipationGate, GateState
-from backtest.setup_filter import run_setup_filter
+from backtest.setup_filter import run_setup_filter, _build_1min_bars
 from core.hawkes.engine import hawkes_replay_fixed_beta
 from core.hawkes.forgetting import fit_hawkes_forgetting, fit_online, HawkesParams
-from core.filters.rapid_entry import entry_eligible
+from core.filters.rapid_entry import Q_THRESHOLD
 from core.features.luld_halt_detection import detect_luld_halts
 
 
@@ -437,6 +437,11 @@ def _process_event_rapid(args: dict) -> dict:
             session_start_ns=start_ns,
             session_end_ns=end_ns,
         )
+        # Bar starts for bar-aware entry_eligible check (separate call — run_setup_filter
+        # does not expose bar_starts from its internal _build_1min_bars invocation)
+        _, _, _, _, _, _, bar_starts_sf = _build_1min_bars(
+            td.timestamps, td.prices, td.sizes.astype(np.int64), start_ns, end_ns
+        )
         N = td.n_trades
 
         # ── 2. Lee-Ready sides ──
@@ -550,8 +555,13 @@ def _process_event_rapid(args: dict) -> dict:
                     candidate = (cur == GateState.PASS)
 
                 if candidate:
-                    # entry_eligible check (setup filter quality gate)
-                    if not entry_eligible(sf, n_hold):
+                    # entry_eligible: check last n_hold bars AT current bar, not end-of-session
+                    # (sf is computed over the full session; slicing to bar_idx avoids look-ahead)
+                    _bar_idx = max(0, int(np.searchsorted(
+                        bar_starts_sf, td.timestamps[i], side="right")) - 1)
+                    _q_at_entry = sf.q_tilde[:_bar_idx + 1]
+                    if (len(_q_at_entry) < n_hold or
+                            not bool(np.all(_q_at_entry[-n_hold:] >= Q_THRESHOLD))):
                         n_entry_eligible_blocks += 1
                     else:
                         # Gap gate check (optional, off by default in rapid mode)

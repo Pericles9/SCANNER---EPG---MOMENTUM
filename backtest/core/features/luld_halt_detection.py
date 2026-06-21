@@ -13,9 +13,10 @@ BAND_BY_TIER = {"tier1": 0.05, "tier2": 0.10}
 
 @dataclass
 class HaltWindow:
-    start: pd.Timestamp
-    end: pd.Timestamp
+    start: pd.Timestamp                       # seg_end: last in-band trade before the gap
+    end: pd.Timestamp                         # gap end / session close
     reason: str = "luld"
+    limit_state_start: Optional[pd.Timestamp] = None  # seg_start: limit-state onset (Phase LULD-V3c)
 
     def duration_seconds(self) -> float:
         return float((self.end - self.start).total_seconds())
@@ -89,16 +90,39 @@ def detect_luld_halts(
     limit_state_seconds: int = 15,
     halt_gap_seconds: int = 300,
 ) -> List[HaltWindow]:
-    """Detect LULD-style halts from trade data using 30s VWAP bands and 5m gaps."""
+    """Detect LULD-style halts from trade data using 5-min arithmetic mean bands and 5m gaps.
+
+    Reference price matches LuldProximityExit: 5-minute rolling arithmetic mean with a 1%
+    sticky filter (reference only updates when the mean deviates ≥1% from the last published
+    value).  This reconciliation enables meaningful confusion-matrix scoring between the
+    labeler and the live exit module (Phase LULD-V3b T5).
+    """
     if trades.empty:
         return []
     price_col, size_col = _choose_columns(trades, price_col, size_col)
     df = trades.sort_index()
     base_pct = base_band_pct if base_band_pct is not None else BAND_BY_TIER.get(band_tier.lower(), 0.05)
 
-    size_series = df[size_col] if size_col else pd.Series(1.0, index=df.index)
-    value = df[price_col] * size_series
-    ref_price = (value.rolling("30s", min_periods=1).sum() / size_series.rolling("30s", min_periods=1).sum()).ffill()
+    # 5-minute arithmetic mean (matches LuldProximityExit ref_window_sec=300s).
+    ref_mean_raw = df[price_col].rolling("300s", min_periods=1).mean()
+
+    # 1% sticky filter (matches LuldProximityExit._published_ref update logic):
+    # reference only updates when the rolling mean deviates ≥1% from the last
+    # published value, preventing spurious band movement on volatile prints and
+    # preserving the pre-gap anchor through short-to-medium gaps.
+    ref_arr = ref_mean_raw.to_numpy(dtype=float)
+    ref_sticky = np.empty_like(ref_arr)
+    published = 0.0
+    for i, raw in enumerate(ref_arr):
+        if np.isnan(raw) or raw <= 0.0:
+            ref_sticky[i] = published
+            continue
+        if published <= 0.0:
+            published = raw
+        elif abs(raw - published) / published >= 0.01:
+            published = raw
+        ref_sticky[i] = published
+    ref_price = pd.Series(ref_sticky, index=df.index, dtype=float)
 
     band_pct_series = pd.Series([_band_pct_for_timestamp(ts, schedule, base_pct) for ts in df.index], index=df.index)
     upper = ref_price * (1.0 + band_pct_series)
@@ -128,7 +152,10 @@ def detect_luld_halts(
                     halt_end = next_ts if gap is not None else seg_end + pd.Timedelta(seconds=halt_gap_seconds)
                     if session_close is not None:
                         halt_end = min(halt_end, session_close)
-                    halts.append(HaltWindow(start=seg_end, end=pd.Timestamp(halt_end), reason="luld"))
+                    halts.append(HaltWindow(
+                        start=seg_end, end=pd.Timestamp(halt_end), reason="luld",
+                        limit_state_start=seg_start,
+                    ))
             start_idx = None
     if start_idx is not None:
         seg_start = pd.Timestamp(idx[start_idx])
@@ -137,7 +164,10 @@ def detect_luld_halts(
             session_row = schedule.loc[seg_end.date()] if schedule is not None and seg_end.date() in schedule.index else None
             session_close = pd.Timestamp(session_row["market_close"]).to_pydatetime() if session_row is not None else None
             if session_close is not None and (session_close - seg_end).total_seconds() >= halt_gap_seconds:
-                halts.append(HaltWindow(start=seg_end, end=pd.Timestamp(session_close), reason="luld"))
+                halts.append(HaltWindow(
+                    start=seg_end, end=pd.Timestamp(session_close), reason="luld",
+                    limit_state_start=seg_start,
+                ))
 
     merged: List[HaltWindow] = []
     for h in sorted(halts, key=lambda x: x.start):
@@ -146,7 +176,16 @@ def detect_luld_halts(
             continue
         last = merged[-1]
         if h.start <= last.end:
-            merged[-1] = HaltWindow(start=last.start, end=max(last.end, h.end), reason=last.reason)
+            # Keep the earliest limit-state onset across the merged windows.
+            merged_lss = last.limit_state_start
+            if merged_lss is None:
+                merged_lss = h.limit_state_start
+            elif h.limit_state_start is not None:
+                merged_lss = min(merged_lss, h.limit_state_start)
+            merged[-1] = HaltWindow(
+                start=last.start, end=max(last.end, h.end), reason=last.reason,
+                limit_state_start=merged_lss,
+            )
         else:
             merged.append(h)
     return merged

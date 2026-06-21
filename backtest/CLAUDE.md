@@ -24,7 +24,7 @@ Inherited from the parent project — apply here without exception:
 - **EPG lambda_ref source is mu_buy + mu_sell only.** Not equilibrium rate, not empirical.
   See parent project CLAUDE.md for full rationale.
 - **Do not touch the test split.** `config/holdout_boundary.json` is locked.
-- **Test before running backtests.** `pytest tests/ -v` must pass all tests before any run. Current count: 357 (grown from initial 49 as phases added new modules and tests).
+- **Test before running backtests.** `pytest tests/ -v` must pass all tests before any run. Current count: 378 (grown from initial 49 as phases added new modules and tests).
 
 ---
 
@@ -62,7 +62,9 @@ Inherited from the parent project — apply here without exception:
 
 **What's next (EPG-Rapid):** C3 is next (halt-gap clock pause in `_hawkes_replay_with_refit`). LULD exit permanently dropped from EPG-Rapid; new phase sequence: C3 → C4 → R0 → R1 → R2 → R3 → R5. LULD-REBUILD T6 and LULD-V3c pending actions remain open for the classic EPG runner (separate track).
 
-**What's next (classic EPG):** Phase LULD-V3c hit a genuine recall hard-stop at T5a — the binding constraint is the **entry signal source** (quote-based bid-vs-band can't see most trade-based halts), not the duration threshold or liquidity penalty. T5b (liquidity-adaptive tiers) and T1 charts (explicitly hard-stop-independent, not yet generated) await Cooper's direction. Cooper must decide whether to pursue a trade-price-based exit signal, abandon the quote-based LULD exit, or accept the V3c-corrected module as-is. Phase LULD-V3b T6 and LULD-REBUILD T6 also remain open pending Cooper. Phase LULD-REBUILD T6 (per-event charts) also blocked pending Cooper winner selection from its T5 sweep. After both, Phase H requires explicit approval before any implementation. **Phase G v1/v2 findings (rank gate, heat gate, quartile gate, multi-day runner) are analysis-only and NOT actionable** — the quartile boundary in particular looks good theoretically but breaks down in practice. Do not implement any of these from Phase G without a dedicated validation phase. SlopeGate F_ss is active live but has no backtest validation — the backtest still uses ParticipationGate. Phase CPD-EXIT finding: BOCPD winner entry gate + fixed TP/SL (5%/5%) produces PF=1.399 on val sample but does not exceed the Phase D baseline (PF=2.65) — the BOCPD entry gate is the binding constraint, not the exit mechanism.
+**LULD exit — ABANDONED (decision 2026-06-20).** The quote-based LULD proximity exit line (V3 → V3b → V3c, and LULD-REBUILD) is **closed.** Rationale: a quote-proximity exit is structurally a *Limit-State* detector, but the halt population on these low-float momentum names is dominated by **discretionary Straddle-State pauses** — the NBBO gaps *away* from the band (so there is nothing at the band to detect) and the listing exchange declares the pause at its **discretion** (so there is no deterministic precursor). V3c fixed the two real instrumentation bugs (T3 onset-anchor, T4 penalty units) and verified that the residual recall (~0.25, uplift to only 0.31 even with a 300s lead window) is genuine and untunable. Do not pursue LULD-V3b T6, LULD-REBUILD T6, V3c Part B (liquidity-adaptive tiers), or V3c T1 charts. Full decision record: `docs/Phase_LULD_V3c.md`. The Phase F config retains LULD upper-band only in the frozen legacy lineage; this decision means no further investment, not forced removal from Phase F artifacts.
+
+**Other open context:** Phase H requires explicit approval before any implementation. **Phase G v1/v2 findings (rank gate, heat gate, quartile gate, multi-day runner) are analysis-only and NOT actionable** — the quartile boundary in particular looks good theoretically but breaks down in practice. Do not implement any of these from Phase G without a dedicated validation phase. SlopeGate F_ss is active live but has no backtest validation — the backtest still uses ParticipationGate. Phase CPD-EXIT finding: BOCPD winner entry gate + fixed TP/SL (5%/5%) produces PF=1.399 on val sample but does not exceed the Phase D baseline (PF=2.65) — the BOCPD entry gate is the binding constraint, not the exit mechanism.
 
 ---
 
@@ -88,9 +90,13 @@ Setup filter (4-signal composite: range, volume, thinness, body conviction) role
 1. **EXIT_D** — Hawkes intensity imbalance timer: I(t) = λ_sell/(λ_buy+λ_sell) > theta
    for τ_min continuous seconds. Disabled if I_entry > theta (already imbalanced at entry).
 2. **LULD proximity** — Price within 2% of Tier 2 LULD band. RTH only (09:30–16:00 ET).
+   **ABANDONED as a research line (2026-06-20)** — structurally a Limit-State detector, blind
+   to the discretionary Straddle-State halts that dominate this universe. See
+   `docs/Phase_LULD_V3c.md`. Retained only in the frozen Phase F legacy config; not used in
+   EPG-Rapid (exit = EPG PASS→FAIL only).
 3. **EPG window close** — EPG transitions PASS → FAIL/INACTIVE.
 
-**Config:** `config/strategy.json` — EXIT_D currently **disabled** (`enabled: false`); code retained. LULD upper band active, lower band disabled (Phase F config).
+**Config:** `config/strategy.json` — EXIT_D currently **disabled** (`enabled: false`); code retained. LULD upper band active in the frozen Phase F config only; no further LULD development (see decision above).
 
 ---
 
