@@ -546,12 +546,19 @@ def _process_event_rapid(args: dict) -> dict:
         n_entry_eligible_blocks = 0
         n_gap_gate_blocks = 0
         n_passtofail = 0  # total PASS→not-PASS transitions across entire event
+        pass_window_start_sec = None
+        pass_window_durations: list[float] = []
 
         for i in range(N):
             cur = epg_states[i]
 
             if prev_state == GateState.PASS and cur != GateState.PASS:
                 n_passtofail += 1
+                if pass_window_start_sec is not None:
+                    pass_window_durations.append(td.t_sec[i] - pass_window_start_sec)
+                    pass_window_start_sec = None
+            elif cur == GateState.PASS and prev_state != GateState.PASS:
+                pass_window_start_sec = td.t_sec[i]
 
             if not in_position and not closed_today:
                 entry_accepted = False
@@ -660,6 +667,10 @@ def _process_event_rapid(args: dict) -> dict:
                 "n_halt_windows": len(halt_intervals),
             })
 
+        # Close any open PASS window at event end
+        if pass_window_start_sec is not None:
+            pass_window_durations.append(td.t_sec[N - 1] - pass_window_start_sec)
+
         # Hard assertion: classic mode must never call entry_eligible
         if entry_mode == "rising_edge" and n_entry_eligible_blocks != 0:
             raise AssertionError(
@@ -678,6 +689,7 @@ def _process_event_rapid(args: dict) -> dict:
             "n_halt_windows": int(len(halt_intervals)),
             "n_event_trades": int(N),
             "n_passtofail_transitions": int(n_passtofail),
+            "pass_window_durations": pass_window_durations,
             "prev_close": float(prev_close),
             "first_price": float(td.prices[0]),
             "last_price": float(td.prices[-1]),
@@ -771,6 +783,14 @@ def compute_run_summary(events: list[dict]) -> dict:
         round(total_passtofail / n_events_total, 3) if n_events_total > 0 else None
     )
 
+    all_pass_windows: list[float] = []
+    for ev in events:
+        if ev.get("status") == "event":
+            all_pass_windows.extend(ev.get("pass_window_durations", []))
+    mean_consecutive_pass_window_sec = (
+        round(float(np.mean(all_pass_windows)), 2) if all_pass_windows else None
+    )
+
     return {
         "n_trades": int(n_trades),
         "profit_factor": round(pf, 4),
@@ -785,6 +805,7 @@ def compute_run_summary(events: list[dict]) -> dict:
         "median_hold_sec": round(float(np.median(hold)), 2),
         "mean_entry_lag_sec": mean_entry_lag_sec,
         "mean_passtofail_per_event": mean_passtofail_per_event,
+        "mean_consecutive_pass_window_sec": mean_consecutive_pass_window_sec,
         "session_breakdown": session_breakdown,
         "exit_reason_breakdown": exit_breakdown,
         "n_events_with_halt_windows": int(n_halt_windows),
@@ -1091,7 +1112,7 @@ def main():
 
     # ── Write per_event_summary.json ──
     per_event = [
-        {k: v for k, v in ev.items() if k not in ("trades",)}
+        {k: v for k, v in ev.items() if k not in ("trades", "pass_window_durations")}
         for ev in results
     ]
     write_json_atomic(per_event, results_dir / "per_event_summary.json")
