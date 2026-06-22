@@ -623,13 +623,15 @@ def generate_chart(diag: dict, out_dir: Path) -> Path | None:
     )
 
     # Background shading panels 1 & 2
+    # yref="y domain" spans full subplot height in paper coords — does not affect data range
     for t_start, t_end, state in state_intervals:
         fill = _STATE_FILL.get(state, "rgba(200,200,200,0.15)")
         for row in (1, 2):
             fig.add_shape(
                 type="rect",
                 x0=t_start, x1=t_end,
-                y0=-1e10, y1=1e10,
+                y0=0, y1=1,
+                xref="x", yref="y domain",
                 row=row, col=1,
                 fillcolor=fill,
                 opacity=1.0,
@@ -789,6 +791,7 @@ def generate_chart(diag: dict, out_dir: Path) -> Path | None:
             type="rect",
             x0=t_start, x1=t_end,
             y0=0, y1=1,
+            xref="x", yref="y domain",
             row=4, col=1,
             fillcolor=_STATE_SOLID.get(state, "rgba(200,200,200,0.85)"),
             opacity=1.0,
