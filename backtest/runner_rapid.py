@@ -8,7 +8,7 @@ parity  (--parity):
     Produces output identical to runner.py when run with matching config.
     Use: compare parity_diff.json — must be empty before R1.
 
-rapid (default, --entry-mode {rising_edge|cross_and_hold}):
+rapid (default, --entry-mode {rising_edge|first_pass|cross_and_hold}):
     Halt windows detected via detect_luld_halts() and fed to Hawkes replay.
     Exit stack: EPG window close only (EXIT_D off, LULD off).
     Hard re-entry off: closed_today=True after first entry; one trade per event.
@@ -17,13 +17,18 @@ T3 parity check:
     python -m backtest.runner_rapid --parity \\
         --split val --results-dir results/phase_r0/parity
 
-T4 gate-consistent baseline:
-    python -m backtest.runner_rapid --entry-mode rising_edge --n-hold 15 \\
-        --split val --results-dir results/phase_r0/baseline
+T2 gate-consistent baseline (classic rising-edge):
+    python -m backtest.runner_rapid --entry-mode rising_edge \\
+        --split val --results-dir results/phase_r0/baseline_r0
 
-R1+ rapid entry:
-    python -m backtest.runner_rapid --entry-mode cross_and_hold --n-hold 3 \\
-        --split val --results-dir results/phase_r1/rapid
+R0 first-PASS rapid entry (EPG-Rapid design):
+    python -m backtest.runner_rapid --entry-mode first_pass \\
+        --split val --results-dir results/phase_r0/rapid_r0
+
+R1+ asymmetric gate sweep:
+    python -m backtest.runner_rapid --entry-mode first_pass \\
+        --p-open 0.70 --p-close 0.65 \\
+        --split val --results-dir results/phase_r1/rapid_po70_pc65
 """
 from __future__ import annotations
 
@@ -46,7 +51,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from data.schemas.mom_db import CONFIG_DIR, NS_PER_SECOND
+from data.schemas.mom_db import CONFIG_DIR, DATA_ROOT, NS_PER_SECOND
 from data.loaders.trades import (
     load_trades, list_events, _session_ns_bounds,
     compute_lambda_ref_per_event,
@@ -446,6 +451,20 @@ def _process_event_rapid(args: dict) -> dict:
         )
         N = td.n_trades
 
+        # ── Scanner hit floor ──
+        # If event is in the catalog and price never reached the scanner threshold,
+        # we would never trade it live → skip.  If the catalog has a hit timestamp,
+        # no tick before that timestamp is eligible for entry.
+        _sh_ts_ns       = args.get("scanner_hit_ts_ns")          # int | None
+        _sh_in_catalog  = args.get("scanner_hit_in_catalog", False)
+        scanner_hit_t_sec: float | None = None
+        if _sh_in_catalog:
+            if _sh_ts_ns is None:
+                return {**base, "status": "skipped", "reason": "no_scanner_hit"}
+            scanner_hit_t_sec = (_sh_ts_ns - int(td.timestamps[0])) / NS_PER_SECOND
+
+        gate_at_scanner_hit: str | None = None
+
         # ── 2. Lee-Ready sides ──
         tier_qbar = q_bar_cfg.get("wide", {}).get("median", 250.0)
         ofi_result = compute_trade_ofi(
@@ -522,6 +541,9 @@ def _process_event_rapid(args: dict) -> dict:
                 t_event_sec = td.t_sec[i]
             dv = float(td.prices[i]) * float(td.sizes[i])
             epg_states[i] = gate.update(dv, td.t_sec[i])
+            if (scanner_hit_t_sec is not None and gate_at_scanner_hit is None
+                    and td.t_sec[i] >= scanner_hit_t_sec):
+                gate_at_scanner_hit = epg_states[i].name
 
         if not t_event_fired:
             return {**base, "status": "skipped", "reason": "no_t_event",
@@ -552,6 +574,11 @@ def _process_event_rapid(args: dict) -> dict:
         for i in range(N):
             cur = epg_states[i]
 
+            # Scanner hit floor: no entry processing before first scanner hit tick
+            if scanner_hit_t_sec is not None and td.t_sec[i] < scanner_hit_t_sec:
+                prev_state = cur
+                continue
+
             if prev_state == GateState.PASS and cur != GateState.PASS:
                 n_passtofail += 1
                 if pass_window_start_sec is not None:
@@ -569,6 +596,11 @@ def _process_event_rapid(args: dict) -> dict:
                             prev_state in (GateState.INACTIVE, GateState.WARMUP,
                                            GateState.FAIL)):
                         n_pass_edges += 1
+                        entry_accepted = True
+                elif entry_mode == "first_pass":
+                    # First-PASS (EPG-Rapid §1): enter on first live PASS tick.
+                    # No rising-edge requirement, no SF, no entry_eligible(), no n_hold.
+                    if cur == GateState.PASS:
                         entry_accepted = True
                 else:  # cross_and_hold: any PASS tick, gated by entry_eligible
                     if cur == GateState.PASS:
@@ -620,6 +652,10 @@ def _process_event_rapid(args: dict) -> dict:
                         "exit_t_sec": float(exit_t_sec),
                         "hold_sec": float(exit_t_sec - entry_t_sec),
                         "entry_lag_sec": float(entry_t_sec - t_event_sec),
+                        "entry_lag_from_scanner_sec": (
+                            float(entry_t_sec - scanner_hit_t_sec)
+                            if scanner_hit_t_sec is not None else None
+                        ),
                         "entry_price": float(entry_price),
                         "exit_price": float(exit_price),
                         "pnl_pct": float(pnl_pct),
@@ -656,6 +692,10 @@ def _process_event_rapid(args: dict) -> dict:
                 "exit_t_sec": float(exit_t_sec),
                 "hold_sec": float(exit_t_sec - entry_t_sec),
                 "entry_lag_sec": float(entry_t_sec - t_event_sec),
+                "entry_lag_from_scanner_sec": (
+                    float(entry_t_sec - scanner_hit_t_sec)
+                    if scanner_hit_t_sec is not None else None
+                ),
                 "entry_price": float(entry_price),
                 "exit_price": float(exit_price),
                 "pnl_pct": float(pnl_pct),
@@ -671,10 +711,10 @@ def _process_event_rapid(args: dict) -> dict:
         if pass_window_start_sec is not None:
             pass_window_durations.append(td.t_sec[N - 1] - pass_window_start_sec)
 
-        # Hard assertion: classic mode must never call entry_eligible
-        if entry_mode == "rising_edge" and n_entry_eligible_blocks != 0:
+        # Hard assertion: rising_edge and first_pass must never call entry_eligible
+        if entry_mode in ("rising_edge", "first_pass") and n_entry_eligible_blocks != 0:
             raise AssertionError(
-                f"[§1.1] rising_edge mode called entry_eligible {n_entry_eligible_blocks}x"
+                f"[§1.1] {entry_mode} mode called entry_eligible {n_entry_eligible_blocks}x"
                 f" in {ticker} {date} — code bug, entry paths not separated"
             )
 
@@ -690,6 +730,7 @@ def _process_event_rapid(args: dict) -> dict:
             "n_event_trades": int(N),
             "n_passtofail_transitions": int(n_passtofail),
             "pass_window_durations": pass_window_durations,
+            "gate_at_scanner_hit": gate_at_scanner_hit,
             "prev_close": float(prev_close),
             "first_price": float(td.prices[0]),
             "last_price": float(td.prices[-1]),
@@ -774,6 +815,28 @@ def compute_run_summary(events: list[dict]) -> dict:
                   if t.get("entry_lag_sec") is not None]
     mean_entry_lag_sec = round(float(np.mean(entry_lags)), 2) if entry_lags else None
 
+    scanner_lags = [t.get("entry_lag_from_scanner_sec") for t in all_trades
+                    if t.get("entry_lag_from_scanner_sec") is not None]
+    mean_entry_lag_from_scanner_sec = (
+        round(float(np.mean(scanner_lags)), 2) if scanner_lags else None
+    )
+    median_entry_lag_from_scanner_sec = (
+        round(float(np.median(scanner_lags)), 2) if scanner_lags else None
+    )
+    p90_entry_lag_from_scanner_sec = (
+        round(float(np.percentile(scanner_lags, 90)), 2) if scanner_lags else None
+    )
+
+    gate_states_at_scanner = [
+        ev.get("gate_at_scanner_hit") for ev in events
+        if ev.get("status") == "event" and ev.get("gate_at_scanner_hit") is not None
+    ]
+    n_pass_at_scanner = sum(1 for s in gate_states_at_scanner if s == "PASS")
+    pct_events_gate_pass_at_scanner_hit = (
+        round(100.0 * n_pass_at_scanner / len(gate_states_at_scanner), 2)
+        if gate_states_at_scanner else None
+    )
+
     n_events_total = sum(1 for ev in events if ev.get("status") == "event")
     total_passtofail = sum(
         ev.get("n_passtofail_transitions", 0)
@@ -804,6 +867,10 @@ def compute_run_summary(events: list[dict]) -> dict:
         "mean_hold_sec": round(float(np.mean(hold)), 2),
         "median_hold_sec": round(float(np.median(hold)), 2),
         "mean_entry_lag_sec": mean_entry_lag_sec,
+        "mean_entry_lag_from_scanner_sec": mean_entry_lag_from_scanner_sec,
+        "median_entry_lag_from_scanner_sec": median_entry_lag_from_scanner_sec,
+        "p90_entry_lag_from_scanner_sec": p90_entry_lag_from_scanner_sec,
+        "pct_events_gate_pass_at_scanner_hit": pct_events_gate_pass_at_scanner_hit,
         "mean_passtofail_per_event": mean_passtofail_per_event,
         "mean_consecutive_pass_window_sec": mean_consecutive_pass_window_sec,
         "session_breakdown": session_breakdown,
@@ -883,9 +950,9 @@ def parse_args():
                         help="Split to run on (test locked until R5)")
     parser.add_argument("--parity", action="store_true", default=False,
                         help="T3 parity mode: delegate to runner._process_event")
-    parser.add_argument("--entry-mode", type=str, default="cross_and_hold",
-                        choices=["rising_edge", "cross_and_hold"],
-                        help="Entry trigger: rising_edge (T4 baseline) or cross_and_hold (R1+)")
+    parser.add_argument("--entry-mode", type=str, default="first_pass",
+                        choices=["rising_edge", "first_pass", "cross_and_hold"],
+                        help="Entry trigger: rising_edge (baseline), first_pass (EPG-Rapid), cross_and_hold (legacy)")
     parser.add_argument("--n-hold", type=int, default=3,
                         help="entry_eligible n_hold bars (default 3)")
     parser.add_argument("--roc-min", type=float, default=None,
@@ -941,6 +1008,16 @@ def main():
         for r in phase_a_results:
             if r.get("status") == "success" and "final_params" in r:
                 per_event_params[(r["ticker"], r["date"])] = r["final_params"]
+
+    # ── Scanner hit catalog (pre-computed floor timestamps) ──
+    scanner_hit_catalog: dict = {}
+    catalog_path = DATA_ROOT / "filtered" / "scanner_hit_catalog.json"
+    if catalog_path.exists():
+        with open(catalog_path) as f:
+            scanner_hit_catalog = json.load(f)
+        log.info(f"Scanner hit catalog: {len(scanner_hit_catalog)} entries loaded")
+    else:
+        log.warning(f"Scanner hit catalog not found at {catalog_path} — floor guard disabled")
 
     all_events = list_events(min_mom=50.0, require_date=True)
     val_start = boundary["val_split_start_date"]
@@ -1014,18 +1091,22 @@ def main():
     exit_d_theta = exit_d_cfg.get("theta", 0.65)
     exit_d_tau_min_ns = int(exit_d_cfg.get("tau_min_sec", 4.0) * NS_PER_SECOND)
 
-    gap_threshold = args.gap_threshold
-    gap_gate_enabled = not args.no_gap_gate and not args.parity
-    # In rapid mode, gap gate is off by default (scanner already filters >=30%).
-    # In parity mode, this is overridden by the classic runner's own config.
     gap_gate_cfg = phase_cfg.get("gap_gate", {})
     if args.parity:
+        # Parity: delegate gap-gate control to strategy.json to match runner.py exactly.
         gap_gate_enabled = gap_gate_cfg.get("enabled", True)
+        gap_threshold = gap_gate_cfg.get("threshold", args.gap_threshold)
+    else:
+        # Rapid: gap gate OFF by default (scanner already ensures >=30%).
+        gap_gate_enabled = False
+        gap_threshold = args.gap_threshold
 
     work_items = []
     for i, ev in enumerate(events):
         key = (ev["ticker"], ev["date"])
         fp = per_event_params.get(key, hawkes_median)
+        catalog_key = f"{ev['ticker']}:{ev['date']}"
+        catalog_rec = scanner_hit_catalog.get(catalog_key)  # None if not in catalog
         item = {
             "ticker": ev["ticker"],
             "date": ev["date"],
@@ -1062,13 +1143,18 @@ def main():
             "watermark_threshold": None,
             "cvd_filter_enabled": False,
             "intra_window_watermark_threshold": None,
+            # Scanner hit floor
+            "scanner_hit_ts_ns": catalog_rec.get("scanner_hit_ts_ns") if catalog_rec else None,
+            "scanner_hit_in_catalog": catalog_rec is not None,
         }
         work_items.append(item)
 
     if args.parity:
         mode_label = "parity"
     elif args.entry_mode == "rising_edge":
-        mode_label = "rapid/classic"
+        mode_label = "rapid/rising_edge"
+    elif args.entry_mode == "first_pass":
+        mode_label = "rapid/first_pass"
     else:
         mode_label = f"rapid/cross_and_hold/n_hold={args.n_hold}"
     log.info(f"Mode={mode_label} | {len(work_items)} events")

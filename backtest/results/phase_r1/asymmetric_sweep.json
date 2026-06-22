@@ -1,178 +1,185 @@
-[
-  {
-    "p_open": 0.6,
-    "p_close": 0.55,
-    "label": "po60_pc55",
-    "n_trades": 82,
-    "profit_factor": 1.3846,
-    "win_rate": 56.1,
-    "mean_pnl_pct": 1.3205,
-    "cvar5_pct": -17.695,
-    "mean_hold_sec": 1249.95,
-    "mean_entry_lag_sec": 3638.66,
-    "mean_passtofail_per_event": 5.845,
-    "mean_consecutive_pass_window_sec": 947.14,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 82,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.3846,
-        "mean_pnl_pct": 1.3205
-      }
-    }
-  },
-  {
-    "p_open": 0.65,
-    "p_close": 0.55,
-    "label": "po65_pc55",
-    "n_trades": 82,
-    "profit_factor": 1.3403,
-    "win_rate": 53.66,
-    "mean_pnl_pct": 1.2211,
-    "cvar5_pct": -17.695,
-    "mean_hold_sec": 1312.38,
-    "mean_entry_lag_sec": 3783.35,
-    "mean_passtofail_per_event": 4.905,
-    "mean_consecutive_pass_window_sec": 1081.45,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 82,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.3403,
-        "mean_pnl_pct": 1.2211
-      }
-    }
-  },
-  {
-    "p_open": 0.65,
-    "p_close": 0.6,
-    "label": "po65_pc60",
-    "n_trades": 81,
-    "profit_factor": 1.2172,
-    "win_rate": 46.91,
-    "mean_pnl_pct": 0.7952,
-    "cvar5_pct": -17.0079,
-    "mean_hold_sec": 1095.08,
-    "mean_entry_lag_sec": 3813.06,
-    "mean_passtofail_per_event": 5.738,
-    "mean_consecutive_pass_window_sec": 860.14,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 81,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.2172,
-        "mean_pnl_pct": 0.7952
-      }
-    }
-  },
-  {
-    "p_open": 0.7,
-    "p_close": 0.55,
-    "label": "po70_pc55",
-    "n_trades": 82,
-    "profit_factor": 1.3536,
-    "win_rate": 54.88,
-    "mean_pnl_pct": 1.2632,
-    "cvar5_pct": -17.695,
-    "mean_hold_sec": 1313.02,
-    "mean_entry_lag_sec": 3835.83,
-    "mean_passtofail_per_event": 4.524,
-    "mean_consecutive_pass_window_sec": 1134.09,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 82,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.3536,
-        "mean_pnl_pct": 1.2632
-      }
-    }
-  },
-  {
-    "p_open": 0.7,
-    "p_close": 0.6,
-    "label": "po70_pc60",
-    "n_trades": 81,
-    "profit_factor": 1.24,
-    "win_rate": 49.38,
-    "mean_pnl_pct": 0.8691,
-    "cvar5_pct": -17.0079,
-    "mean_hold_sec": 1095.51,
-    "mean_entry_lag_sec": 3866.18,
-    "mean_passtofail_per_event": 5.06,
-    "mean_consecutive_pass_window_sec": 943.18,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 81,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.24,
-        "mean_pnl_pct": 0.8691
-      }
-    }
-  },
-  {
-    "p_open": 0.7,
-    "p_close": 0.65,
-    "label": "po70_pc65",
-    "n_trades": 81,
-    "profit_factor": 1.4109,
-    "win_rate": 50.62,
-    "mean_pnl_pct": 1.413,
-    "cvar5_pct": -16.9191,
-    "mean_hold_sec": 987.49,
-    "mean_entry_lag_sec": 3902.96,
-    "mean_passtofail_per_event": 5.75,
-    "mean_consecutive_pass_window_sec": 771.35,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 81,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.4109,
-        "mean_pnl_pct": 1.413
-      }
-    }
-  },
-  {
-    "p_open": 0.65,
-    "p_close": 0.4,
-    "label": "low_close_0.40",
-    "n_trades": 82,
-    "profit_factor": 1.5508,
-    "win_rate": 50.0,
-    "mean_pnl_pct": 2.1347,
-    "cvar5_pct": -21.964,
-    "mean_hold_sec": 1930.49,
-    "mean_entry_lag_sec": 3590.16,
-    "mean_passtofail_per_event": 3.655,
-    "mean_consecutive_pass_window_sec": 1833.04,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 82,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.5508,
-        "mean_pnl_pct": 2.1347
-      }
-    }
-  },
-  {
-    "p_open": 0.65,
-    "p_close": 0.5,
-    "label": "low_close_0.50",
-    "n_trades": 82,
-    "profit_factor": 1.4817,
-    "win_rate": 45.12,
-    "mean_pnl_pct": 1.734,
-    "cvar5_pct": -18.0682,
-    "mean_hold_sec": 1527.68,
-    "mean_entry_lag_sec": 3670.73,
-    "mean_passtofail_per_event": 4.31,
-    "mean_consecutive_pass_window_sec": 1326.51,
-    "exit_reason_breakdown": {
-      "epg_window_close": {
-        "count": 82,
-        "pct_of_trades": 100.0,
-        "profit_factor": 1.4817,
-        "mean_pnl_pct": 1.734
-      }
-    }
-  }
-]
+﻿{
+    "_invalidated":  true,
+    "_invalidated_reason":  "Scanner hit floor not applied when produced. Entries fired before scanner hit in ~65% of events. See results/phase_r1/INVALIDATED.md",
+    "configs":  {
+                    "value":  [
+                                  {
+                                      "p_open":  0.6,
+                                      "p_close":  0.55,
+                                      "label":  "po60_pc55",
+                                      "n_trades":  82,
+                                      "profit_factor":  1.3846,
+                                      "win_rate":  56.1,
+                                      "mean_pnl_pct":  1.3205,
+                                      "cvar5_pct":  -17.695,
+                                      "mean_hold_sec":  1249.95,
+                                      "mean_entry_lag_sec":  3638.66,
+                                      "mean_passtofail_per_event":  5.845,
+                                      "mean_consecutive_pass_window_sec":  947.14,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  82,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.3846,
+                                                                                             "mean_pnl_pct":  1.3205
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.65,
+                                      "p_close":  0.55,
+                                      "label":  "po65_pc55",
+                                      "n_trades":  82,
+                                      "profit_factor":  1.3403,
+                                      "win_rate":  53.66,
+                                      "mean_pnl_pct":  1.2211,
+                                      "cvar5_pct":  -17.695,
+                                      "mean_hold_sec":  1312.38,
+                                      "mean_entry_lag_sec":  3783.35,
+                                      "mean_passtofail_per_event":  4.905,
+                                      "mean_consecutive_pass_window_sec":  1081.45,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  82,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.3403,
+                                                                                             "mean_pnl_pct":  1.2211
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.65,
+                                      "p_close":  0.6,
+                                      "label":  "po65_pc60",
+                                      "n_trades":  81,
+                                      "profit_factor":  1.2172,
+                                      "win_rate":  46.91,
+                                      "mean_pnl_pct":  0.7952,
+                                      "cvar5_pct":  -17.0079,
+                                      "mean_hold_sec":  1095.08,
+                                      "mean_entry_lag_sec":  3813.06,
+                                      "mean_passtofail_per_event":  5.738,
+                                      "mean_consecutive_pass_window_sec":  860.14,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  81,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.2172,
+                                                                                             "mean_pnl_pct":  0.7952
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.7,
+                                      "p_close":  0.55,
+                                      "label":  "po70_pc55",
+                                      "n_trades":  82,
+                                      "profit_factor":  1.3536,
+                                      "win_rate":  54.88,
+                                      "mean_pnl_pct":  1.2632,
+                                      "cvar5_pct":  -17.695,
+                                      "mean_hold_sec":  1313.02,
+                                      "mean_entry_lag_sec":  3835.83,
+                                      "mean_passtofail_per_event":  4.524,
+                                      "mean_consecutive_pass_window_sec":  1134.09,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  82,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.3536,
+                                                                                             "mean_pnl_pct":  1.2632
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.7,
+                                      "p_close":  0.6,
+                                      "label":  "po70_pc60",
+                                      "n_trades":  81,
+                                      "profit_factor":  1.24,
+                                      "win_rate":  49.38,
+                                      "mean_pnl_pct":  0.8691,
+                                      "cvar5_pct":  -17.0079,
+                                      "mean_hold_sec":  1095.51,
+                                      "mean_entry_lag_sec":  3866.18,
+                                      "mean_passtofail_per_event":  5.06,
+                                      "mean_consecutive_pass_window_sec":  943.18,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  81,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.24,
+                                                                                             "mean_pnl_pct":  0.8691
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.7,
+                                      "p_close":  0.65,
+                                      "label":  "po70_pc65",
+                                      "n_trades":  81,
+                                      "profit_factor":  1.4109,
+                                      "win_rate":  50.62,
+                                      "mean_pnl_pct":  1.413,
+                                      "cvar5_pct":  -16.9191,
+                                      "mean_hold_sec":  987.49,
+                                      "mean_entry_lag_sec":  3902.96,
+                                      "mean_passtofail_per_event":  5.75,
+                                      "mean_consecutive_pass_window_sec":  771.35,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  81,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.4109,
+                                                                                             "mean_pnl_pct":  1.413
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.65,
+                                      "p_close":  0.4,
+                                      "label":  "low_close_0.40",
+                                      "n_trades":  82,
+                                      "profit_factor":  1.5508,
+                                      "win_rate":  50.0,
+                                      "mean_pnl_pct":  2.1347,
+                                      "cvar5_pct":  -21.964,
+                                      "mean_hold_sec":  1930.49,
+                                      "mean_entry_lag_sec":  3590.16,
+                                      "mean_passtofail_per_event":  3.655,
+                                      "mean_consecutive_pass_window_sec":  1833.04,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  82,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.5508,
+                                                                                             "mean_pnl_pct":  2.1347
+                                                                                         }
+                                                                }
+                                  },
+                                  {
+                                      "p_open":  0.65,
+                                      "p_close":  0.5,
+                                      "label":  "low_close_0.50",
+                                      "n_trades":  82,
+                                      "profit_factor":  1.4817,
+                                      "win_rate":  45.12,
+                                      "mean_pnl_pct":  1.734,
+                                      "cvar5_pct":  -18.0682,
+                                      "mean_hold_sec":  1527.68,
+                                      "mean_entry_lag_sec":  3670.73,
+                                      "mean_passtofail_per_event":  4.31,
+                                      "mean_consecutive_pass_window_sec":  1326.51,
+                                      "exit_reason_breakdown":  {
+                                                                    "epg_window_close":  {
+                                                                                             "count":  82,
+                                                                                             "pct_of_trades":  100.0,
+                                                                                             "profit_factor":  1.4817,
+                                                                                             "mean_pnl_pct":  1.734
+                                                                                         }
+                                                                }
+                                  }
+                              ],
+                    "Count":  8
+                }
+}

@@ -1,0 +1,54 @@
+{
+  "n_trades": 52,
+  "profit_factor": 0.8277,
+  "win_rate": 48.08,
+  "mean_pnl_pct": -0.8421,
+  "median_pnl_pct": -1.0172,
+  "total_pnl_pct": -43.7906,
+  "cvar5_pct": -22.1515,
+  "max_win_pct": 34.3313,
+  "max_loss_pct": -24.1379,
+  "mean_hold_sec": 873.57,
+  "median_hold_sec": 772.59,
+  "mean_entry_lag_sec": 6868.31,
+  "mean_entry_lag_from_scanner_sec": 1750.83,
+  "median_entry_lag_from_scanner_sec": 6.9,
+  "p90_entry_lag_from_scanner_sec": 5009.7,
+  "pct_events_gate_pass_at_scanner_hit": 41.82,
+  "mean_passtofail_per_event": 8.527,
+  "mean_consecutive_pass_window_sec": 297.2,
+  "session_breakdown": {
+    "regular_hours": {
+      "n_trades": 31,
+      "profit_factor": 0.9627,
+      "mean_pnl_pct": -0.1642,
+      "win_rate": 48.39
+    },
+    "pre_market": {
+      "n_trades": 21,
+      "profit_factor": 0.6714,
+      "mean_pnl_pct": -1.8428,
+      "win_rate": 47.62
+    }
+  },
+  "exit_reason_breakdown": {
+    "epg_window_close": {
+      "count": 52,
+      "pct_of_trades": 100.0,
+      "profit_factor": 0.8277,
+      "mean_pnl_pct": -0.8421
+    }
+  },
+  "n_events_with_halt_windows": 77,
+  "run_config": {
+    "mode": "rapid/first_pass",
+    "entry_mode": "first_pass",
+    "n_hold": 3,
+    "p_open": 0.65,
+    "p_close": 0.65,
+    "roc_min": null,
+    "n_events_sampled": 100,
+    "seed": 42,
+    "split": "val"
+  }
+}

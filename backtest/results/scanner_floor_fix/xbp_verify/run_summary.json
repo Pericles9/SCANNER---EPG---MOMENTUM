@@ -1,0 +1,48 @@
+{
+  "n_trades": 1,
+  "profit_factor": 0.0,
+  "win_rate": 0.0,
+  "mean_pnl_pct": -13.8146,
+  "median_pnl_pct": -13.8146,
+  "total_pnl_pct": -13.8146,
+  "cvar5_pct": -13.8146,
+  "max_win_pct": -13.8146,
+  "max_loss_pct": -13.8146,
+  "mean_hold_sec": 438.65,
+  "median_hold_sec": 438.65,
+  "mean_entry_lag_sec": 3108.55,
+  "mean_entry_lag_from_scanner_sec": 595.58,
+  "median_entry_lag_from_scanner_sec": 595.58,
+  "p90_entry_lag_from_scanner_sec": 595.58,
+  "pct_events_gate_pass_at_scanner_hit": 0.0,
+  "mean_passtofail_per_event": 6.0,
+  "mean_consecutive_pass_window_sec": 210.63,
+  "session_breakdown": {
+    "regular_hours": {
+      "n_trades": 1,
+      "profit_factor": 0.0,
+      "mean_pnl_pct": -13.8146,
+      "win_rate": 0.0
+    }
+  },
+  "exit_reason_breakdown": {
+    "epg_window_close": {
+      "count": 1,
+      "pct_of_trades": 100.0,
+      "profit_factor": 0.0,
+      "mean_pnl_pct": -13.8146
+    }
+  },
+  "n_events_with_halt_windows": 3,
+  "run_config": {
+    "mode": "rapid/first_pass",
+    "entry_mode": "first_pass",
+    "n_hold": 3,
+    "p_open": 0.65,
+    "p_close": 0.65,
+    "roc_min": null,
+    "n_events_sampled": 1,
+    "seed": 42,
+    "split": "val"
+  }
+}

@@ -1,0 +1,20 @@
+﻿{
+    "a3_verdict":  "PASS — floor guard prevents pre-scanner entry. Entry now post-scanner by 595.6s. Proceed to A4.",
+    "escalation_triggered":  false,
+    "scanner_hit_tod_sec":  22319.655,
+    "escalation_note":  "Gate=FAIL at scanner hit (not WARMUP/INACTIVE). Entry fires at next PASS, 595.6s after scanner. No escalation.",
+    "exit_reason":  "epg_window_close",
+    "entry_lag_from_scanner_sec":  595.58,
+    "entry_tod_sec":  22915.232,
+    "entry_price":  33.66,
+    "exit_price":  29.01,
+    "scanner_hit_hms":  "10:11:59 ET",
+    "entry_hms":  "10:21:55 ET",
+    "a3_verification":  "XBP:2023-12-04",
+    "floor_guard_working":  true,
+    "pnl_pct":  -13.81,
+    "pre_fix_entry_lag_from_scanner_sec":  -2206.7,
+    "gate_at_scanner_hit":  "FAIL",
+    "entry_lag_from_t_event_sec":  3108.55,
+    "pre_fix_entry_hms":  "09:35:13 ET"
+}

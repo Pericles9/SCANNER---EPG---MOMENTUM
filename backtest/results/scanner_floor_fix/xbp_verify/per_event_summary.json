@@ -1,0 +1,19 @@
+[
+  {
+    "ticker": "XBP",
+    "date": "2023-12-04",
+    "event_idx": 0,
+    "status": "event",
+    "n_trades_in_event": 1,
+    "n_pass_edges": 0,
+    "n_entry_eligible_blocks": 0,
+    "n_gap_gate_blocks": 0,
+    "n_halt_windows": 3,
+    "n_event_trades": 5866,
+    "n_passtofail_transitions": 6,
+    "gate_at_scanner_hit": "FAIL",
+    "prev_close": 23.75,
+    "first_price": 20.84,
+    "last_price": 37.5
+  }
+]
