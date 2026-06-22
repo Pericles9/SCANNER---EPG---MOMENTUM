@@ -5,7 +5,7 @@ tags:
   - domain/hawkes
   - domain/microstructure
   - project/scanner-epg-momentum
-  - status/proposal
+  - status/active
 created: 2026-06-18
 parent_strategy: epg
 strategy_id: epg_rapid
@@ -31,8 +31,8 @@ the best part of the move is often gone.
 
 EPG-Rapid keeps the **validated exit machinery** and replaces only the **entry**:
 
-- **Entry:** fire on the **first EPG gate PASS tick at or after `t_scanner_hit_sec`**. No rising-edge requirement, no SF cross-and-hold, no n_hold. **Hard floor: no tick before the scanner hit timestamp is eligible for entry** (enforced by the pre-computed `scanner_hit_catalog.json`). Entering into a live PASS state avoids immediate-exit risk.
-- **Exit:** EPG window close only. EXIT_D off. LULD proximity exit abandoned 2026-06-20 — structurally blind to discretionary Straddle-State halts (see `Phase_LULD_V3c.md`).
+- **Entry:** fire on the **first tick at or after `t_scanner_hit`** where `gate.state == PASS`. The scanner hit timestamp is a hard floor — no tick before it is eligible regardless of gate state. In the majority of events the gate is already PASS at scanner hit (warmed on pre-event history), so entry fires within seconds. No rising-edge requirement. No SF involvement of any kind.
+- **Exit:** EPG window close (primary). EXIT_D off. LULD proximity (rebuilt module, both sides, RTH only) active — halt avoidance. Tuned in R4. See §5.
 - **Re-entry:** hard off. One trade per ticker per session.
 
 The target event is the **dead-tape-to-burst transition**: a stock trading on near-zero
@@ -49,14 +49,14 @@ volume from 4am, news hits 7–9am ET, volume explodes, price runs 100–200%+ o
 | Gate threshold | `p_open`, `p_close` — **tuned in Phase R1** | Starting point 0.65/0.65 (original). Swept independently in R1. See §2.1. |
 | Gate role | Entry qualifier **and** exit driver | Entry requires gate PASS; exit fires on PASS→FAIL/INACTIVE. |
 | EXIT_D | **Disabled** | `exit_d.enabled=false`. Code retained, not evaluated. |
-| LULD proximity | **ABANDONED 2026-06-20** | Structurally a Limit-State detector; blind to discretionary Straddle-State halts (V3c recall ceiling 0.31). Not used in EPG-Rapid. See `Phase_LULD_V3c.md`. |
+| LULD proximity | Rebuilt module, both sides | Independent upper/lower thresholds (0.02/0.02 start). RTH only. Lower band re-enabled (no EXIT_D to pre-empt). Tuned in R4. See §5. |
 | EPG window close | Enabled | PASS→FAIL or PASS→INACTIVE. Primary exit. Timing determined by gate threshold from R1. |
 | Re-entry | Hard off | One entry per ticker per session. `closed_today=True` set at entry, before fill confirmation. |
-| Entry qualification | First live EPG PASS tick at or after scanner hit | Hard floor: `scanner_hit_t_sec` from pre-computed catalog. See §3.0. |
+| Entry qualification | First PASS tick at or after `t_scanner_hit` | Hard scanner hit floor checked before gate state. No SF, no rising-edge, no `n_hold`. |
 | ROC gate | 5-minute ROC | `roc_5m ≥ threshold`. Threshold tuned 5–25% (Phase R3). |
 | Scanner heat / quartile | **Void** | Computed and stored as analysis fields only. No gate. Legacy Q3/Q4 filter is not applied. |
 | Halt handling | Pause decay clocks across halt gaps | Hawkes EMA and gate `λ_V` do not decay across detected halt windows. See §6. |
-| Baseline | Best validated EPG on 100-event val | Same exit stack as EPG-Rapid (LULD prox on, EXIT_D off). See §7. |
+| Baseline | Classic EPG on MDR≥200 diagnostic sample (first-PASS, same exit stack) | Scanner floor active. See §7. |
 | Test split | Untouched | Opened once at the very end of the full pipeline. Not in any phase. |
 
 ---
@@ -82,6 +82,11 @@ The sweep (Phase R1) starts with **symmetric** arms (`p_open = p_close`), then e
 **asymmetric** combinations. Key diagnostic: average PASS→FAIL transitions per trade
 (gate chatter) and exit-reason distribution. Cooper selects; agent presents data only.
 
+`max_entry_lag_sec` (Phase R1 starting point 180s): maximum allowed seconds from scanner
+hit to entry. Applied per-event as a hard filter in R1 — events where
+`t_entry − t_scanner_hit > max_entry_lag_sec` are excluded from scoring. R0 logs the lag
+distribution; Cooper sets the value before R1 begins.
+
 ---
 
 ---
@@ -89,60 +94,35 @@ The sweep (Phase R1) starts with **symmetric** arms (`p_open = p_close`), then e
 ## 3. Entry Stack
 
 ```
-Scanner hit (todaysChangePerc ≥ 30%)
+Scanner hit  (todaysChangePerc ≥ 30%; pre-computed in scanner_hit_catalog.json)
     ↓
-[HARD FLOOR] t_scanner_hit_sec from scanner_hit_catalog.json
-    │  No tick before this timestamp is eligible for entry.
-    │  Events with no scanner hit in catalog → skipped entirely.
+ROC gate  roc_5m = pct_change_now − pct_change_5min_ago ≥ roc_min
     ↓
-5-min ROC gate: roc_5m ≥ roc_min
+Context fetch + historical replay
+    ├─ Hawkes engine: warmed from 4am, halt-gap dt=0 substitution active
+    └─ ParticipationGate: replayed through full pre-event history
     ↓
-Context fetch completes
-  └─ Hawkes engine warmed via historical replay (halt-gap-aware)
-  └─ EventAnchor + ParticipationGate replayed through history
+Entry loop — first tick at or after t_scanner_hit where BOTH conditions hold:
+    ├─ [FLOOR]  t_sec ≥ t_scanner_hit          (hard floor — always checked first)
+    └─ [GATE]   gate.state == PASS
     ↓
-First live EPG gate PASS tick at or after scanner hit → ENTRY
-    ↓
-closed_today = True   (no re-entry this session)
+ENTRY  →  closed_today = True  (no re-entry)
 ```
+
+*Note:* ROC gate checked on the pre-computed snapshot, before the replay. Scanner hit floor (`t_sec ≥ t_scanner_hit`) is always the first guard inside the entry loop; context fetch does not depend on it.
 
 ### 3.0 Scanner Hit Floor
 
-**Why it exists:** the rapid runner replays all session trades from 4am to warm the Hawkes
-model and EPG gate. The Hawkes anchor fires on the RTH open intensity surge — not on price
-momentum. Without an explicit floor, entries can and do fire before the stock reaches the
-30% threshold that would trigger the live scanner. In 65.4% of val-split events the anchor
-fires before scanner hit (median offset −174s; worst case observed: −2,207s = 37 min early).
+`t_scanner_hit_sec` is the timestamp when `todaysChangePerc ≥ 30%` was first satisfied,
+read from `scanner_hit_catalog.json`. Events with no confirmed scanner hit in the catalog
+are skipped (`reason=no_scanner_hit`).
 
-**Mechanism:** a pre-computed catalog (`data/filtered/scanner_hit_catalog.json`) records
-the first trade where `price ≥ prev_close × 1.30` for each val-split event. In the runner,
-this timestamp is loaded in `main()` and passed as `scanner_hit_ts_ns` in the work item.
-Inside `_process_event_rapid()`, it is converted to the `t_sec` frame
-(`scanner_hit_t_sec = (scanner_hit_ts_ns − timestamps[0]) / 1e9`) and used as the first
-guard in the entry loop:
+The gate is replayed through all pre-event history from 4:00am, so it is already warm —
+and often in PASS state — at the scanner hit tick. In 41.8% of val events the gate was in
+PASS at scanner hit; entry fired within seconds.
 
-```python
-if scanner_hit_t_sec is not None and td.t_sec[i] < scanner_hit_t_sec:
-    prev_state = cur
-    continue
-```
-
-**Edge cases:**
-
-- Event in catalog but `scanner_hit_ts_ns = null` (price never reached 30% in session
-  trades) → event **skipped** with reason `no_scanner_hit`. This is the correct live
-  behavior — the scanner would never have fired on this name.
-- Event not in catalog (e.g., train split, future events) → no floor applied; behavior
-  identical to pre-floor runner.
-- Scanner hit at the very first trade (pre-market gap-up) → `scanner_hit_t_sec < 0`;
-  floor is effectively inactive (all ticks pass).
-
-**Diagnostic fields added by the floor fix:**
-
-- Per-trade: `entry_lag_from_scanner_sec` (seconds from scanner hit to entry)
-- Event-level: `gate_at_scanner_hit` (gate state at the scanner hit tick)
-- Summary: `mean_entry_lag_from_scanner_sec`, `median_entry_lag_from_scanner_sec`,
-  `p90_entry_lag_from_scanner_sec`, `pct_events_gate_pass_at_scanner_hit`
+The floor guard is always the first check in the entry loop. No gate-state condition is
+evaluated for ticks before `t_scanner_hit_sec`.
 
 ### 3.1 ROC Gate (5-minute)
 
@@ -274,16 +254,16 @@ Detected halt windows must not advance any decay clock.
 
 ## 7. Baseline Definition
 
-The EPG-Rapid numbers are only meaningful against a baseline run with the **same exit
-stack**. The baseline is the best validated classic-EPG config on the 100-event val sample
-(seed=42), reconfigured to match EPG-Rapid's exits:
+EPG-Rapid numbers are only meaningful against a baseline run with the **same exit stack**.
+The baseline used throughout R0–R4 is classic-EPG first-PASS entry on the **MDR≥200
+diagnostic sample** (100 events, randomly selected from events where `mom_pct ≥ 200` and
+`t_scanner_hit_sec IS NOT NULL`, not top-ranked), configured to match EPG-Rapid exits.
 
 - Gate: `ParticipationGate`, original symmetric (`τ=300`, `p=0.65`, `warmup=300`).
-- EXIT_D: off. LULD proximity: on, **both sides**, at a fixed reference threshold (the R3
-  starting point). EPG window close: on.
-- Entry: **classic rising-edge ONLY** — no `entry_eligible()` call, zero SF involvement.
-  This is the thing EPG-Rapid replaces. (§1.1: bolting any SF gate onto the classic first
-  entry is the known EPG-OPT2-SF failure mode. The baseline must be clean of it.)
+- EXIT_D: off. **LULD proximity:** rebuilt module, both sides, `proximity_threshold=0.02`
+  each. EPG window close: on.
+- Entry: **classic first-PASS** — first tick where `gate.state == PASS` at or after
+  `t_scanner_hit`. Scanner floor active. No SF, no rising-edge, no `n_hold`.
 
 Reported deltas: PF, trade count, mean entry lag (t_entry − t_scanner_hit), CVaR5,
 exit-reason distribution.
@@ -345,6 +325,8 @@ updated in the same pass.
   "entry": {
     "mode": "rapid",
     "require_epg_pass": true,
+    "scanner_floor": true,
+    "max_entry_lag_sec": null,
     "roc_min_5m": 0.05
   },
   "reentry": { "enabled": false },
@@ -369,4 +351,5 @@ updated in the same pass.
 
 All values above are **starting points**, not selected. `p_open`/`p_close` selected in R1;
 `roc_min_5m` in R3; `proximity_threshold_upper`/`_lower` in R4.
+`max_entry_lag_sec` set by Cooper after R0 T7 distribution; `null` in R0 (log only).
 `reference_update_threshold_pct=0.01` is fixed (matches the real SIP rule, not a tuning target).
