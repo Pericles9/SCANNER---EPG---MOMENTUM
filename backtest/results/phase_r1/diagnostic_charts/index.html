@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>R1 T1 Entry Lag Diagnostic</title>
+<style>
+body { font-family: monospace; font-size: 13px; padding: 16px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: right; }
+th { background: #eee; cursor: pointer; }
+td:first-child, td:nth-child(2) { text-align: left; }
+tr:hover { background: #f9f9f9; }
+</style>
+<script>
+function sortTable(n) {
+  var t = document.getElementById("diag");
+  var rows = Array.from(t.rows).slice(1);
+  var asc = t.dataset.sort == n;
+  rows.sort((a, b) => {
+    var av = a.cells[n].innerText, bv = b.cells[n].innerText;
+    return asc ? av.localeCompare(bv, undefined, {numeric:true}) : bv.localeCompare(av, undefined, {numeric:true});
+  });
+  rows.forEach(r => t.appendChild(r));
+  t.dataset.sort = asc ? "" : n;
+}
+</script>
+</head>
+<body>
+<h2>R1 T1 Entry Lag Diagnostic — p=0.65/0.65</h2>
+<p>Sorted by t_event_offset_vs_scanner_sec descending (worst H1 cases first). Click column headers to re-sort.</p>
+<table id="diag" data-sort="">
+<tr>
+<th onclick="sortTable(0)">Ticker</th>
+<th onclick="sortTable(1)">Date</th>
+<th onclick="sortTable(2)">t_event_offset (s)</th>
+<th onclick="sortTable(3)">first_q_bar_offset (s)</th>
+<th onclick="sortTable(4)">entry_lag (s)</th>
+<th onclick="sortTable(5)">chatter</th>
+<th>Chart</th>
+</tr>
+<tr><td>⚠️CPOP</td><td>2024-02-08</td><td>22069.1</td><td>13958.4</td><td>10267.2</td><td>5</td><td><a href="CPOP_2024-02-08.png">chart</a></td></tr>
+<tr><td>⚠️BGLC</td><td>2024-06-04</td><td>21754.4</td><td>19804.6</td><td>390.6</td><td>1</td><td><a href="BGLC_2024-06-04.png">chart</a></td></tr>
+<tr><td>⚠️OTLK</td><td>2024-03-15</td><td>21558.8</td><td>14586.8</td><td>311.9</td><td>19</td><td><a href="OTLK_2024-03-15.png">chart</a></td></tr>
+<tr><td>⚠️ATGL</td><td>2024-04-22</td><td>21518.6</td><td>21799.6</td><td>401.4</td><td>4</td><td><a href="ATGL_2024-04-22.png">chart</a></td></tr>
+<tr><td>⚠️DRCT</td><td>2024-06-12</td><td>17733.0</td><td>18149.8</td><td>543.0</td><td>11</td><td><a href="DRCT_2024-06-12.png">chart</a></td></tr>
+<tr><td>⚠️MNY</td><td>2024-02-08</td><td>15554.2</td><td>18652.1</td><td>3221.4</td><td>13</td><td><a href="MNY_2024-02-08.png">chart</a></td></tr>
+<tr><td>⚠️NRXP</td><td>2024-05-06</td><td>14533.3</td><td>15811.5</td><td>4090.7</td><td>4</td><td><a href="NRXP_2024-05-06.png">chart</a></td></tr>
+<tr><td>⚠️BNAI</td><td>2024-05-29</td><td>14461.9</td><td>15240.0</td><td>898.0</td><td>4</td><td><a href="BNAI_2024-05-29.png">chart</a></td></tr>
+<tr><td>⚠️SGLY</td><td>2024-03-12</td><td>14402.0</td><td>840.0</td><td>301.5</td><td>6</td><td><a href="SGLY_2024-03-12.png">chart</a></td></tr>
+<tr><td>⚠️RAPT</td><td>2024-02-21</td><td>14401.8</td><td>15960.0</td><td>4859.5</td><td>2</td><td><a href="RAPT_2024-02-21.png">chart</a></td></tr>
+<tr><td>⚠️RR</td><td>2024-07-22</td><td>14400.6</td><td>660.0</td><td>5759.4</td><td>2</td><td><a href="RR_2024-07-22.png">chart</a></td></tr>
+<tr><td>⚠️ROOT</td><td>2024-02-22</td><td>14186.4</td><td>11880.0</td><td>3096.5</td><td>5</td><td><a href="ROOT_2024-02-22.png">chart</a></td></tr>
+<tr><td>⚠️UPLD</td><td>2024-05-03</td><td>13648.9</td><td>19872.2</td><td>6343.5</td><td>6</td><td><a href="UPLD_2024-05-03.png">chart</a></td></tr>
+<tr><td>⚠️BMRA</td><td>2023-12-18</td><td>12016.1</td><td>12197.8</td><td>301.9</td><td>13</td><td><a href="BMRA_2023-12-18.png">chart</a></td></tr>
+<tr><td>⚠️IXHL</td><td>2024-02-21</td><td>11408.3</td><td>13065.1</td><td>1991.5</td><td>7</td><td><a href="IXHL_2024-02-21.png">chart</a></td></tr>
+<tr><td>⚠️HSCS</td><td>2024-05-16</td><td>10848.4</td><td>20820.0</td><td>16698.4</td><td>17</td><td><a href="HSCS_2024-05-16.png">chart</a></td></tr>
+<tr><td>⚠️CNSP</td><td>2024-06-14</td><td>10808.3</td><td>10473.3</td><td>1105.0</td><td>4</td><td><a href="CNSP_2024-06-14.png">chart</a></td></tr>
+<tr><td>⚠️GRNQ</td><td>2024-07-15</td><td>10358.7</td><td>10259.9</td><td>300.6</td><td>8</td><td><a href="GRNQ_2024-07-15.png">chart</a></td></tr>
+<tr><td>⚠️FHTX</td><td>2024-02-08</td><td>8967.9</td><td>9162.6</td><td>316.5</td><td>20</td><td><a href="FHTX_2024-02-08.png">chart</a></td></tr>
+<tr><td>⚠️SFWL</td><td>2024-01-04</td><td>8142.4</td><td>20400.0</td><td>12378.9</td><td>28</td><td><a href="SFWL_2024-01-04.png">chart</a></td></tr>
+<tr><td>⚠️SPRC</td><td>2024-01-24</td><td>7836.7</td><td>9604.6</td><td>1888.4</td><td>3</td><td><a href="SPRC_2024-01-24.png">chart</a></td></tr>
+<tr><td>⚠️AEHL</td><td>2024-02-13</td><td>5266.6</td><td>8468.3</td><td>21817.0</td><td>14</td><td><a href="AEHL_2024-02-13.png">chart</a></td></tr>
+<tr><td>⚠️MBOT</td><td>2024-06-03</td><td>5030.3</td><td>5326.0</td><td>415.8</td><td>8</td><td><a href="MBOT_2024-06-03.png">chart</a></td></tr>
+<tr><td>⚠️INTZ</td><td>2024-04-17</td><td>4953.5</td><td>5039.5</td><td>300.0</td><td>3</td><td><a href="INTZ_2024-04-17.png">chart</a></td></tr>
+<tr><td>⚠️ASTI</td><td>2024-05-16</td><td>4606.3</td><td>7800.0</td><td>3315.8</td><td>19</td><td><a href="ASTI_2024-05-16.png">chart</a></td></tr>
+<tr><td>⚠️UCAR</td><td>2024-02-08</td><td>4028.3</td><td>540.0</td><td>300.5</td><td>9</td><td><a href="UCAR_2024-02-08.png">chart</a></td></tr>
+<tr><td>⚠️MBIO</td><td>2024-05-29</td><td>3908.8</td><td>4260.0</td><td>471.9</td><td>30</td><td><a href="MBIO_2024-05-29.png">chart</a></td></tr>
+<tr><td>⚠️TKLF</td><td>2024-05-24</td><td>3484.9</td><td>3642.2</td><td>300.3</td><td>8</td><td><a href="TKLF_2024-05-24.png">chart</a></td></tr>
+<tr><td>⚠️ROMA</td><td>2024-02-08</td><td>2913.8</td><td>3058.8</td><td>505.6</td><td>19</td><td><a href="ROMA_2024-02-08.png">chart</a></td></tr>
+<tr><td>⚠️BTBD</td><td>2024-01-09</td><td>2391.4</td><td>423.5</td><td>312.4</td><td>13</td><td><a href="BTBD_2024-01-09.png">chart</a></td></tr>
+<tr><td>⚠️XPON</td><td>2024-04-18</td><td>1948.4</td><td>2035.5</td><td>300.2</td><td>7</td><td><a href="XPON_2024-04-18.png">chart</a></td></tr>
+<tr><td>⚠️TPST</td><td>2024-04-01</td><td>1622.5</td><td>-10593.2</td><td>300.7</td><td>13</td><td><a href="TPST_2024-04-01.png">chart</a></td></tr>
+<tr><td>⚠️MOLN</td><td>2024-06-20</td><td>779.5</td><td>20160.0</td><td>28751.2</td><td>13</td><td><a href="MOLN_2024-06-20.png">chart</a></td></tr>
+<tr><td>⚠️XBP</td><td>2023-12-14</td><td>698.8</td><td>980.3</td><td>402.2</td><td>13</td><td><a href="XBP_2023-12-14.png">chart</a></td></tr>
+<tr><td>⚠️MIRA</td><td>2024-03-08</td><td>340.9</td><td>273.1</td><td>300.7</td><td>8</td><td><a href="MIRA_2024-03-08.png">chart</a></td></tr>
+<tr><td>⚠️LVTX</td><td>2024-01-25</td><td>294.1</td><td>299.9</td><td>300.3</td><td>9</td><td><a href="LVTX_2024-01-25.png">chart</a></td></tr>
+<tr><td>⚠️SOUN</td><td>2024-02-15</td><td>113.1</td><td>215.1</td><td>300.4</td><td>29</td><td><a href="SOUN_2024-02-15.png">chart</a></td></tr>
+<tr><td>⚠️EYPT</td><td>2023-12-04</td><td>74.3</td><td>3540.0</td><td>3585.8</td><td>14</td><td><a href="EYPT_2023-12-04.png">chart</a></td></tr>
+<tr><td>⚠️CMND</td><td>2024-06-28</td><td>36.8</td><td>5376.8</td><td>5523.3</td><td>6</td><td><a href="CMND_2024-06-28.png">chart</a></td></tr>
+<tr><td>⚠️PXLW</td><td>2024-01-30</td><td>32.6</td><td>3099.9</td><td>3187.4</td><td>12</td><td><a href="PXLW_2024-01-30.png">chart</a></td></tr>
+<tr><td>⚠️SLDB</td><td>2023-12-07</td><td>27.0</td><td>13079.8</td><td>13689.0</td><td>21</td><td><a href="SLDB_2023-12-07.png">chart</a></td></tr>
+<tr><td>⚠️JFBR</td><td>2024-05-30</td><td>24.9</td><td>188.1</td><td>305.2</td><td>12</td><td><a href="JFBR_2024-05-30.png">chart</a></td></tr>
+<tr><td>⚠️JL</td><td>2024-02-29</td><td>11.6</td><td>-411.6</td><td>300.1</td><td>2</td><td><a href="JL_2024-02-29.png">chart</a></td></tr>
+<tr><td>SNTI</td><td>2024-07-01</td><td>-5.1</td><td>237.1</td><td>362.4</td><td>7</td><td><a href="SNTI_2024-07-01.png">chart</a></td></tr>
+<tr><td>CISO</td><td>2024-02-20</td><td>-5.8</td><td>415.1</td><td>541.0</td><td>6</td><td><a href="CISO_2024-02-20.png">chart</a></td></tr>
+<tr><td>ANGH</td><td>2023-11-21</td><td>-8.6</td><td>1179.0</td><td>1307.6</td><td>28</td><td><a href="ANGH_2023-11-21.png">chart</a></td></tr>
+<tr><td>IPW</td><td>2024-05-17</td><td>-66.3</td><td>-4459.6</td><td>528.1</td><td>9</td><td><a href="IPW_2024-05-17.png">chart</a></td></tr>
+<tr><td>IVP</td><td>2024-07-08</td><td>-109.8</td><td>0.1</td><td>300.0</td><td>16</td><td><a href="IVP_2024-07-08.png">chart</a></td></tr>
+<tr><td>IVP</td><td>2024-01-30</td><td>-603.6</td><td>-720.7</td><td>304.0</td><td>8</td><td><a href="IVP_2024-01-30.png">chart</a></td></tr>
+<tr><td>PRSO</td><td>2024-04-16</td><td>-1661.2</td><td>-126.0</td><td>1655.2</td><td>2</td><td><a href="PRSO_2024-04-16.png">chart</a></td></tr>
+<tr><td>UBXG</td><td>2024-06-11</td><td>-1793.8</td><td>-8457.7</td><td>1198.3</td><td>4</td><td><a href="UBXG_2024-06-11.png">chart</a></td></tr>
+<tr><td>IVP</td><td>2024-07-12</td><td>-2280.0</td><td>-2158.8</td><td>300.6</td><td>15</td><td>—</td></tr>
+<tr><td>XBP</td><td>2023-12-04</td><td>-2513.0</td><td>-1019.7</td><td>1614.5</td><td>8</td><td><a href="XBP_2023-12-04.png">chart</a></td></tr>
+<tr><td>ELWS</td><td>2024-01-02</td><td>-2583.7</td><td>-1443.4</td><td>2131.8</td><td>2</td><td><a href="ELWS_2024-01-02.png">chart</a></td></tr>
+<tr><td>RELI</td><td>2024-03-04</td><td>-2694.0</td><td>-1734.9</td><td>1082.4</td><td>2</td><td>—</td></tr>
+<tr><td>CRIS</td><td>2023-11-17</td><td>-2785.6</td><td>-6912.3</td><td>3614.0</td><td>7</td><td><a href="CRIS_2023-11-17.png">chart</a></td></tr>
+<tr><td>OMH</td><td>2024-02-13</td><td>-3067.1</td><td>-4433.2</td><td>300.1</td><td>26</td><td>—</td></tr>
+<tr><td>ELWS</td><td>2023-12-27</td><td>-3589.4</td><td>-21737.0</td><td>12452.5</td><td>13</td><td><a href="ELWS_2023-12-27.png">chart</a></td></tr>
+<tr><td>KAVL</td><td>2024-04-15</td><td>-3639.7</td><td>-22349.7</td><td>4210.1</td><td>21</td><td><a href="KAVL_2024-04-15.png">chart</a></td></tr>
+<tr><td>LCFY</td><td>2024-07-11</td><td>-4745.2</td><td>-4779.2</td><td>300.1</td><td>7</td><td>—</td></tr>
+<tr><td>SGD</td><td>2024-03-08</td><td>-5050.0</td><td>-4820.6</td><td>349.6</td><td>8</td><td>—</td></tr>
+<tr><td>SVRE</td><td>2023-11-27</td><td>-5088.1</td><td>-1596.9</td><td>3611.3</td><td>11</td><td>—</td></tr>
+<tr><td>LUNR</td><td>2024-02-20</td><td>-8955.6</td><td>-9183.2</td><td>300.0</td><td>12</td><td>—</td></tr>
+<tr><td>PLCE</td><td>2024-02-15</td><td>-9016.4</td><td>-18978.9</td><td>1077.6</td><td>13</td><td>—</td></tr>
+<tr><td>CETY</td><td>2024-02-14</td><td>-9175.9</td><td>-3190.6</td><td>6525.3</td><td>7</td><td>—</td></tr>
+<tr><td>LUCY</td><td>2024-05-29</td><td>-9287.8</td><td>-12108.4</td><td>3637.2</td><td>8</td><td>—</td></tr>
+<tr><td>FDMT</td><td>2024-02-05</td><td>-10112.5</td><td>-9074.8</td><td>1161.6</td><td>35</td><td>—</td></tr>
+<tr><td>MAXN</td><td>2024-05-14</td><td>-14909.2</td><td>-9309.0</td><td>5720.5</td><td>13</td><td>—</td></tr>
+<tr><td>NXL</td><td>2024-03-28</td><td>-15703.9</td><td>-15905.6</td><td>303.6</td><td>9</td><td>—</td></tr>
+<tr><td>BMR</td><td>2024-02-13</td><td>-16578.8</td><td>-16587.1</td><td>10432.5</td><td>23</td><td>—</td></tr>
+<tr><td>MLGO</td><td>2023-12-06</td><td>-16614.6</td><td>-16438.6</td><td>300.4</td><td>20</td><td>—</td></tr>
+<tr><td>AMIX</td><td>2024-07-17</td><td>-20430.9</td><td>-22115.6</td><td>17457.1</td><td>18</td><td>—</td></tr>
+<tr><td>ANVS</td><td>2024-07-08</td><td>-21163.5</td><td>-10553.8</td><td>10745.2</td><td>16</td><td>—</td></tr>
+<tr><td>BTOG</td><td>2024-01-30</td><td>-21268.8</td><td>-36475.2</td><td>362.8</td><td>7</td><td>—</td></tr>
+<tr><td>LAES</td><td>2024-01-11</td><td>-21854.8</td><td>-13073.3</td><td>17481.4</td><td>24</td><td>—</td></tr>
+<tr><td>CGC</td><td>2024-04-30</td><td>-22282.4</td><td>-23272.4</td><td>300.7</td><td>6</td><td>—</td></tr>
+<tr><td>UK</td><td>2023-11-29</td><td>-22536.6</td><td>-21517.2</td><td>1729.6</td><td>26</td><td>—</td></tr>
+<tr><td>BGLC</td><td>2023-11-29</td><td>-22806.4</td><td>-14958.5</td><td>7969.2</td><td>12</td><td>—</td></tr>
+<tr><td>ONMD</td><td>2024-01-30</td><td>-27728.8</td><td>-27520.2</td><td>330.4</td><td>12</td><td>—</td></tr>
+<tr><td>ANY</td><td>2023-12-05</td><td>-28818.6</td><td>-10232.9</td><td>18705.8</td><td>31</td><td>—</td></tr>
+<tr><td>INOD</td><td>2024-05-08</td><td>-38005.0</td><td>-43527.7</td><td>10678.2</td><td>15</td><td>—</td></tr>
+</table>
+<p style="margin-top:16px; color:#666">
+t_event_offset &lt; 0: anchor fires BEFORE scanner (expected ~-30s, H1 clear).<br>
+t_event_offset &gt; 0: anchor fires AFTER scanner (H1 contributor).<br>
+first_q_bar_offset: seconds after scanner hit until Q̃ first crosses 0.65 (H2 diagnostic).
+</p>
+</body>
+</html>
