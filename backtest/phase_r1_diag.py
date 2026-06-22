@@ -252,6 +252,8 @@ def _collect_event_diag(args: dict) -> dict:
     rho = args["rho"]
     rho_E = args["rho_E"]
     q_bar_cfg = args["q_bar_cfg"]
+    p_open = args.get("p_open", P_OPEN)
+    p_close = args.get("p_close", P_CLOSE)
 
     base = {"ticker": ticker, "session_date": date}
 
@@ -343,10 +345,10 @@ def _collect_event_diag(args: dict) -> dict:
 
         gate = ParticipationGate(
             half_life_seconds=EPG_TAU,
-            peak_threshold_p=P_OPEN,
+            peak_threshold_p=p_open,
             warmup_seconds=EPG_WARMUP,
-            p_open=P_OPEN,
-            p_close=P_CLOSE,
+            p_open=p_open,
+            p_close=p_close,
         )
 
         epg_states = []
@@ -367,7 +369,7 @@ def _collect_event_diag(args: dict) -> dict:
             e_val = float(E_out[i])
             if t_event_fired:
                 e_peak = max(e_peak, e_val)
-            e_peak_thresholds.append(P_OPEN * e_peak)
+            e_peak_thresholds.append(p_open * e_peak)
 
         if not t_event_fired:
             return {**base, "status": "skipped", "reason": "no_t_event"}
@@ -554,6 +556,8 @@ def _collect_event_diag(args: dict) -> dict:
                 "first_q_offset_sec": first_q_offset,
                 "first_3consec_vrect": first_3c_vrect,
                 "first_3consec_diamond": first_3c_diamond,
+                "p_open": p_open,
+                "p_close": p_close,
             },
         }
 
@@ -596,6 +600,8 @@ def generate_chart(diag: dict, out_dir: Path) -> Path | None:
     cd = diag["_chart"]
     ticker = diag["ticker"]
     date = diag["session_date"]
+    p_open_val = cd.get("p_open", P_OPEN)
+    p_close_val = cd.get("p_close", P_CLOSE)
 
     win_start = cd["win_start_rel"]
     win_end = cd["win_end_rel"]
@@ -712,7 +718,7 @@ def generate_chart(diag: dict, out_dir: Path) -> Path | None:
                 x=tick_t_rel, y=tick_E_thr,
                 mode="lines",
                 line=dict(color="navy", width=1.0, dash="dot"),
-                name=f"p×E_peak  (p={P_OPEN})",
+                name=f"p×E_peak  (p={p_open_val})",
             ),
             row=2, col=1,
         )
@@ -849,7 +855,8 @@ def generate_chart(diag: dict, out_dir: Path) -> Path | None:
 
 # ── Index HTML ────────────────────────────────────────────────────────────────
 
-def generate_index(events: list[dict], chart_dir: Path) -> None:
+def generate_index(events: list[dict], chart_dir: Path,
+                   p_open: float = P_OPEN, p_close: float = P_CLOSE) -> None:
     rows = []
     for ev in events:
         if ev.get("status") != "event" or not ev.get("has_trade"):
@@ -926,7 +933,7 @@ function sortTable(n) {{
 </script>
 </head>
 <body>
-<h2>R1 Entry Lag Diagnostic (Redo) — p={P_OPEN}/{P_CLOSE}</h2>
+<h2>R1 Entry Lag Diagnostic (Redo) — p={p_open}/{p_close}</h2>
 <p>
   Default sort: <b>first_3consec DESC</b> (slowest Q̃ qualification first).
   T₀ offset: <span style="color:red">red = H1 confirmed (anchor after scanner)</span>,
