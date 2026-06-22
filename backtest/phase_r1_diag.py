@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""R1 T1 Diagnostic — entry lag analysis (H1 vs H2).
+"""R1-D (REDO) — Entry Lag Diagnostic Charts (Plotly HTML).
 
-H1: EventAnchor fires late (after or well after scanner hit).
+H1: EventAnchor fires late (after scanner hit).
 H2: Q̃ smoothing (rho_fast=0.90) delays 3 consecutive qualifying bars.
+
+Source: results/phase_r1/symmetric_p65/per_trade.json (81 traded events).
+Replay is for signal extraction only — do not re-run the backtest.
 
 Outputs:
   results/phase_r1/entry_lag_diagnosis.json
-  results/phase_r1/diagnostic_charts/<ticker>_<date>.png  (traded events only)
-  results/phase_r1/diagnostic_charts/index.html
+  results/phase_r1/diagnostic_charts/{TICKER}_{DATE}.html
+  results/phase_r1/diagnostic_charts/index.html  (default sort: first_3consec DESC)
 """
 from __future__ import annotations
 
@@ -18,12 +21,7 @@ import traceback as tb_module
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 
 BACKTEST = Path(__file__).resolve().parent
 sys.path.insert(0, str(BACKTEST))
@@ -39,14 +37,12 @@ from core.ofi.trade_ofi import compute_trade_ofi
 from core.epg.anchor import EventAnchor
 from core.epg.gate import ParticipationGate, GateState
 from setup_filter import run_setup_filter, _build_1min_bars
-from core.hawkes.forgetting import fit_hawkes_forgetting, fit_online, HawkesParams
+from core.hawkes.forgetting import fit_hawkes_forgetting, fit_online
 from core.filters.rapid_entry import Q_THRESHOLD
 from core.features.luld_halt_detection import detect_luld_halts
 
-# Constants (from runner_rapid.py — kept in sync manually)
 EPG_K = 5
 EPG_TAU = 300.0
-EPG_P = 0.65
 EPG_WARMUP = 300.0
 COLD_START_SIZE = 1000
 REFIT_INTERVAL = 50
@@ -54,34 +50,80 @@ REFIT_WINDOW = 10000
 BETA_FIXED = 0.1
 HALT_GAP_THRESHOLD = 60.0
 
+N_HOLD = 3
+P_OPEN = 0.65
+P_CLOSE = 0.65
+SCANNER_THRESHOLD = 0.30
+
 REPO = Path(__file__).resolve().parent.parent
 RESULTS_DIR = BACKTEST / "results" / "phase_r1"
 CHART_DIR = RESULTS_DIR / "diagnostic_charts"
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
-N_HOLD = 3
-P_OPEN = 0.65
-P_CLOSE = 0.65
-SCANNER_THRESHOLD = 0.30  # 30% intraday change triggers scanner
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _build_10s_bars(timestamps_ns: np.ndarray, prices: np.ndarray, session_start_ns: int):
+    """Bucket trades into 10s bars aligned to session_start_ns."""
+    BAR_NS = 10 * NS_PER_SECOND
+    N = len(timestamps_ns)
+    if N == 0:
+        empty = np.array([], dtype=np.float64)
+        return np.array([], dtype=np.int64), empty, empty, empty, empty
+
+    bar_idx = ((timestamps_ns.astype(np.int64) - session_start_ns) // BAR_NS).astype(np.int64)
+    unique_bars = np.unique(bar_idx)
+
+    starts, opens, highs, lows, closes = [], [], [], [], []
+    for bi in unique_bars:
+        mask = bar_idx == bi
+        bp = prices[mask]
+        starts.append(int(session_start_ns + bi * BAR_NS))
+        opens.append(float(bp[0]))
+        highs.append(float(np.max(bp)))
+        lows.append(float(np.min(bp)))
+        closes.append(float(bp[-1]))
+
+    return (
+        np.array(starts, dtype=np.int64),
+        np.array(opens), np.array(highs),
+        np.array(lows), np.array(closes),
+    )
 
 
-# ── Hawkes replay (self-contained copy from runner_rapid.py) ──────────────────
+def _build_state_intervals(t_rel: list, states: list) -> list:
+    """Convert per-tick state list to [(t_start, t_end, state), ...]."""
+    if not t_rel:
+        return []
+    intervals = []
+    cur_state = states[0]
+    cur_start = t_rel[0]
+    for i in range(1, len(t_rel)):
+        if states[i] != cur_state:
+            intervals.append((cur_start, t_rel[i], cur_state))
+            cur_state = states[i]
+            cur_start = t_rel[i]
+    intervals.append((cur_start, t_rel[-1], cur_state))
+    return intervals
+
+
+# ── Hawkes replay ─────────────────────────────────────────────────────────────
 
 def _build_halt_intervals(td) -> list:
     try:
         import pandas as _pd
-        trades_df = _pd.DataFrame(
+        df = _pd.DataFrame(
             {"price": td.prices},
             index=_pd.to_datetime(td.timestamps, unit="ns"),
         )
-        halt_windows = detect_luld_halts(trades_df, price_col="price")
-        if not halt_windows:
+        hw_list = detect_luld_halts(df, price_col="price")
+        if not hw_list:
             return []
-        t0_ns = int(td.timestamps[0])
+        t0 = int(td.timestamps[0])
         return [
-            ((hw.start.value - t0_ns) / NS_PER_SECOND,
-             (hw.end.value - t0_ns) / NS_PER_SECOND)
-            for hw in halt_windows
+            ((hw.start.value - t0) / NS_PER_SECOND,
+             (hw.end.value - t0) / NS_PER_SECOND)
+            for hw in hw_list
         ]
     except Exception:
         return []
@@ -90,7 +132,7 @@ def _build_halt_intervals(td) -> list:
 def _hawkes_replay_with_refit(
     t_sec, sides, rho, lambda_ref, init_params, rho_E,
     lam_buy_out, lam_sell_out, E_out, Edot_out, n_base_out,
-    dv_arr=None, halt_intervals=None,
+    halt_intervals=None,
 ):
     N = len(t_sec)
     if N == 0:
@@ -113,8 +155,7 @@ def _hawkes_replay_with_refit(
             init_params["beta"], rho_E,
             lam_buy_out, lam_sell_out, E_out, Edot_out,
         )
-        _nb = (init_params["alpha_buy_self"] + init_params["alpha_sell_self"]) / BETA_FIXED
-        n_base_out[:] = _nb
+        n_base_out[:] = (init_params["alpha_buy_self"] + init_params["alpha_sell_self"]) / BETA_FIXED
         return None
 
     params = fit_hawkes_forgetting(
@@ -122,7 +163,6 @@ def _hawkes_replay_with_refit(
         rho=rho, lambda_ref=lambda_ref, T=float(t_sec[cold_end - 1]),
         init_params=init_arr, n_restarts=5, beta_fixed=BETA_FIXED,
     )
-    cold_start_params = params
 
     refit_points = list(range(cold_end + REFIT_INTERVAL, N + 1, REFIT_INTERVAL))
     if refit_points and refit_points[-1] < N:
@@ -130,9 +170,10 @@ def _hawkes_replay_with_refit(
     elif not refit_points and N > cold_end:
         refit_points = [N]
 
-    chunk_starts = [0, cold_end] + refit_points[:-1] if refit_points else [0, cold_end]
-    chunk_ends = [cold_end] + refit_points if refit_points else [cold_end]
-    if not refit_points:
+    if refit_points:
+        chunk_starts = [0, cold_end] + refit_points[:-1]
+        chunk_ends = [cold_end] + refit_points
+    else:
         chunk_starts = [0]
         chunk_ends = [N]
 
@@ -153,34 +194,29 @@ def _hawkes_replay_with_refit(
                 T=float(t_sec[c_end - 1]), n_restarts=1, beta_fixed=BETA_FIXED,
             )
 
-        mu_total = params.mu_buy + params.mu_sell
-        if mu_total < 1e-10:
-            mu_total = 1e-10
+        mu_total = max(params.mu_buy + params.mu_sell, 1e-10)
         chunk_n_base = (params.alpha_buy_self + params.alpha_sell_self) / params.beta
 
         for i in range(c_start, c_end):
             n_base_out[i] = chunk_n_base
             if i == 0:
-                lam_b = params.mu_buy
-                lam_s = params.mu_sell
-                lam_total = max(lam_b, 0.0) + max(lam_s, 0.0)
-                E_val = lam_total / mu_total
-                lam_buy_out[0] = max(lam_b, 0.0)
-                lam_sell_out[0] = max(lam_s, 0.0)
+                lam_b = max(params.mu_buy, 0.0)
+                lam_s = max(params.mu_sell, 0.0)
+                E_val = (lam_b + lam_s) / mu_total
+                lam_buy_out[0] = lam_b
+                lam_sell_out[0] = lam_s
                 E_out[0] = E_val
                 Edot_out[0] = 0.0
-                if sides[0] == 1:
-                    R_buy = 1.0
-                else:
-                    R_sell = 1.0
+                R_buy = 1.0 if sides[0] == 1 else 0.0
+                R_sell = 0.0 if sides[0] == 1 else 1.0
                 E_prev = E_val
             else:
                 dt = t_sec[i] - t_sec[i - 1]
                 dt_eff = dt
                 if _halt_ivs and dt_eff > HALT_GAP_THRESHOLD:
-                    t_prev, t_curr = t_sec[i - 1], t_sec[i]
+                    t_p, t_c = t_sec[i - 1], t_sec[i]
                     for h_s, h_e in _halt_ivs:
-                        if t_prev < h_e and t_curr > h_s:
+                        if t_p < h_e and t_c > h_s:
                             dt_eff = 1e-6
                             break
                 if dt_eff > 0:
@@ -190,30 +226,25 @@ def _hawkes_replay_with_refit(
 
                 lam_b = max(0.0, params.mu_buy + params.alpha_buy_self * R_buy)
                 lam_s = max(0.0, params.mu_sell + params.alpha_sell_self * R_sell)
-                lam_total = lam_b + lam_s
-                E_val = lam_total / mu_total
-                dt_capped = max(min(dt_eff, 1.0), 1e-12)
-                raw_slope = (E_val - E_prev) / dt_capped
-                Edot_ema = rho_E * Edot_ema + (1.0 - rho_E) * raw_slope
+                E_val = (lam_b + lam_s) / mu_total
+                dt_cap = max(min(dt_eff, 1.0), 1e-12)
+                Edot_ema = rho_E * Edot_ema + (1.0 - rho_E) * (E_val - E_prev) / dt_cap
 
                 lam_buy_out[i] = lam_b
                 lam_sell_out[i] = lam_s
                 E_out[i] = E_val
                 Edot_out[i] = Edot_ema
 
-                if sides[i] == 1:
-                    R_buy += 1.0
-                else:
-                    R_sell += 1.0
+                R_buy += 1.0 if sides[i] == 1 else 0.0
+                R_sell += 0.0 if sides[i] == 1 else 1.0
                 E_prev = E_val
 
-    return cold_start_params
+    return params
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 
 def _collect_event_diag(args: dict) -> dict:
-    """Full replay for one event; returns timing diagnostic + chart data."""
     ticker = args["ticker"]
     date = args["date"]
     mom_pct = args["mom_pct"]
@@ -240,21 +271,16 @@ def _collect_event_diag(args: dict) -> dict:
         N = td.n_trades
         start_ns, end_ns = _session_ns_bounds(date)
 
-        # ── Scanner hit time ──────────────────────────────────────────────
-        # First trade where intraday_pct >= 30% (proxy for scanner trigger)
-        t_scanner_hit_sec = None
-        t_scanner_hit_ns = None
+        # Scanner hit: first trade >= 30% intraday
+        t_scanner_hit_sec = float(td.t_sec[0])
+        t_scanner_hit_ns = int(td.timestamps[0])
         for i in range(N):
             if (td.prices[i] - prev_close) / prev_close >= SCANNER_THRESHOLD:
                 t_scanner_hit_sec = float(td.t_sec[i])
                 t_scanner_hit_ns = int(td.timestamps[i])
                 break
-        if t_scanner_hit_sec is None:
-            # Event never crossed 30% in this window — use first trade as fallback
-            t_scanner_hit_sec = 0.0
-            t_scanner_hit_ns = int(td.timestamps[0])
 
-        # ── Setup filter + bar starts ─────────────────────────────────────
+        # Setup filter + 1-min bars
         sf = run_setup_filter(
             timestamps=td.timestamps,
             prices=td.prices,
@@ -262,14 +288,16 @@ def _collect_event_diag(args: dict) -> dict:
             session_start_ns=start_ns,
             session_end_ns=end_ns,
         )
-        opens, highs, lows, closes, vols, dvols, bar_starts_ns = _build_1min_bars(
+        _, _, _, _, _, _, bar_starts_ns = _build_1min_bars(
             td.timestamps, td.prices, td.sizes.astype(np.int64), start_ns, end_ns
         )
         n_bars = len(bar_starts_ns)
+        q_tilde = sf.q_tilde
+        n_q_bars = len(q_tilde)
 
-        # ── Lee-Ready sides ───────────────────────────────────────────────
+        # Lee-Ready sides
         tier_qbar = q_bar_cfg.get("wide", {}).get("median", 250.0)
-        ofi_result = compute_trade_ofi(
+        ofi = compute_trade_ofi(
             trade_timestamps=td.timestamps,
             trade_prices=td.prices,
             trade_sizes=td.sizes.astype(np.float64),
@@ -281,39 +309,37 @@ def _collect_event_diag(args: dict) -> dict:
             window_sec=10.0,
             q_bar_fallback=tier_qbar,
         )
-        sides = ofi_result.sides
+        sides = ofi.sides
 
-        # ── Hawkes replay ─────────────────────────────────────────────────
+        # Hawkes replay
         halt_intervals = _build_halt_intervals(td)
         lam_buy_out = np.zeros(N, dtype=np.float64)
         lam_sell_out = np.zeros(N, dtype=np.float64)
         E_out = np.zeros(N, dtype=np.float64)
         Edot_out = np.zeros(N, dtype=np.float64)
         n_base_out = np.zeros(N, dtype=np.float64)
-        dv_arr = td.prices.astype(np.float64) * td.sizes.astype(np.float64)
 
-        global_lambda_ref = fp["mu_buy"] + fp["mu_sell"]
-        per_event_lref = compute_lambda_ref_per_event(ticker, date)
-        lambda_ref = global_lambda_ref if (math.isnan(per_event_lref) or per_event_lref <= 0) else per_event_lref
+        global_lref = fp["mu_buy"] + fp["mu_sell"]
+        per_ev_lref = compute_lambda_ref_per_event(ticker, date)
+        lambda_ref = global_lref if (math.isnan(per_ev_lref) or per_ev_lref <= 0) else per_ev_lref
 
-        cold_start_params = _hawkes_replay_with_refit(
+        cold_params = _hawkes_replay_with_refit(
             t_sec=td.t_sec, sides=sides,
             rho=rho, lambda_ref=lambda_ref,
             init_params=fp, rho_E=rho_E,
             lam_buy_out=lam_buy_out, lam_sell_out=lam_sell_out,
             E_out=E_out, Edot_out=Edot_out, n_base_out=n_base_out,
-            dv_arr=dv_arr,
             halt_intervals=halt_intervals or None,
         )
         lambda_hat = lam_buy_out + lam_sell_out
 
-        # ── EPG ───────────────────────────────────────────────────────────
-        global_lref_epg = fp["mu_buy"] + fp["mu_sell"]
-        anchor = EventAnchor(lambda_ref=global_lref_epg, k_multiplier=EPG_K)
-        if cold_start_params is not None:
-            lref_epg = cold_start_params.mu_buy + cold_start_params.mu_sell
-            if lref_epg > 0:
-                anchor.set_lambda_ref(lref_epg)
+        # EPG + e_peak tracking
+        lref_epg = fp["mu_buy"] + fp["mu_sell"]
+        anchor = EventAnchor(lambda_ref=lref_epg, k_multiplier=EPG_K)
+        if cold_params is not None:
+            lref2 = cold_params.mu_buy + cold_params.mu_sell
+            if lref2 > 0:
+                anchor.set_lambda_ref(lref2)
 
         gate = ParticipationGate(
             half_life_seconds=EPG_TAU,
@@ -324,8 +350,10 @@ def _collect_event_diag(args: dict) -> dict:
         )
 
         epg_states = []
+        e_peak_thresholds = []
         t_event_fired = False
         t_event_sec = 0.0
+        e_peak = 0.0
 
         for i in range(N):
             t_ev = anchor.update(lambda_hat[i], td.t_sec[i])
@@ -334,52 +362,52 @@ def _collect_event_diag(args: dict) -> dict:
                 t_event_fired = True
                 t_event_sec = float(td.t_sec[i])
             dv = float(td.prices[i]) * float(td.sizes[i])
-            epg_states.append(gate.update(dv, td.t_sec[i]))
+            state = gate.update(dv, td.t_sec[i])
+            epg_states.append(state)
+            e_val = float(E_out[i])
+            if t_event_fired:
+                e_peak = max(e_peak, e_val)
+            e_peak_thresholds.append(P_OPEN * e_peak)
 
         if not t_event_fired:
             return {**base, "status": "skipped", "reason": "no_t_event"}
 
-        # ── Q̃ qualifying bar analysis ─────────────────────────────────────
-        q_tilde = sf.q_tilde  # shape (n_bars,) — one value per 1-min bar
-        n_q_bars = len(q_tilde)
+        # Q̃ qualifying bar offsets
+        # bar_t_sec: seconds from first trade to each bar start
+        bar_t_sec = (bar_starts_ns.astype(np.float64) - float(td.timestamps[0])) / NS_PER_SECOND
 
-        # First qualifying bar (Q̃ >= threshold)
-        first_q_bar_idx = None
+        def bar_offset_rel(idx):
+            if idx is None or idx >= len(bar_t_sec):
+                return None
+            return float(bar_t_sec[idx]) - t_scanner_hit_sec
+
+        first_q_idx = None
         for i in range(n_q_bars):
             if q_tilde[i] >= Q_THRESHOLD:
-                first_q_bar_idx = i
+                first_q_idx = i
                 break
 
-        # First run of N_HOLD consecutive qualifying bars
-        first_3consec_idx = None
+        first_3c_idx = None
         consec = 0
         for i in range(n_q_bars):
             if q_tilde[i] >= Q_THRESHOLD:
                 consec += 1
                 if consec >= N_HOLD:
-                    first_3consec_idx = i - (N_HOLD - 1)
+                    first_3c_idx = i - (N_HOLD - 1)
                     break
             else:
                 consec = 0
 
-        # Convert bar indices to t_sec (seconds from first trade)
-        bar_t_sec = (bar_starts_ns - td.timestamps[0]).astype(np.float64) / NS_PER_SECOND
+        first_q_offset = bar_offset_rel(first_q_idx)
+        first_3c_offset = bar_offset_rel(first_3c_idx)
 
-        def bar_offset(idx):
-            if idx is None or idx >= len(bar_t_sec):
-                return None
-            return float(bar_t_sec[idx] - t_scanner_hit_sec)
-
-        first_q_offset = bar_offset(first_q_bar_idx)
-        first_3consec_offset = bar_offset(first_3consec_idx)
-
-        # ── State-machine replay (to find entry) ──────────────────────────
+        # Entry state machine
         prev_state = GateState.INACTIVE
         in_position = False
         closed_today = False
         entry_t_sec = None
+        entry_price = None
         n_passtofail = 0
-        n_entry_eligible_blocks = 0
 
         for i in range(N):
             cur = epg_states[i]
@@ -388,13 +416,12 @@ def _collect_event_diag(args: dict) -> dict:
 
             if not in_position and not closed_today:
                 if cur == GateState.PASS:
-                    _bar_idx = max(0, int(np.searchsorted(
+                    b_idx = max(0, int(np.searchsorted(
                         bar_starts_ns, td.timestamps[i], side="right")) - 1)
-                    _q = sf.q_tilde[:_bar_idx + 1]
-                    if len(_q) < N_HOLD or not bool(np.all(_q[-N_HOLD:] >= Q_THRESHOLD)):
-                        n_entry_eligible_blocks += 1
-                    else:
+                    _q = q_tilde[:b_idx + 1]
+                    if len(_q) >= N_HOLD and bool(np.all(_q[-N_HOLD:] >= Q_THRESHOLD)):
                         entry_t_sec = float(td.t_sec[i])
+                        entry_price = float(td.prices[i])
                         in_position = True
                         closed_today = True
             elif in_position:
@@ -403,56 +430,130 @@ def _collect_event_diag(args: dict) -> dict:
 
             prev_state = cur
 
-        t_entry_offset_sec = (float(entry_t_sec) - t_scanner_hit_sec) if entry_t_sec is not None else None
-        t_event_offset_vs_scanner_sec = t_event_sec - t_scanner_hit_sec
+        t_event_offset_sec = t_event_sec - t_scanner_hit_sec
         t_warmup_end_offset_sec = (t_event_sec + EPG_WARMUP) - t_scanner_hit_sec
+        entry_lag_sec = (entry_t_sec - t_event_sec) if entry_t_sec is not None else None
+        t_entry_offset_sec = (entry_t_sec - t_scanner_hit_sec) if entry_t_sec is not None else None
 
-        # ── Per-bar gate state for charting ──────────────────────────────
-        # Dominant gate state per 1-min bar
-        bar_gate_states = ["INACTIVE"] * n_bars
-        for i in range(N):
-            b_idx = int(np.searchsorted(bar_starts_ns, td.timestamps[i], side="right")) - 1
-            if 0 <= b_idx < n_bars:
-                s = epg_states[i].name
-                # Prefer PASS > WARMUP > FAIL > INACTIVE
-                cur_s = bar_gate_states[b_idx]
-                priority = {"PASS": 4, "WARMUP": 3, "FAIL": 2, "INACTIVE": 1}
-                if priority.get(s, 0) > priority.get(cur_s, 0):
-                    bar_gate_states[b_idx] = s
+        # Chart window (seconds from scanner)
+        win_start_rel = t_event_offset_sec - 120.0
+        win_end_rel = (t_entry_offset_sec + 300.0) if t_entry_offset_sec is not None else (t_event_offset_sec + 3900.0)
 
-        # ── Return payload ────────────────────────────────────────────────
-        has_trade = entry_t_sec is not None
+        # Per-tick data (windowed)
+        tick_t_rel_all = td.t_sec - t_scanner_hit_sec
+        tick_mask = (tick_t_rel_all >= win_start_rel) & (tick_t_rel_all <= win_end_rel)
+        tick_t_rel = tick_t_rel_all[tick_mask].tolist()
+        tick_E = E_out[tick_mask].tolist()
+        tick_E_peak_threshold = np.array(e_peak_thresholds)[tick_mask].tolist()
+
+        # State intervals (full run)
+        state_intervals = _build_state_intervals(
+            tick_t_rel_all.tolist(),
+            [s.name for s in epg_states],
+        )
+
+        # 10s OHLC bars (windowed)
+        b10s_starts, b10s_o, b10s_h, b10s_l, b10s_c = _build_10s_bars(
+            td.timestamps, td.prices, start_ns,
+        )
+        if len(b10s_starts) > 0:
+            b10s_t_rel_all = (b10s_starts.astype(np.float64) - t_scanner_hit_ns) / NS_PER_SECOND
+            bm = (b10s_t_rel_all >= win_start_rel) & (b10s_t_rel_all <= win_end_rel)
+            b10s_t = b10s_t_rel_all[bm].tolist()
+            b10s_o_w = b10s_o[bm].tolist()
+            b10s_h_w = b10s_h[bm].tolist()
+            b10s_l_w = b10s_l[bm].tolist()
+            b10s_c_w = b10s_c[bm].tolist()
+        else:
+            b10s_t = b10s_o_w = b10s_h_w = b10s_l_w = b10s_c_w = []
+
+        # Q̃ trajectory (bar close times, windowed)
+        n_bars_for_q = min(n_q_bars, n_bars)
+        if n_bars_for_q > 0:
+            bar_close_t_rel = (
+                bar_starts_ns[:n_bars_for_q].astype(np.float64)
+                + 60 * NS_PER_SECOND
+                - t_scanner_hit_ns
+            ) / NS_PER_SECOND
+            qm = (bar_close_t_rel >= win_start_rel) & (bar_close_t_rel <= win_end_rel)
+            qtilde_t_rel = bar_close_t_rel[qm].tolist()
+            qtilde_vals = q_tilde[:n_bars_for_q][qm].tolist()
+        else:
+            qtilde_t_rel = []
+            qtilde_vals = []
+
+        # LULD halt fires (start of each detected halt window)
+        luld_fires = []
+        try:
+            import pandas as _pd
+            df = _pd.DataFrame(
+                {"price": td.prices},
+                index=_pd.to_datetime(td.timestamps, unit="ns"),
+            )
+            for hw in detect_luld_halts(df, price_col="price"):
+                idx = int(np.searchsorted(td.timestamps, hw.start.value, side="left"))
+                if idx < N:
+                    luld_fires.append({
+                        "t_rel": float(td.t_sec[idx]) - t_scanner_hit_sec,
+                        "price": float(td.prices[idx]),
+                    })
+        except Exception:
+            pass
+
+        # First-3-consecutive vrect bounds (bar start/end in rel seconds)
+        first_3c_vrect = None
+        if first_3c_idx is not None and first_3c_idx + N_HOLD <= n_bars:
+            f3_start = (float(bar_starts_ns[first_3c_idx]) - t_scanner_hit_ns) / NS_PER_SECOND
+            f3_end = (
+                float(bar_starts_ns[first_3c_idx + N_HOLD - 1])
+                + 60 * NS_PER_SECOND
+                - t_scanner_hit_ns
+            ) / NS_PER_SECOND
+            first_3c_vrect = (f3_start, f3_end)
+
+        # Diamond marker at first_3consec bar start
+        first_3c_diamond = None
+        if first_3c_idx is not None and first_3c_offset is not None and first_3c_idx < n_q_bars:
+            first_3c_diamond = {
+                "t_rel": first_3c_offset,
+                "q": float(q_tilde[first_3c_idx]),
+            }
 
         return {
             **base,
             "status": "event",
-            "has_trade": has_trade,
+            "has_trade": entry_t_sec is not None,
             "prev_close": float(prev_close),
-            # Diagnostic timing fields
-            "t_event_offset_vs_scanner_sec": round(t_event_offset_vs_scanner_sec, 1),
+            "t_event_offset_sec": round(t_event_offset_sec, 1),
             "t_warmup_end_offset_sec": round(t_warmup_end_offset_sec, 1),
-            "first_qualifying_bar_offset_sec": round(first_q_offset, 1) if first_q_offset is not None else None,
-            "first_3consec_qualifying_bar_offset_sec": round(first_3consec_offset, 1) if first_3consec_offset is not None else None,
+            "first_q_offset_sec": round(first_q_offset, 1) if first_q_offset is not None else None,
+            "first_3consec_offset_sec": round(first_3c_offset, 1) if first_3c_offset is not None else None,
             "t_entry_offset_sec": round(t_entry_offset_sec, 1) if t_entry_offset_sec is not None else None,
-            "entry_lag_sec": round(float(entry_t_sec) - t_event_sec, 1) if entry_t_sec is not None else None,
+            "entry_lag_sec": round(entry_lag_sec, 1) if entry_lag_sec is not None else None,
             "gate_chatter_count": int(n_passtofail),
-            "n_entry_eligible_blocks": int(n_entry_eligible_blocks),
-            # Chart data (kept in memory for chart generation — NOT written to JSON directly)
             "_chart": {
-                "bar_ts_ns": bar_starts_ns.tolist(),
-                "first_trade_ns": int(td.timestamps[0]),
-                "q_tilde": q_tilde.tolist() if len(q_tilde) > 0 else [],
-                "bar_opens": opens.tolist(),
-                "bar_highs": highs.tolist(),
-                "bar_lows": lows.tolist(),
-                "bar_closes": closes.tolist(),
-                "bar_gate_states": bar_gate_states,
-                "t_event_sec": t_event_sec,
-                "t_scanner_hit_sec": t_scanner_hit_sec,
-                "t_scanner_hit_ns": int(t_scanner_hit_ns) if t_scanner_hit_ns else int(td.timestamps[0]),
-                "entry_t_sec": entry_t_sec,
-                "first_q_bar_idx": first_q_bar_idx,
-                "first_3consec_idx": first_3consec_idx,
+                "win_start_rel": win_start_rel,
+                "win_end_rel": win_end_rel,
+                "state_intervals": state_intervals,
+                "b10s_t": b10s_t,
+                "b10s_o": b10s_o_w,
+                "b10s_h": b10s_h_w,
+                "b10s_l": b10s_l_w,
+                "b10s_c": b10s_c_w,
+                "tick_t_rel": tick_t_rel,
+                "tick_E": tick_E,
+                "tick_E_peak_threshold": tick_E_peak_threshold,
+                "qtilde_t_rel": qtilde_t_rel,
+                "qtilde": qtilde_vals,
+                "entry_price": entry_price,
+                "luld_fires": luld_fires,
+                "t_event_offset_sec": t_event_offset_sec,
+                "t_warmup_end_offset_sec": t_warmup_end_offset_sec,
+                "entry_lag_sec": entry_lag_sec,
+                "first_3consec_offset_sec": first_3c_offset,
+                "first_q_offset_sec": first_q_offset,
+                "first_3consec_vrect": first_3c_vrect,
+                "first_3consec_diamond": first_3c_diamond,
             },
         }
 
@@ -467,163 +568,279 @@ def _collect_event_diag(args: dict) -> dict:
 
 # ── Chart generation ──────────────────────────────────────────────────────────
 
-STATE_COLORS = {
-    "INACTIVE": "#f0f0f0",
-    "WARMUP":   "#fff3cd",
-    "PASS":     "#d4edda",
-    "FAIL":     "#f8d7da",
+_STATE_FILL = {
+    "INACTIVE": "rgba(200,200,200,0.25)",
+    "WARMUP":   "rgba(255,179,71,0.30)",
+    "PASS":     "rgba(100,200,100,0.28)",
+    "FAIL":     "rgba(220,80,80,0.28)",
+}
+_STATE_SOLID = {
+    "INACTIVE": "rgba(190,190,190,0.90)",
+    "WARMUP":   "rgba(255,165,0,0.90)",
+    "PASS":     "rgba(60,180,60,0.90)",
+    "FAIL":     "rgba(210,60,60,0.90)",
 }
 
 
-def _ns_to_dt(ns_val: int) -> pd.Timestamp:
-    return pd.Timestamp(ns_val, unit="ns", tz="America/New_York")
-
-
 def generate_chart(diag: dict, out_dir: Path) -> Path | None:
-    """Generate 2-panel diagnostic chart for one event. Returns output path."""
     if not diag.get("has_trade"):
+        return None
+
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print("plotly not installed — skipping chart generation")
         return None
 
     cd = diag["_chart"]
     ticker = diag["ticker"]
     date = diag["session_date"]
-    t_event_offset = diag["t_event_offset_vs_scanner_sec"]
 
-    bar_ts_ns = np.array(cd["bar_ts_ns"], dtype=np.int64)
-    first_trade_ns = cd["first_trade_ns"]
-    q_tilde = np.array(cd["q_tilde"])
-    bar_opens = np.array(cd["bar_opens"])
-    bar_highs = np.array(cd["bar_highs"])
-    bar_lows = np.array(cd["bar_lows"])
-    bar_closes = np.array(cd["bar_closes"])
-    bar_states = cd["bar_gate_states"]
-    n_bars = len(bar_ts_ns)
+    win_start = cd["win_start_rel"]
+    win_end = cd["win_end_rel"]
+    state_intervals = cd["state_intervals"]
+    t_event_rel = cd["t_event_offset_sec"]
+    t_warmup_rel = cd["t_warmup_end_offset_sec"]
+    entry_lag = cd["entry_lag_sec"]
+    t_entry_rel = (t_event_rel + entry_lag) if entry_lag is not None else None
+    entry_price = cd["entry_price"]
+    luld_fires = cd["luld_fires"]
+    first_3c_vrect = cd["first_3consec_vrect"]
+    first_3c_diamond = cd["first_3consec_diamond"]
 
-    t_event_sec = cd["t_event_sec"]
-    t_scanner_hit_sec = cd["t_scanner_hit_sec"]
-    t_scanner_hit_ns = cd["t_scanner_hit_ns"]
-    entry_t_sec = cd["entry_t_sec"]
-    first_q_bar_idx = cd["first_q_bar_idx"]
-    first_3consec_idx = cd["first_3consec_idx"]
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.38, 0.22, 0.22, 0.18],
+        subplot_titles=[
+            "Price (10s OHLC)",
+            "Gate Intensity  λ_V = E(t)",
+            "Q̃ Trajectory",
+            "EPG Gate State",
+        ],
+    )
 
-    # Absolute timestamps from t_sec offsets (from first trade)
-    t_event_ns = first_trade_ns + int(t_event_sec * NS_PER_SECOND)
-    t_warmup_end_ns = t_event_ns + int(EPG_WARMUP * NS_PER_SECOND)
-    t_entry_ns = first_trade_ns + int(entry_t_sec * NS_PER_SECOND) if entry_t_sec is not None else None
+    # Background shading panels 1 & 2
+    for t_start, t_end, state in state_intervals:
+        fill = _STATE_FILL.get(state, "rgba(200,200,200,0.15)")
+        for row in (1, 2):
+            fig.add_shape(
+                type="rect",
+                x0=t_start, x1=t_end,
+                y0=-1e10, y1=1e10,
+                row=row, col=1,
+                fillcolor=fill,
+                opacity=1.0,
+                layer="below",
+                line_width=0,
+            )
 
-    # Chart window: scanner - 5min to entry + 10min
-    win_start_ns = t_scanner_hit_ns - 5 * 60 * NS_PER_SECOND
-    win_end_ns = (t_entry_ns + 10 * 60 * NS_PER_SECOND) if t_entry_ns else (t_scanner_hit_ns + 90 * 60 * NS_PER_SECOND)
+    # Panel 1: 10s OHLC
+    b10s_t = cd["b10s_t"]
+    if b10s_t:
+        fig.add_trace(
+            go.Candlestick(
+                x=[t + 5.0 for t in b10s_t],
+                open=cd["b10s_o"],
+                high=cd["b10s_h"],
+                low=cd["b10s_l"],
+                close=cd["b10s_c"],
+                name="Price (10s)",
+                increasing_line_color="#2ca02c",
+                decreasing_line_color="#d62728",
+                showlegend=False,
+            ),
+            row=1, col=1,
+        )
 
-    # Filter bars to window
-    mask = (bar_ts_ns >= win_start_ns) & (bar_ts_ns <= win_end_ns)
-    if not mask.any():
-        return None
+    if t_entry_rel is not None and entry_price is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[t_entry_rel], y=[entry_price],
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=12, color="green"),
+                name="Entry",
+            ),
+            row=1, col=1,
+        )
 
-    b_ts = bar_ts_ns[mask]
-    b_states = [bar_states[i] for i, m in enumerate(mask) if m]
-    b_opens = bar_opens[mask]
-    b_highs = bar_highs[mask]
-    b_lows = bar_lows[mask]
-    b_closes = bar_closes[mask]
+    if luld_fires:
+        fig.add_trace(
+            go.Scatter(
+                x=[f["t_rel"] for f in luld_fires],
+                y=[f["price"] for f in luld_fires],
+                mode="markers",
+                marker=dict(symbol="x", size=10, color="orange"),
+                name="LULD halt",
+            ),
+            row=1, col=1,
+        )
 
-    # Q̃ bars (aligned to the same bar indices)
-    n_q = len(q_tilde)
-    bar_idx_in_window = [i for i, m in enumerate(mask) if m]
-    b_q = np.array([q_tilde[i] if i < n_q else np.nan for i in bar_idx_in_window])
+    # Vertical lines (no row/col → spans all subplots)
+    fig.add_vline(x=0.0, line_color="blue", line_width=1.8,
+                  annotation_text="scanner", annotation_position="top right")
+    fig.add_vline(x=t_event_rel, line_color="red", line_width=1.8,
+                  annotation_text="T₀", annotation_position="top left")
+    fig.add_vline(x=t_warmup_rel, line_color="red", line_width=1.2,
+                  line_dash="dash", annotation_text="warmup end",
+                  annotation_position="top left")
+    if t_entry_rel is not None:
+        fig.add_vline(x=t_entry_rel, line_color="green", line_width=1.8,
+                      annotation_text="entry", annotation_position="top right")
 
-    # Bar width in seconds (58s to leave a gap)
-    BAR_WIDTH_SEC = 58
+    # Panel 2: E(t) + p×E_peak step line
+    tick_t_rel = cd["tick_t_rel"]
+    tick_E = cd["tick_E"]
+    tick_E_thr = cd["tick_E_peak_threshold"]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
-                                    gridspec_kw={"height_ratios": [3, 1.2]})
+    if tick_t_rel:
+        fig.add_trace(
+            go.Scatter(
+                x=tick_t_rel, y=tick_E,
+                mode="lines",
+                line=dict(color="steelblue", width=1.3),
+                name="E(t) = λ_V",
+            ),
+            row=2, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=tick_t_rel, y=tick_E_thr,
+                mode="lines",
+                line=dict(color="navy", width=1.0, dash="dot"),
+                name=f"p×E_peak  (p={P_OPEN})",
+            ),
+            row=2, col=1,
+        )
 
-    h1_warn = " ⚠️ H1" if t_event_offset > 0 else ""
-    fig.suptitle(f"{ticker} {date}  —  T-event offset vs scanner: "
-                 f"{t_event_offset:+.0f}s{h1_warn}", fontsize=12, fontweight="bold")
+    # Panel 3: Q̃
+    qtilde_t = cd["qtilde_t_rel"]
+    qtilde_v = cd["qtilde"]
 
-    # ── Panel 1: OHLC + shading ───────────────────────────────────────────
-    for i, (ts, state) in enumerate(zip(b_ts, b_states)):
-        x0 = ts / NS_PER_SECOND
-        x1 = x0 + 60
-        color = STATE_COLORS.get(state, "#ffffff")
-        ax1.axvspan(x0, x1, color=color, alpha=0.7, linewidth=0)
+    if qtilde_t:
+        qv = np.array(qtilde_v)
+        green_y = [float(v) if v >= Q_THRESHOLD else None for v in qv]
+        red_y   = [float(v) if v < Q_THRESHOLD  else None for v in qv]
 
-    # Candlestick bars
-    for i, (ts, o, h, l, c) in enumerate(zip(b_ts, b_opens, b_highs, b_lows, b_closes)):
-        x = ts / NS_PER_SECOND + 30  # center of bar
-        color = "#2ca02c" if c >= o else "#d62728"
-        ax1.plot([x, x], [l, h], color=color, linewidth=0.8)
-        ax1.bar(x, abs(c - o), bottom=min(o, c), width=BAR_WIDTH_SEC,
-                color=color, alpha=0.85, linewidth=0)
+        if any(v is not None for v in green_y):
+            fig.add_trace(
+                go.Scatter(
+                    x=qtilde_t, y=green_y,
+                    mode="lines+markers",
+                    line=dict(color="green", width=1.5),
+                    marker=dict(size=4),
+                    name="Q̃ ≥ 0.65",
+                    connectgaps=False,
+                ),
+                row=3, col=1,
+            )
+        if any(v is not None for v in red_y):
+            fig.add_trace(
+                go.Scatter(
+                    x=qtilde_t, y=red_y,
+                    mode="lines+markers",
+                    line=dict(color="red", width=1.5),
+                    marker=dict(size=4),
+                    name="Q̃ < 0.65",
+                    connectgaps=False,
+                ),
+                row=3, col=1,
+            )
 
-    # Vertical markers (in seconds-from-epoch, same scale as bar_ts_ns / NS_PER_SECOND)
-    ax1.axvline(t_scanner_hit_ns / NS_PER_SECOND, color="#1f77b4", linewidth=1.8, label="scanner")
-    ax1.axvline(t_event_ns / NS_PER_SECOND, color="#d62728", linewidth=1.8, label="T-event")
-    ax1.axvline(t_warmup_end_ns / NS_PER_SECOND, color="#d62728", linewidth=1.2,
-                linestyle="--", label="warmup end")
-    if t_entry_ns:
-        ax1.axvline(t_entry_ns / NS_PER_SECOND, color="#2ca02c", linewidth=1.8, label="entry")
+        # Q̃ threshold dashed line
+        fig.add_shape(
+            type="line",
+            x0=win_start, x1=win_end,
+            y0=Q_THRESHOLD, y1=Q_THRESHOLD,
+            line=dict(color="black", width=1.0, dash="dash"),
+            row=3, col=1,
+        )
 
-    # Format x-axis as time-of-day (minutes offset from window start)
-    x_min = win_start_ns / NS_PER_SECOND
-    x_max = win_end_ns / NS_PER_SECOND
-    ax1.set_xlim(x_min, x_max)
+        # First-3-consecutive vrect
+        if first_3c_vrect:
+            fig.add_shape(
+                type="rect",
+                x0=first_3c_vrect[0], x1=first_3c_vrect[1],
+                y0=0, y1=1.05,
+                row=3, col=1,
+                fillcolor="rgba(144,238,144,0.40)",
+                layer="below",
+                line_width=0,
+            )
 
-    # Custom x tick formatter: show as ET time HH:MM
-    def _fmt_x(x_sec, _pos=None):
-        try:
-            return _ns_to_dt(int(x_sec * NS_PER_SECOND)).strftime("%H:%M")
-        except Exception:
-            return ""
+        # Diamond at first_3consec bar start
+        if first_3c_diamond:
+            fig.add_trace(
+                go.Scatter(
+                    x=[first_3c_diamond["t_rel"]],
+                    y=[first_3c_diamond["q"]],
+                    mode="markers",
+                    marker=dict(symbol="diamond", size=10, color="darkgreen"),
+                    name="first 3-consec",
+                ),
+                row=3, col=1,
+            )
 
-    import matplotlib.ticker as ticker_mod
-    ax1.xaxis.set_major_formatter(ticker_mod.FuncFormatter(_fmt_x))
-    ax1.xaxis.set_major_locator(ticker_mod.MultipleLocator(300))  # every 5 min
+    # Panel 4: gate state colored bands
+    for t_start, t_end, state in state_intervals:
+        fig.add_shape(
+            type="rect",
+            x0=t_start, x1=t_end,
+            y0=0, y1=1,
+            row=4, col=1,
+            fillcolor=_STATE_SOLID.get(state, "rgba(200,200,200,0.85)"),
+            opacity=1.0,
+            layer="below",
+            line_width=0,
+        )
 
-    ax1.set_ylabel("Price")
-    ax1.legend(loc="upper right", fontsize=8)
+    # Dummy traces for Panel 4 legend
+    for state, color in _STATE_SOLID.items():
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(size=10, color=color, symbol="square"),
+                name=state,
+                showlegend=True,
+            ),
+            row=4, col=1,
+        )
 
-    # Legend for shading
-    patches = [mpatches.Patch(color=v, alpha=0.7, label=k) for k, v in STATE_COLORS.items()]
-    ax1.legend(handles=patches + ax1.get_lines()[:4], loc="upper left",
-               fontsize=7, ncol=4)
+    # Layout
+    h1_tag = "⚠ H1" if t_event_rel > 0 else "H1 ok"
+    chatter = diag.get("gate_chatter_count", "?")
+    lag_str = f"{entry_lag:.0f}s" if entry_lag is not None else "—"
 
-    # ── Panel 2: Q̃ ────────────────────────────────────────────────────────
-    q_bar_centers = b_ts / NS_PER_SECOND + 30
-    bar_colors = ["#2ca02c" if q >= Q_THRESHOLD else "#d62728"
-                  for q in b_q]
-    ax2.bar(q_bar_centers, b_q, width=BAR_WIDTH_SEC,
-            color=bar_colors, alpha=0.75, linewidth=0)
-    ax2.axhline(Q_THRESHOLD, color="black", linewidth=1.2, linestyle="--",
-                label=f"Q̃ = {Q_THRESHOLD}")
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"{ticker}  {date}  —  T₀ offset: {t_event_rel:+.0f}s ({h1_tag})  "
+                f"entry_lag: {lag_str}  chatter: {chatter}"
+            ),
+            font=dict(size=13),
+        ),
+        height=900,
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
 
-    # Shade first 3-consecutive qualifying region
-    if first_3consec_idx is not None and first_3consec_idx < n_bars:
-        end_idx = min(first_3consec_idx + N_HOLD, n_bars)
-        shade_start = bar_ts_ns[first_3consec_idx] / NS_PER_SECOND
-        shade_end = bar_ts_ns[end_idx - 1] / NS_PER_SECOND + 60
-        ax2.axvspan(shade_start, shade_end, color="#d4edda", alpha=0.6, label="first 3-consec")
+    fig.update_xaxes(range=[win_start, win_end])
+    fig.update_xaxes(title_text="Seconds from scanner hit", row=4, col=1)
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="E(t)", row=2, col=1)
+    fig.update_yaxes(title_text="Q̃", range=[0, 1.05], row=3, col=1)
+    fig.update_yaxes(title_text="State", range=[0, 1], showticklabels=False, row=4, col=1)
 
-    # Mark entry eligible point
-    if entry_t_sec is not None:
-        ax2.axvline(first_trade_ns / NS_PER_SECOND + entry_t_sec,
-                    color="#2ca02c", linewidth=1.8, linestyle=":", label="entry accepted")
-
-    ax2.set_xlim(x_min, x_max)
-    ax2.set_ylim(0, 1.05)
-    ax2.set_ylabel("Q̃")
-    ax2.set_xlabel("Time (ET)")
-    ax2.legend(loc="upper right", fontsize=7)
-    ax2.xaxis.set_major_formatter(ticker_mod.FuncFormatter(_fmt_x))
-    ax2.xaxis.set_major_locator(ticker_mod.MultipleLocator(300))
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    chart_name = f"{ticker}_{date}.png"
-    chart_path = out_dir / chart_name
-    plt.savefig(str(chart_path), dpi=130, bbox_inches="tight")
-    plt.close(fig)
+    chart_path = out_dir / f"{ticker}_{date}.html"
+    fig.write_html(
+        str(chart_path),
+        include_plotlyjs="cdn",
+        config={"responsive": True},
+    )
     return chart_path
 
 
@@ -634,38 +851,42 @@ def generate_index(events: list[dict], chart_dir: Path) -> None:
     for ev in events:
         if ev.get("status") != "event" or not ev.get("has_trade"):
             continue
-        chart_file = f"{ev['ticker']}_{ev['session_date']}.png"
-        chart_exists = (chart_dir / chart_file).exists()
-        h1 = "⚠️" if (ev.get("t_event_offset_vs_scanner_sec") or 0) > 0 else ""
+        chart_file = f"{ev['ticker']}_{ev['session_date']}.html"
+        t0_offset = ev.get("t_event_offset_sec") or 0.0
         rows.append({
             "ticker": ev["ticker"],
             "date": ev["session_date"],
-            "t_event_offset": ev.get("t_event_offset_vs_scanner_sec"),
-            "first_q_offset": ev.get("first_qualifying_bar_offset_sec"),
-            "entry_lag": ev.get("entry_lag_sec"),
-            "chatter": ev.get("gate_chatter_count"),
-            "chart": chart_file if chart_exists else None,
-            "h1": h1,
+            "t_event_offset_sec": t0_offset,
+            "t0_color": "red" if t0_offset > 0 else "green",
+            "first_q_offset_sec": ev.get("first_q_offset_sec"),
+            "first_3consec_offset_sec": ev.get("first_3consec_offset_sec"),
+            "entry_lag_sec": ev.get("entry_lag_sec"),
+            "gate_chatter_count": ev.get("gate_chatter_count"),
+            "chart": chart_file if (chart_dir / chart_file).exists() else None,
         })
 
-    rows.sort(key=lambda r: r["t_event_offset"] if r["t_event_offset"] is not None else 0, reverse=True)
+    # Default: first_3consec_offset_sec DESC
+    rows.sort(
+        key=lambda r: r["first_3consec_offset_sec"]
+        if r["first_3consec_offset_sec"] is not None else -1e9,
+        reverse=True,
+    )
 
     def _fmt(v):
         if v is None:
             return "—"
-        if isinstance(v, float):
-            return f"{v:.1f}"
-        return str(v)
+        return f"{v:.1f}" if isinstance(v, float) else str(v)
 
     row_html = "\n".join(
         f'<tr>'
-        f'<td>{r["h1"]}{r["ticker"]}</td>'
+        f'<td>{r["ticker"]}</td>'
         f'<td>{r["date"]}</td>'
-        f'<td>{_fmt(r["t_event_offset"])}</td>'
-        f'<td>{_fmt(r["first_q_offset"])}</td>'
-        f'<td>{_fmt(r["entry_lag"])}</td>'
-        f'<td>{_fmt(r["chatter"])}</td>'
-        f'<td>{"<a href=" + chr(34) + r["chart"] + chr(34) + ">chart</a>" if r["chart"] else "—"}</td>'
+        f'<td style="color:{r["t0_color"]}">{_fmt(r["t_event_offset_sec"])}</td>'
+        f'<td>{_fmt(r["first_q_offset_sec"])}</td>'
+        f'<td>{_fmt(r["first_3consec_offset_sec"])}</td>'
+        f'<td>{_fmt(r["entry_lag_sec"])}</td>'
+        f'<td>{_fmt(r["gate_chatter_count"])}</td>'
+        f'<td>{"<a href=" + chr(34) + r["chart"] + chr(34) + " target=_blank>chart</a>" if r["chart"] else "—"}</td>'
         f'</tr>'
         for r in rows
     )
@@ -674,48 +895,60 @@ def generate_index(events: list[dict], chart_dir: Path) -> None:
 <html>
 <head>
 <meta charset="utf-8">
-<title>R1 T1 Entry Lag Diagnostic</title>
+<title>R1 Entry Lag Diagnostic (Redo)</title>
 <style>
 body {{ font-family: monospace; font-size: 13px; padding: 16px; }}
 table {{ border-collapse: collapse; width: 100%; }}
 th, td {{ border: 1px solid #ccc; padding: 4px 8px; text-align: right; }}
-th {{ background: #eee; cursor: pointer; }}
+th {{ background: #eee; cursor: pointer; user-select: none; }}
 td:first-child, td:nth-child(2) {{ text-align: left; }}
-tr:hover {{ background: #f9f9f9; }}
+tr:hover {{ background: #f5f5f5; }}
+a {{ color: #1a73e8; text-decoration: none; }}
 </style>
 <script>
+let _sortCol = 4, _sortAsc = false;
 function sortTable(n) {{
   var t = document.getElementById("diag");
-  var rows = Array.from(t.rows).slice(1);
-  var asc = t.dataset.sort == n;
-  rows.sort((a, b) => {{
-    var av = a.cells[n].innerText, bv = b.cells[n].innerText;
-    return asc ? av.localeCompare(bv, undefined, {{numeric:true}}) : bv.localeCompare(av, undefined, {{numeric:true}});
+  var rows = Array.from(t.tBodies[0].rows);
+  _sortAsc = (_sortCol === n) ? !_sortAsc : false;
+  _sortCol = n;
+  rows.sort(function(a, b) {{
+    var av = a.cells[n].innerText.replace('—',''), bv = b.cells[n].innerText.replace('—','');
+    var an = parseFloat(av), bn = parseFloat(bv);
+    if (!isNaN(an) && !isNaN(bn)) return _sortAsc ? an - bn : bn - an;
+    return _sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
   }});
-  rows.forEach(r => t.appendChild(r));
-  t.dataset.sort = asc ? "" : n;
+  rows.forEach(function(r) {{ t.tBodies[0].appendChild(r); }});
 }}
 </script>
 </head>
 <body>
-<h2>R1 T1 Entry Lag Diagnostic — p=0.65/0.65</h2>
-<p>Sorted by t_event_offset_vs_scanner_sec descending (worst H1 cases first). Click column headers to re-sort.</p>
-<table id="diag" data-sort="">
-<tr>
-<th onclick="sortTable(0)">Ticker</th>
-<th onclick="sortTable(1)">Date</th>
-<th onclick="sortTable(2)">t_event_offset (s)</th>
-<th onclick="sortTable(3)">first_q_bar_offset (s)</th>
-<th onclick="sortTable(4)">entry_lag (s)</th>
-<th onclick="sortTable(5)">chatter</th>
-<th>Chart</th>
-</tr>
+<h2>R1 Entry Lag Diagnostic (Redo) — p={P_OPEN}/{P_CLOSE}</h2>
+<p>
+  Default sort: <b>first_3consec DESC</b> (slowest Q̃ qualification first).
+  T₀ offset: <span style="color:red">red = H1 confirmed (anchor after scanner)</span>,
+  <span style="color:green">green = H1 clear</span>.
+  Click column headers to re-sort.
+</p>
+<table id="diag">
+<thead><tr>
+  <th onclick="sortTable(0)">Ticker</th>
+  <th onclick="sortTable(1)">Date</th>
+  <th onclick="sortTable(2)">T₀ offset (s)</th>
+  <th onclick="sortTable(3)">first_q (s)</th>
+  <th onclick="sortTable(4)">first_3consec (s)</th>
+  <th onclick="sortTable(5)">entry_lag (s)</th>
+  <th onclick="sortTable(6)">chatter</th>
+  <th>Chart</th>
+</tr></thead>
+<tbody>
 {row_html}
+</tbody>
 </table>
-<p style="margin-top:16px; color:#666">
-t_event_offset &lt; 0: anchor fires BEFORE scanner (expected ~-30s, H1 clear).<br>
-t_event_offset &gt; 0: anchor fires AFTER scanner (H1 contributor).<br>
-first_q_bar_offset: seconds after scanner hit until Q̃ first crosses 0.65 (H2 diagnostic).
+<p style="margin-top:16px; color:#666; font-size:12px">
+  T₀ offset = t_event − t_scanner_hit.  Negative ≈ −30s expected (anchor fires before scanner).<br>
+  first_3consec = seconds after scanner hit until first run of {N_HOLD} consecutive Q̃ ≥ {Q_THRESHOLD} bars.<br>
+  entry_lag = seconds from T₀ to actual entry (EPG PASS &amp; Q̃ qualified).
 </p>
 </body>
 </html>"""
@@ -727,8 +960,6 @@ first_q_bar_offset: seconds after scanner hit until Q̃ first crosses 0.65 (H2 d
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    import random
-
     with open(CONFIG_DIR / "holdout_boundary.json") as f:
         boundary = json.load(f)
     with open(CONFIG_DIR / "hawkes_params.json") as f:
@@ -736,50 +967,45 @@ def main():
     with open(CONFIG_DIR / "q_bar_tiers.json") as f:
         q_bar_cfg = json.load(f)
 
+    # Load traded events from T1 per_trade.json
+    t1_path = RESULTS_DIR / "symmetric_p65" / "per_trade.json"
+    if not t1_path.exists():
+        print(f"ERROR: {t1_path} not found — run T1 first", file=sys.stderr)
+        sys.exit(1)
+    with open(t1_path) as f:
+        t1_trades = json.load(f)
+    traded_keys = {(tr["ticker"], tr["date"]) for tr in t1_trades}
+    print(f"Loaded {len(traded_keys)} traded events from T1 per_trade.json")
+
+    # Val event lookup
     val_start = boundary["val_split_start_date"]
     test_start = boundary["test_split_start_date"]
     all_events = list_events(min_mom=50.0, require_date=True)
-    events = [e for e in all_events if val_start <= e["date"] < test_start]
+    val_lookup = {
+        (e["ticker"], e["date"]): e
+        for e in all_events
+        if val_start <= e["date"] < test_start
+    }
 
-    # Same stratified sample as T1 p=0.65 run
-    rng = random.Random(42)
-    n_sample = 100
-    by_year: dict[str, list] = {}
-    for e in events:
-        by_year.setdefault(e["date"][:4], []).append(e)
-    year_counts = {y: len(evs) for y, evs in by_year.items()}
-    total = sum(year_counts.values())
-    alloc = {y: int(n_sample * cnt / total) for y, cnt in year_counts.items()}
-    remainder = n_sample - sum(alloc.values())
-    for y in sorted(year_counts, key=year_counts.get, reverse=True):
-        if remainder <= 0:
-            break
-        alloc[y] += 1
-        remainder -= 1
-    sampled = []
-    for y in sorted(by_year):
-        n_y = min(alloc[y], len(by_year[y]))
-        sampled.extend(rng.sample(by_year[y], n_y))
-    events = sorted(sampled, key=lambda e: (e["date"], e["ticker"]))
-    print(f"Loaded {len(events)} events (stratified seed=42)")
-
-    repo_root = BACKTEST.parent
-    phase_a_path = repo_root / "results" / "phase_a" / "production_fit_results.json"
-    per_event_params = {}
+    # Per-event Hawkes params
+    phase_a_path = REPO / "results" / "phase_a" / "production_fit_results.json"
+    per_event_params: dict = {}
     if phase_a_path.exists():
         with open(phase_a_path) as f:
-            phase_a_results = json.load(f)
-        for r in phase_a_results:
-            if r.get("status") == "success" and "final_params" in r:
-                per_event_params[(r["ticker"], r["date"])] = r["final_params"]
+            for r in json.load(f):
+                if r.get("status") == "success" and "final_params" in r:
+                    per_event_params[(r["ticker"], r["date"])] = r["final_params"]
 
     args_list = []
-    for ev in events:
-        key = (ev["ticker"], ev["date"])
-        fp = per_event_params.get(key, hawkes_median)
+    for ticker, date in sorted(traded_keys):
+        ev = val_lookup.get((ticker, date))
+        if ev is None:
+            print(f"  WARNING: {ticker} {date} not in val events — skipping")
+            continue
+        fp = per_event_params.get((ticker, date), hawkes_median)
         args_list.append({
-            "ticker": ev["ticker"],
-            "date": ev["date"],
+            "ticker": ticker,
+            "date": date,
             "mom_pct": ev["mom_pct"],
             "hawkes_params": fp,
             "rho": hawkes_median.get("rho", 0.99),
@@ -787,7 +1013,7 @@ def main():
             "q_bar_cfg": q_bar_cfg,
         })
 
-    print("Collecting diagnostic data (6 workers)...")
+    print(f"Processing {len(args_list)} events (6 workers)...")
     raw_results = []
     with ProcessPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(_collect_event_diag, a): a for a in args_list}
@@ -801,18 +1027,20 @@ def main():
 
     event_results = [r for r in raw_results if r.get("status") == "event"]
     traded_results = [r for r in event_results if r.get("has_trade")]
+    errors = [r for r in raw_results if r.get("status") == "error"]
+    if errors:
+        print(f"  {len(errors)} errors:")
+        for e in errors[:5]:
+            print(f"    {e['ticker']} {e.get('session_date','?')}: {e.get('error','')[:120]}")
+
     print(f"Events: {len(event_results)} processable, {len(traded_results)} with trades")
 
-    # ── Aggregate stats ────────────────────────────────────────────────────
-    offsets = [r["t_event_offset_vs_scanner_sec"] for r in event_results
-               if r.get("t_event_offset_vs_scanner_sec") is not None]
-    first_q_offsets = [r["first_qualifying_bar_offset_sec"] for r in event_results
-                       if r.get("first_qualifying_bar_offset_sec") is not None]
-    first_3c_offsets = [r["first_3consec_qualifying_bar_offset_sec"] for r in event_results
-                        if r.get("first_3consec_qualifying_bar_offset_sec") is not None]
-    entry_lags = [r["entry_lag_sec"] for r in traded_results
-                  if r.get("entry_lag_sec") is not None]
-    h1_count = sum(1 for x in offsets if x > 0)
+    # Aggregates
+    offsets     = [r["t_event_offset_sec"] for r in event_results if r.get("t_event_offset_sec") is not None]
+    first_q_off = [r["first_q_offset_sec"] for r in event_results if r.get("first_q_offset_sec") is not None]
+    first_3c_off = [r["first_3consec_offset_sec"] for r in event_results if r.get("first_3consec_offset_sec") is not None]
+    entry_lags  = [r["entry_lag_sec"] for r in traded_results if r.get("entry_lag_sec") is not None]
+    h1_count    = sum(1 for x in offsets if x > 0)
 
     def pct(arr, p):
         return round(float(np.percentile(arr, p)), 1) if arr else None
@@ -820,33 +1048,39 @@ def main():
     aggregates = {
         "n_events": len(event_results),
         "n_traded": len(traded_results),
-        "t_event_offset_vs_scanner_median_sec": pct(offsets, 50),
-        "t_event_offset_vs_scanner_p90_sec": pct(offsets, 90),
-        "h1_rate_pct": round(100 * h1_count / len(offsets), 1) if offsets else None,
-        "first_qualifying_bar_offset_median_sec": pct(first_q_offsets, 50),
-        "first_3consec_qualifying_bar_offset_median_sec": pct(first_3c_offsets, 50),
-        "entry_lag_median_sec": pct(entry_lags, 50),
-        "entry_lag_p90_sec": pct(entry_lags, 90),
+        "median_t_event_offset_sec": pct(offsets, 50),
+        "p10_t_event_offset_sec": pct(offsets, 10),
+        "p90_t_event_offset_sec": pct(offsets, 90),
+        "pct_events_where_h1_confirmed": round(100 * h1_count / len(offsets), 1) if offsets else None,
+        "median_first_qualifying_bar_offset_sec": pct(first_q_off, 50),
+        "median_first_3consec_offset_sec": pct(first_3c_off, 50),
+        "median_entry_lag_sec": pct(entry_lags, 50),
+        "p90_entry_lag_sec": pct(entry_lags, 90),
     }
 
-    # ── Build diagnosis JSON (strip chart data) ────────────────────────────
-    diag_rows = []
-    for r in event_results:
-        row = {k: v for k, v in r.items() if k != "_chart"}
-        diag_rows.append(row)
-    diag_rows.sort(key=lambda r: r.get("t_event_offset_vs_scanner_sec") or 0, reverse=True)
-
-    output = {"events": diag_rows, "aggregates": aggregates}
+    # Write entry_lag_diagnosis.json (sorted by first_3consec DESC)
+    diag_rows = [{k: v for k, v in r.items() if k != "_chart"} for r in event_results]
+    diag_rows.sort(
+        key=lambda r: r.get("first_3consec_offset_sec") or -1e9,
+        reverse=True,
+    )
     diag_path = RESULTS_DIR / "entry_lag_diagnosis.json"
     with open(diag_path, "w") as f:
-        json.dump(output, f, indent=2, default=lambda x: None if isinstance(x, float) and (math.isnan(x) or math.isinf(x)) else x)
+        json.dump(
+            {"events": diag_rows, "aggregates": aggregates},
+            f, indent=2,
+            default=lambda x: None if isinstance(x, float) and (math.isnan(x) or math.isinf(x)) else x,
+        )
     print(f"Diagnosis written to {diag_path}")
 
-    # ── Generate charts ────────────────────────────────────────────────────
+    # Generate charts
     print(f"Generating {len(traded_results)} charts...")
+    n_ok = 0
     for i, r in enumerate(traded_results):
         try:
-            chart_path = generate_chart(r, CHART_DIR)
+            p = generate_chart(r, CHART_DIR)
+            if p:
+                n_ok += 1
             if (i + 1) % 10 == 0:
                 print(f"  {i+1}/{len(traded_results)} charts generated")
         except Exception as e:
@@ -854,16 +1088,20 @@ def main():
 
     generate_index(event_results, CHART_DIR)
     print(f"Index written to {CHART_DIR}/index.html")
+    print(f"Charts OK: {n_ok}/{len(traded_results)}")
 
-    # ── Print aggregate summary ────────────────────────────────────────────
+    # Summary
     print("\n=== Entry Lag Diagnostic Aggregates ===")
     print(f"  n_events: {aggregates['n_events']}, n_traded: {aggregates['n_traded']}")
-    print(f"  t_event_offset vs scanner — median: {aggregates['t_event_offset_vs_scanner_median_sec']}s, "
-          f"p90: {aggregates['t_event_offset_vs_scanner_p90_sec']}s")
-    print(f"  H1 rate (anchor AFTER scanner): {aggregates['h1_rate_pct']}%")
-    print(f"  first_qualifying_bar_offset median: {aggregates['first_qualifying_bar_offset_median_sec']}s")
-    print(f"  first_3consec_qualifying_bar_offset median: {aggregates['first_3consec_qualifying_bar_offset_median_sec']}s")
-    print(f"  entry_lag median: {aggregates['entry_lag_median_sec']}s, p90: {aggregates['entry_lag_p90_sec']}s")
+    print(f"  t_event_offset — median: {aggregates['median_t_event_offset_sec']}s  "
+          f"p10: {aggregates['p10_t_event_offset_sec']}s  "
+          f"p90: {aggregates['p90_t_event_offset_sec']}s")
+    print(f"  H1 rate (anchor AFTER scanner): {aggregates['pct_events_where_h1_confirmed']}%")
+    print(f"  median first_q_offset: {aggregates['median_first_qualifying_bar_offset_sec']}s")
+    print(f"  median first_3consec_offset: {aggregates['median_first_3consec_offset_sec']}s")
+    print(f"  entry_lag — median: {aggregates['median_entry_lag_sec']}s  "
+          f"p90: {aggregates['p90_entry_lag_sec']}s")
+    print("DIAGNOSTIC COMPLETE")
 
 
 if __name__ == "__main__":
