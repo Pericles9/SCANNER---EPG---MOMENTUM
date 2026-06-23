@@ -107,15 +107,25 @@ The distribution is strongly bimodal: a near-instant cluster (~36%) where the ga
 already PASS at scanner hit, and a long-tail cluster where the gate opens late.
 
 **Cooper sets `max_entry_lag_sec` before R1.** Starting point from spec: 180s.
-Capture rates at common thresholds:
+Profit stats per threshold (cumulative: all trades with lag ≤ threshold):
 
-| `max_entry_lag_sec` | Trades kept | Trades filtered |
-|---|---|---|
-| 60s | ~36% (35) | ~64% (61) |
-| 180s | ~45% (43) | ~55% (53) |
-| 300s | ~48% (46) | ~52% (50) |
-| 1800s | ~79% (76) | ~21% (20) |
-| 3600s | ~83% (80) | ~17% (16) |
+| `max_entry_lag_sec` | n | PF | win% | mean PnL | median PnL | CVaR5 | median lag |
+|---|---|---|---|---|---|---|---|
+| 60s | 35 | 2.838 | 54.3% | 10.03% | 1.73% | −31.34% | 0s |
+| 180s | 38 | 2.661 | 52.6% | 9.25% | 1.54% | −31.34% | 0s |
+| 300s | 46 | 2.811 | 56.5% | 9.06% | 2.22% | **−27.74%** | 0s |
+| 600s | 70 | 2.236 | 52.9% | 6.93% | 1.24% | −32.15% | 92s |
+| 1800s | 76 | 2.331 | 52.6% | 7.13% | 1.24% | −32.15% | 206s |
+| 3600s | 80 | 2.658 | 53.8% | 9.33% | 1.54% | −34.91% | 264s |
+| no filter | 96 | **2.970** | **55.2%** | **10.14%** | **2.18%** | −34.91% | 306s |
+
+**Non-monotonic pattern:** PF is not "smaller threshold = better." The 300–600s band
+(24 additional trades) is the worst incremental group — adding it drops PF from 2.81 to
+2.24. The >3600s group (16 trades, the very late entries) is the best incremental group
+— including them lifts PF from 2.66 to 2.97. Implications:
+- A tight filter (≤300s) gives the best CVaR5 (−27.7%) and a good PF (2.81).
+- No filter gives the best PF (2.97) and best win% — the late entries are profitable.
+- The 600–1800s band is the weak zone; a threshold in that range is the worst choice.
 
 ---
 
