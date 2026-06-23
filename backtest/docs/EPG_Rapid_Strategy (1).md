@@ -56,7 +56,7 @@ volume from 4am, news hits 7–9am ET, volume explodes, price runs 100–200%+ o
 | ROC gate | 5-minute ROC | `roc_5m ≥ threshold`. Threshold tuned 5–25% (Phase R3). |
 | Scanner heat / quartile | **Void** | Computed and stored as analysis fields only. No gate. Legacy Q3/Q4 filter is not applied. |
 | Halt handling | Pause decay clocks across halt gaps | Hawkes EMA and gate `λ_V` do not decay across detected halt windows. See §6. |
-| Baseline | Classic EPG on MDR≥200 diagnostic sample (first-PASS, same exit stack) | Scanner floor active. See §7. |
+| Baseline | Classic EPG on MDR≥150 diagnostic sample (first-PASS, same exit stack) | Scanner floor active. See §7. |
 | Test split | Untouched | Opened once at the very end of the full pipeline. Not in any phase. |
 
 ---
@@ -255,8 +255,8 @@ Detected halt windows must not advance any decay clock.
 ## 7. Baseline Definition
 
 EPG-Rapid numbers are only meaningful against a baseline run with the **same exit stack**.
-The baseline used throughout R0–R4 is classic-EPG first-PASS entry on the **MDR≥200
-diagnostic sample** (100 events, randomly selected from events where `mom_pct ≥ 200` and
+The baseline used throughout R0–R4 is classic-EPG first-PASS entry on the **MDR≥150
+diagnostic sample** (100 events, randomly selected from events where `mom_pct ≥ 150` and
 `t_scanner_hit_sec IS NOT NULL`, not top-ranked), configured to match EPG-Rapid exits.
 
 - Gate: `ParticipationGate`, original symmetric (`τ=300`, `p=0.65`, `warmup=300`).

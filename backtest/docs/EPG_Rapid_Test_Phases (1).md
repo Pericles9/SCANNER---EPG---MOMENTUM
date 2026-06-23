@@ -28,8 +28,8 @@ Phased validation for `epg_rapid`. All phases follow `Agent_Prompt_Standard.md` 
   approved before being incorporated into the next.
 - **No cross-contamination.** A C-phase failure stops the sequence. Do not proceed to
   integration (R0) until all C-phases (C2–C4) are green.
-- **Default sample (R0–R4):** MDR≥200 diagnostic sample — 100 events randomly selected
-  from `mom_pct ≥ 200` AND `t_scanner_hit_sec IS NOT NULL`. Not stratified. Every event
+- **Default sample (R0–R4):** MDR≥150 diagnostic sample — 100 events randomly selected
+  from `mom_pct ≥ 150` AND `t_scanner_hit_sec IS NOT NULL`. Not stratified. Every event
   has a confirmed scanner hit. **Production val sample** (stratified, seed=42,
   scanner-confirmed, 1228 events) is used only in R5. Test split is never touched in C or
   R phases — opened once at the very end of R5.
@@ -46,10 +46,10 @@ Phased validation for `epg_rapid`. All phases follow `Agent_Prompt_Standard.md` 
 | C2 | Component | `LuldProximityExit` independent upper/lower + lower-enable flag | Unit tests | No |
 | C3 | Component | Halt-gap clock pause in Hawkes/gate replay | Unit tests | No |
 | C4 | Component | ROC 5-min buffer (per-ticker, partial-window, first-appearance) | Unit tests | No |
-| R0 | Integration | Rapid runner + MDR≥200 diagnostic baseline; entry lag distribution | MDR≥200 (100 events) | No |
-| R1 | Tuning | EPG gate threshold (`p_open` × `p_close`) — regime gate recalibration | MDR≥200 (100 events) | No |
-| R3 | Tuning | 5-min ROC gate threshold | MDR≥200 (100 events) | No |
-| R4 | Tuning | LULD halt-avoidance (two-sided, independent thresholds) | MDR≥200 (100 events) | No |
+| R0 | Integration | Rapid runner + MDR≥150 diagnostic baseline; entry lag distribution | MDR≥150 (100 events) | No |
+| R1 | Tuning | EPG gate threshold (`p_open` × `p_close`) — regime gate recalibration | MDR≥150 (100 events) | No |
+| R3 | Tuning | 5-min ROC gate threshold | MDR≥150 (100 events) | No |
+| R4 | Tuning | LULD halt-avoidance (two-sided, independent thresholds) | MDR≥150 (100 events) | No |
 | R5 | Milestone | Integration + confirmation on production val sample | Production val (stratified, seed=42, scanner-confirmed) | **Yes** |
 
 Phases are strictly sequential. Each requires Cooper's explicit approval before the next begins.
@@ -363,9 +363,9 @@ the classic runner, and establish the gate-consistent baseline
 **Context:**
 
 - All C-phases approved (C2–C4). All component unit tests green.
-- **Sample: MDR≥200 diagnostic sample** — 100 events randomly selected from the event
-  catalog where `mom_pct ≥ 200` AND `t_scanner_hit_sec IS NOT NULL`. Not stratified; not
-  top-ranked. Saved to `data/val_mdr200_diagnostic.json`. Every event has a confirmed
+- **Sample: MDR≥150 diagnostic sample** — 100 events randomly selected from the event
+  catalog where `mom_pct ≥ 150` AND `t_scanner_hit_sec IS NOT NULL`. Not stratified; not
+  top-ranked. Saved to `data/val_mdr150_diagnostic.json`. Every event has a confirmed
   scanner hit — no `no_scanner_hit` skips.
 - Scanner hit floor active (`scanner_floor=true`). `max_entry_lag_sec=null` in R0 (log only
   — Cooper sets the value after T7).
@@ -398,14 +398,14 @@ the classic runner, and establish the gate-consistent baseline
   — is upper-only). Run on 100-event val. Produce trade-level JSON diff vs `runner.py` on same events.
   - [ ] T3a — Diff is empty. Any non-empty diff = hard stop.
 
-- [ ] **T4 — Baseline runner (classic first-PASS on MDR≥200)**
+- [ ] **T4 — Baseline runner (classic first-PASS on MDR≥150)**
   Classic first-PASS entry (first `gate.state == PASS` tick at or after `t_scanner_hit`),
   EPG-Rapid exit stack (LULD both sides on at starting thresholds, EXIT_D off, EPG close
-  on). MDR≥200 sample. Write `results/phase_r0/baseline_metrics.json`. PF result IS the
-  MDR≥200 baseline — the comparator for R1–R4.
+  on). MDR≥150 sample. Write `results/phase_r0/baseline_metrics.json`. PF result IS the
+  MDR≥150 baseline — the comparator for R1–R4.
   - [ ] T4a — Post PF, n_trades, CVaR5, exit-reason breakdown.
 
-- [ ] **T5 — Rapid runner first-PASS on MDR≥200**
+- [ ] **T5 — Rapid runner first-PASS on MDR≥150**
   EPG-Rapid first-PASS entry, same exit stack. Write `results/phase_r0/rapid_metrics.json`.
   Compare vs T4 baseline (entry method is the primary variable).
 
@@ -438,7 +438,7 @@ the classic runner, and establish the gate-consistent baseline
 | Any C-phase unit test fails post-integration (T1) | any failure | Hard stop — post which test |
 | Parity diff non-empty (T3a) | any diff | Hard stop — post the diff |
 | T6 pre-scanner audit | any `entry_lag_from_scanner_sec < 0` | Hard stop — scanner floor is broken |
-| Baseline PF (T4) | < 1.00 | Hard stop — MDR≥200 sample is strong movers; sub-1.00 indicates real signal problem |
+| Baseline PF (T4) | < 1.00 | Hard stop — MDR≥150 sample is strong movers; sub-1.00 indicates real signal problem |
 
 ---
 
@@ -489,7 +489,7 @@ all configs; Cooper selects
 
 **Context:**
 
-- **Sample: MDR≥200 diagnostic sample.** `max_entry_lag_sec` filter active (Cooper sets
+- **Sample: MDR≥150 diagnostic sample.** `max_entry_lag_sec` filter active (Cooper sets
   value after R0 T7 distribution; events where `t_entry − t_scanner_hit > max_entry_lag_sec`
   excluded from scoring). Starting point: 180s.
 - `p_open` and `p_close` are not PF-optimization targets. The regime gate should correctly
@@ -500,7 +500,7 @@ all configs; Cooper selects
   regime detection) and **exit-reason distribution**. Both reported per config.
 - Asymmetric configs: `p_open > p_close` = enters on stronger signal, exits faster;
   `p_open < p_close` = enters more easily, holds through pullbacks.
-- **Expected prior for MDR≥200 events:** low `p_open` / high `p_close` — enter early into
+- **Expected prior for MDR≥150 events:** low `p_open` / high `p_close` — enter early into
   strong momentum, hold through minor pullbacks. This is the asymmetric regime most natural
   for a strong mover that sustains for hours.
 
@@ -664,7 +664,7 @@ minimizing false exits on strong movers.
 
 **Context:**
 
-- **Sample: MDR≥200 diagnostic sample.** `max_entry_lag_sec` filter active (R1 selection).
+- **Sample: MDR≥150 diagnostic sample.** `max_entry_lag_sec` filter active (R1 selection).
 - Entry and gate config fully locked from R1 + R3.
 - LULD module: rebuilt, both sides, **independent** upper/lower thresholds (C2 deliverable).
   Starting point: `proximity_threshold_upper=proximity_threshold_lower=0.02`.
@@ -679,7 +679,7 @@ minimizing false exits on strong movers.
 ## Tasks
 
 - [ ] **T1 — Halt labeling**
-  Run halt detection (`detect_luld_halts()`) on all MDR≥200 events. Report: n_events with
+  Run halt detection (`detect_luld_halts()`) on all MDR≥150 events. Report: n_events with
   ≥1 halt, total halt count, halt distribution by session bucket (pre-market / RTH).
 
 - [ ] **T2 — Upper-band sweep**
@@ -759,7 +759,7 @@ open the test split exactly once.
 **Context:**
 - Config fully locked from R1–R4 selections. No parameter changes in R5.
 - **Production val sample (stratified, seed=42, scanner-confirmed, 1228 events) used here
-  for the first time.** The MDR≥200 diagnostic sample (R0–R4) was biased toward strong
+  for the first time.** The MDR≥150 diagnostic sample (R0–R4) was biased toward strong
   movers — expect some PF regression on the broader production sample.
 - **Test split opened exactly once, at the end of R5 T4, conditional on production-val pass.**
   If production val fails, test is not opened.
@@ -776,7 +776,7 @@ open the test split exactly once.
   Locked EPG-Rapid config (R1+R3+R4 selections) on production val.
 
 - [ ] **T3 — Confirmation analysis**
-  Production-val EPG-Rapid vs (a) its own MDR≥200 diagnostic results and (b) production-val
+  Production-val EPG-Rapid vs (a) its own MDR≥150 diagnostic results and (b) production-val
   baseline. Metrics: PF, CVaR5, n_trades, win%, mean_entry_lag, exit-reason distribution,
   halt-exposure table (RTH vs pre-market).
 
@@ -834,10 +834,10 @@ and given explicit approval. Test split is now spent.
 - **Selection authority:** every swept parameter selected by Cooper from presented data.
   Agents may not select winners.
 - **C-phases have no backtest runs.** If an agent attempts a backtest during C-phases (C2–C4), stop.
-- **MDR≥200 diagnostic sample (R0–R4):** 100 events randomly selected from `mom_pct ≥ 200`
+- **MDR≥150 diagnostic sample (R0–R4):** 100 events randomly selected from `mom_pct ≥ 150`
   AND `t_scanner_hit_sec IS NOT NULL`. Not stratified; biased toward strong movers. Every
   event has a confirmed scanner hit — no `no_scanner_hit` skips. Built in Part B; saved to
-  `data/val_mdr200_diagnostic.json`.
+  `data/val_mdr150_diagnostic.json`.
 - **Production val sample (R5):** stratified, seed=42, scanner-confirmed, 1228 events.
   First used in R5 T1.
 - **Test split:** one touch, terminal, R5 T4, conditional on production-val pass.
