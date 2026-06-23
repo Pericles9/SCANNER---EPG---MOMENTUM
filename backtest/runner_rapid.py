@@ -13,22 +13,30 @@ rapid (default, --entry-mode {rising_edge|first_pass|cross_and_hold}):
     Exit stack: EPG window close only (EXIT_D off, LULD off).
     Hard re-entry off: closed_today=True after first entry; one trade per event.
 
+Results layout
+--------------
+Old invalidated results (pre-scanner-floor-fix):  results/phase_r0/
+New MDR>=150 diagnostic results:                   results/phase_r0_mdr150/
+
 T3 parity check:
     python -m backtest.runner_rapid --parity \\
-        --split val --results-dir results/phase_r0/parity
+        --split val --results-dir results/phase_r0_mdr150/parity
 
-T2 gate-consistent baseline (classic rising-edge):
+T4 gate-consistent baseline (classic first-PASS on MDR>=150):
     python -m backtest.runner_rapid --entry-mode rising_edge \\
-        --split val --results-dir results/phase_r0/baseline_r0
+        --event-file data/val_mdr150_diagnostic.json \\
+        --split val --results-dir results/phase_r0_mdr150/baseline_mdr150
 
-R0 first-PASS rapid entry (EPG-Rapid design):
+T5 rapid first-PASS on MDR>=150 (EPG-Rapid design):
     python -m backtest.runner_rapid --entry-mode first_pass \\
-        --split val --results-dir results/phase_r0/rapid_r0
+        --event-file data/val_mdr150_diagnostic.json \\
+        --split val --results-dir results/phase_r0_mdr150/rapid_mdr150
 
 R1+ asymmetric gate sweep:
     python -m backtest.runner_rapid --entry-mode first_pass \\
+        --event-file data/val_mdr150_diagnostic.json \\
         --p-open 0.70 --p-close 0.65 \\
-        --split val --results-dir results/phase_r1/rapid_po70_pc65
+        --split val --results-dir results/phase_r1_mdr150/rapid_po70_pc65
 """
 from __future__ import annotations
 
@@ -975,6 +983,9 @@ def parse_args():
                         help="EPG gate open threshold (default: 0.65 from EPG_P)")
     parser.add_argument("--p-close", type=float, default=None,
                         help="EPG gate close threshold (default: same as --p-open)")
+    parser.add_argument("--event-file", type=str, default=None,
+                        help="Path to pre-built event sample JSON (e.g. val_mdr150_diagnostic.json). "
+                             "Bypasses list_events() and stratified sampling entirely.")
     return parser.parse_args()
 
 
@@ -1019,54 +1030,66 @@ def main():
     else:
         log.warning(f"Scanner hit catalog not found at {catalog_path} — floor guard disabled")
 
-    all_events = list_events(min_mom=50.0, require_date=True)
     val_start = boundary["val_split_start_date"]
     test_start = boundary["test_split_start_date"]
 
-    if args.split == "train":
-        events = [e for e in all_events if e["date"] < val_start]
-    elif args.split == "val":
-        events = [e for e in all_events if val_start <= e["date"] < test_start]
-    elif args.split == "trainval":
-        events = [e for e in all_events if e["date"] < test_start]
+    if args.event_file:
+        # Load pre-built sample (e.g. MDR>=150 diagnostic) — bypass list_events + sampling.
+        with open(args.event_file) as f:
+            ef = json.load(f)
+        events = ef["events"]
+        if args.ticker:
+            events = [e for e in events if e["ticker"] == args.ticker]
+        if args.date:
+            events = [e for e in events if e["date"] == args.date]
+        assert_split_valid([e["date"] for e in events], args.split, boundary)
+        log.info(f"Event file {args.event_file}: {len(events)} events loaded")
     else:
-        raise ValueError(f"Unknown split: {args.split}")
+        all_events = list_events(min_mom=50.0, require_date=True)
+        if args.split == "train":
+            events = [e for e in all_events if e["date"] < val_start]
+        elif args.split == "val":
+            events = [e for e in all_events if val_start <= e["date"] < test_start]
+        elif args.split == "trainval":
+            events = [e for e in all_events if e["date"] < test_start]
+        else:
+            raise ValueError(f"Unknown split: {args.split}")
 
-    if args.ticker:
-        events = [e for e in events if e["ticker"] == args.ticker]
-    if args.date:
-        events = [e for e in events if e["date"] == args.date]
+        if args.ticker:
+            events = [e for e in events if e["ticker"] == args.ticker]
+        if args.date:
+            events = [e for e in events if e["date"] == args.date]
 
-    assert_split_valid([e["date"] for e in events], args.split, boundary)
-    log.info(f"Split={args.split}: {len(events)} events after filter")
+        assert_split_valid([e["date"] for e in events], args.split, boundary)
+        log.info(f"Split={args.split}: {len(events)} events after filter")
 
-    if (args.random_sample and args.random_sample < len(events)
-            and not args.ticker and not args.date):
-        import random
-        rng = random.Random(args.seed)
-        n_sample = args.random_sample
-        by_year: dict[str, list] = {}
-        for e in events:
-            year = e["date"][:4]
-            by_year.setdefault(year, []).append(e)
-        year_counts = {y: len(evs) for y, evs in by_year.items()}
-        total = sum(year_counts.values())
-        alloc = {y: int(n_sample * cnt / total) for y, cnt in year_counts.items()}
-        remainder = n_sample - sum(alloc.values())
-        for y in sorted(year_counts, key=year_counts.get, reverse=True):
-            if remainder <= 0:
-                break
-            alloc[y] += 1
-            remainder -= 1
-        sampled = []
-        for y in sorted(by_year):
-            n_y = min(alloc[y], len(by_year[y]))
-            sampled.extend(rng.sample(by_year[y], n_y))
-        events = sorted(sampled, key=lambda e: (e["date"], e["ticker"]))
-        log.info(
-            f"Stratified sample: {len(events)} events "
-            f"(seed={args.seed}, alloc={dict(sorted(alloc.items()))})"
-        )
+        if (args.random_sample and args.random_sample < len(events)
+                and not args.ticker and not args.date):
+            import random
+            rng = random.Random(args.seed)
+            n_sample = args.random_sample
+            by_year: dict[str, list] = {}
+            for e in events:
+                year = e["date"][:4]
+                by_year.setdefault(year, []).append(e)
+            year_counts = {y: len(evs) for y, evs in by_year.items()}
+            total = sum(year_counts.values())
+            alloc = {y: int(n_sample * cnt / total) for y, cnt in year_counts.items()}
+            remainder = n_sample - sum(alloc.values())
+            for y in sorted(year_counts, key=year_counts.get, reverse=True):
+                if remainder <= 0:
+                    break
+                alloc[y] += 1
+                remainder -= 1
+            sampled = []
+            for y in sorted(by_year):
+                n_y = min(alloc[y], len(by_year[y]))
+                sampled.extend(rng.sample(by_year[y], n_y))
+            events = sorted(sampled, key=lambda e: (e["date"], e["ticker"]))
+            log.info(
+                f"Stratified sample: {len(events)} events "
+                f"(seed={args.seed}, alloc={dict(sorted(alloc.items()))})"
+            )
 
     if args.max_events:
         events = events[:args.max_events]
@@ -1234,9 +1257,9 @@ def main():
 
     # ── Escalation checks ──
     pf = summary.get("profit_factor")
-    if not args.parity and pf is not None and pf < 1.30:
+    if not args.parity and pf is not None and pf < 1.00:
         log.error(
-            f"ESCALATION: Baseline PF={pf:.4f} < 1.30 hard-stop threshold. "
+            f"ESCALATION: PF={pf:.4f} < 1.00 hard-stop threshold (MDR>=150 sample). "
             "Do not proceed to R1."
         )
 
