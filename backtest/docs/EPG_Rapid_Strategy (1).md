@@ -49,7 +49,7 @@ volume from 4am, news hits 7–9am ET, volume explodes, price runs 100–200%+ o
 | Gate threshold | `p_open`, `p_close` — **tuned in Phase R1** | Starting point 0.65/0.65 (original). Swept independently in R1. See §2.1. |
 | Gate role | Entry qualifier **and** exit driver | Entry requires gate PASS; exit fires on PASS→FAIL/INACTIVE. |
 | EXIT_D | **Disabled** | `exit_d.enabled=false`. Code retained, not evaluated. |
-| LULD proximity | Rebuilt module, both sides | Independent upper/lower thresholds (0.02/0.02 start). RTH only. Lower band re-enabled (no EXIT_D to pre-empt). Tuned in R4. See §5. |
+| LULD proximity | **Disabled** | Not in EPG-Rapid exit stack. `LuldProximityExit` retained unchanged for classic EPG runner only. |
 | EPG window close | Enabled | PASS→FAIL or PASS→INACTIVE. Primary exit. Timing determined by gate threshold from R1. |
 | Re-entry | Hard off | One entry per ticker per session. `closed_today=True` set at entry, before fill confirmation. |
 | Entry qualification | First PASS tick at or after `t_scanner_hit` | Hard scanner hit floor checked before gate state. No SF, no rising-edge, no `n_hold`. |
@@ -260,8 +260,7 @@ diagnostic sample** (100 events, randomly selected from events where `mom_pct �
 `t_scanner_hit_sec IS NOT NULL`, not top-ranked), configured to match EPG-Rapid exits.
 
 - Gate: `ParticipationGate`, original symmetric (`τ=300`, `p=0.65`, `warmup=300`).
-- EXIT_D: off. **LULD proximity:** rebuilt module, both sides, `proximity_threshold=0.02`
-  each. EPG window close: on.
+- EXIT_D: off. LULD: off. EPG window close: on.
 - Entry: **classic first-PASS** — first tick where `gate.state == PASS` at or after
   `t_scanner_hit`. Scanner floor active. No SF, no rising-edge, no `n_hold`.
 

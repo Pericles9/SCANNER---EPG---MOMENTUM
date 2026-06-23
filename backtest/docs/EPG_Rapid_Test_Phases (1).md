@@ -43,13 +43,13 @@ Phased validation for `epg_rapid`. All phases follow `Agent_Prompt_Standard.md` 
 | Phase | Type | Purpose | Sample | Full val? |
 |---|---|---|---|---|
 | C0 | Component | Scanner hit floor — pre-computed catalog + floor guard. **Complete.** | Unit tests + single-event verify | No |
-| C2 | Component | `LuldProximityExit` independent upper/lower + lower-enable flag | Unit tests | No |
+| C2 | Component | `LuldProximityExit` independent upper/lower + lower-enable flag | Unit tests | **DROPPED** |
 | C3 | Component | Halt-gap clock pause in Hawkes/gate replay | Unit tests | No |
 | C4 | Component | ROC 5-min buffer (per-ticker, partial-window, first-appearance) | Unit tests | No |
 | R0 | Integration | Rapid runner + MDR≥150 diagnostic baseline; entry lag distribution | MDR≥150 (100 events) | No |
 | R1 | Tuning | EPG gate threshold (`p_open` × `p_close`) — regime gate recalibration | MDR≥150 (100 events) | No |
 | R3 | Tuning | 5-min ROC gate threshold | MDR≥150 (100 events) | No |
-| R4 | Tuning | LULD halt-avoidance (two-sided, independent thresholds) | MDR≥150 (100 events) | No |
+| R4 | Tuning | LULD halt-avoidance (two-sided, independent thresholds) | MDR≥150 (100 events) | **DROPPED** |
 | R5 | Milestone | Integration + confirmation on production val sample | Production val (stratified, seed=42, scanner-confirmed) | **Yes** |
 
 Phases are strictly sequential. Each requires Cooper's explicit approval before the next begins.
@@ -362,7 +362,7 @@ the classic runner, and establish the gate-consistent baseline
 
 **Context:**
 
-- All C-phases approved (C2–C4). All component unit tests green.
+- C-phases approved (C3: halt-gap pause ✅, C4: RocBuffer ✅). All component unit tests green.
 - **Sample: MDR≥150 diagnostic sample** — 100 events randomly selected from the event
   catalog where `mom_pct ≥ 150` AND `t_scanner_hit_sec IS NOT NULL`. Not stratified; not
   top-ranked. Saved to `data/val_mdr150_diagnostic.json`. Every event has a confirmed
@@ -370,9 +370,8 @@ the classic runner, and establish the gate-consistent baseline
 - Scanner hit floor active (`scanner_floor=true`). `max_entry_lag_sec=null` in R0 (log only
   — Cooper sets the value after T7).
 - ROC gate disabled (`roc_min=None`). Gate threshold: 0.65/0.65 (starting point).
-- LULD: rebuilt module, both sides, starting thresholds (`proximity_threshold=0.02` each).
-  EXIT_D disabled.
-- Halt windows: `detect_luld_halts()` called per event; passed to replay.
+- Exit stack: EPG window close only. EXIT_D disabled. LULD not in EPG-Rapid exit stack.
+- Halt windows: `detect_luld_halts()` called per event; passed to replay (Hawkes decay only).
 - The classic runner path (`runner.py`) must not be modified.
 
 ---
@@ -400,9 +399,9 @@ the classic runner, and establish the gate-consistent baseline
 
 - [ ] **T4 — Baseline runner (classic first-PASS on MDR≥150)**
   Classic first-PASS entry (first `gate.state == PASS` tick at or after `t_scanner_hit`),
-  EPG-Rapid exit stack (LULD both sides on at starting thresholds, EXIT_D off, EPG close
-  on). MDR≥150 sample. Write `results/phase_r0/baseline_metrics.json`. PF result IS the
-  MDR≥150 baseline — the comparator for R1–R4.
+  EPG-Rapid exit stack (EXIT_D off, LULD off, EPG close on). MDR≥150 sample. Write
+  `results/phase_r0/baseline_metrics.json`. PF result IS the MDR≥150 baseline — the
+  comparator for R1–R3.
   - [ ] T4a — Post PF, n_trades, CVaR5, exit-reason breakdown.
 
 - [ ] **T5 — Rapid runner first-PASS on MDR≥150**
@@ -845,9 +844,8 @@ and given explicit approval. Test split is now spent.
   `t_scanner_hit_sec`. `entry_lag_from_scanner_sec` always ≥ 0 by construction. Pre-fix
   R0/R1 results are invalidated — see `results/phase_r0/INVALIDATED.md` and
   `results/phase_r1/INVALIDATED.md`.
-- **LULD:** rebuilt module (Phase LULD-REBUILD), both sides, active in R0–R5. Starting
-  thresholds `proximity_threshold_upper=proximity_threshold_lower=0.02`. Tuned in R4.
+- **LULD:** not in EPG-Rapid exit stack (dropped). `LuldProximityExit` retained unchanged
+  for classic EPG runner only. C2 and R4 dropped.
 - **Charts:** Panel 3 = Setup filter `q_tilde` trajectory, 0.65 threshold line,
-  entry-eligible bars shaded green, throughout all R phases. R4 T5 adds LULD fire markers
-  to Panel 1.
+  entry-eligible bars shaded green, throughout all R phases.
 - **`results/phase_*/summary.md`** is a required output at every phase completion.
