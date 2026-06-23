@@ -587,6 +587,12 @@ def _process_event_rapid(args: dict) -> dict:
                 prev_state = cur
                 continue
 
+            # max_entry_lag_sec filter: once lag exceeded, no entry is possible
+            max_lag = args.get("max_entry_lag_sec")
+            if (max_lag is not None and scanner_hit_t_sec is not None
+                    and td.t_sec[i] - scanner_hit_t_sec > max_lag):
+                break
+
             if prev_state == GateState.PASS and cur != GateState.PASS:
                 n_passtofail += 1
                 if pass_window_start_sec is not None:
@@ -986,6 +992,9 @@ def parse_args():
     parser.add_argument("--event-file", type=str, default=None,
                         help="Path to pre-built event sample JSON (e.g. val_mdr150_diagnostic.json). "
                              "Bypasses list_events() and stratified sampling entirely.")
+    parser.add_argument("--max-entry-lag-sec", type=float, default=None,
+                        help="Hard per-event filter: skip entry if t_entry - t_scanner_hit > this value. "
+                             "None = disabled (R0 log-only mode). Set by Cooper after R0 T7.")
     return parser.parse_args()
 
 
@@ -1169,6 +1178,8 @@ def main():
             # Scanner hit floor
             "scanner_hit_ts_ns": catalog_rec.get("scanner_hit_ts_ns") if catalog_rec else None,
             "scanner_hit_in_catalog": catalog_rec is not None,
+            # Entry lag filter (None = disabled, set by Cooper after R0 T7)
+            "max_entry_lag_sec": args.max_entry_lag_sec,
         }
         work_items.append(item)
 
@@ -1242,6 +1253,8 @@ def main():
         "p_close": (args.p_close if args.p_close is not None
                     else (args.p_open if args.p_open is not None else EPG_P)),
         "roc_min": args.roc_min,
+        "max_entry_lag_sec": args.max_entry_lag_sec,
+        "event_file": args.event_file,
         "n_events_sampled": len(events),
         "seed": args.seed,
         "split": args.split,
