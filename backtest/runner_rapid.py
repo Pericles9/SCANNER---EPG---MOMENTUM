@@ -548,7 +548,16 @@ def _process_event_rapid(args: dict) -> dict:
                 t_event_idx = i
                 t_event_sec = td.t_sec[i]
             dv = float(td.prices[i]) * float(td.sizes[i])
-            epg_states[i] = gate.update(dv, td.t_sec[i])
+            # T6b fix: apply halt dt-substitution to gate λ_V (spec §6 requires gate pauses across halts)
+            gate_t_sec = td.t_sec[i]
+            if i > 0 and halt_intervals:
+                _dt = td.t_sec[i] - td.t_sec[i - 1]
+                if _dt > HALT_GAP_THRESHOLD:
+                    for _hs, _he in halt_intervals:
+                        if td.t_sec[i - 1] < _he and td.t_sec[i] > _hs:
+                            gate_t_sec = td.t_sec[i - 1] + 1e-6
+                            break
+            epg_states[i] = gate.update(dv, gate_t_sec)
             if (scanner_hit_t_sec is not None and gate_at_scanner_hit is None
                     and td.t_sec[i] >= scanner_hit_t_sec):
                 gate_at_scanner_hit = epg_states[i].name
@@ -588,9 +597,13 @@ def _process_event_rapid(args: dict) -> dict:
                 continue
 
             # max_entry_lag_sec filter: once lag exceeded, no entry is possible
+            # T4e fix: only break when flat. Breaking while in_position would
+            # terminate exit monitoring of an open position, force-booking
+            # session_end at end-of-data instead of the gate-driven exit.
             max_lag = args.get("max_entry_lag_sec")
             if (max_lag is not None and scanner_hit_t_sec is not None
-                    and td.t_sec[i] - scanner_hit_t_sec > max_lag):
+                    and td.t_sec[i] - scanner_hit_t_sec > max_lag
+                    and not in_position):
                 break
 
             if prev_state == GateState.PASS and cur != GateState.PASS:
