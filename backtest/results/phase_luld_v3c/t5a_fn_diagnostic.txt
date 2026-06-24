@@ -1,0 +1,39 @@
+Recall vs pre-onset lead width (dur=6s, 32 halts)
+
+   lead_s  tp  fn  recall    fp  fp_rate
+       15   8  24  0.2500   134   0.9437
+       30   9  23  0.2812   132   0.9296
+       60   9  23  0.2812   132   0.9296
+      120   9  23  0.2812   131   0.9225
+      300  10  22  0.3125   128   0.9014
+
+Per-halt nearest-fire offset to limit-state window [onset, seg_end] (dur=6):
+  ticker onset_off note                        
+  FBYDW         -- no fires in entire event
+  XBP           -- no fires in entire event
+  XBP           -- no fires in entire event
+  MNPR        1762 fire 1762s after seg_end (genuine no-fire near halt)
+  MNPR          -2 approach fire 2s before onset
+  MNPR        -543 approach fire 543s before onset (genuine no-fire near halt)
+  IVP       442229 fire 442229s after seg_end (genuine no-fire near halt)
+  IVP       441698 fire 441698s after seg_end (genuine no-fire near halt)
+  ODVWZ         -- no fires in entire event
+  ODVWZ         -- no fires in entire event
+  LIDR     -414929 approach fire 414929s before onset (genuine no-fire near halt)
+  GRI          -24 approach fire 24s before onset
+  CETY          -9 approach fire 9s before onset
+  MLGO        2249 fire 2249s after seg_end (genuine no-fire near halt)
+  MLGO        1640 fire 1640s after seg_end (genuine no-fire near halt)
+  BCG        94384 fire 94384s after seg_end (genuine no-fire near halt)
+  BCG        88273 fire 88273s after seg_end (genuine no-fire near halt)
+  EDBL          -- no fires in entire event
+  BNED        1233 fire 1233s after seg_end (genuine no-fire near halt)
+  BNED         795 fire 795s after seg_end (genuine no-fire near halt)
+  BNED        -182 approach fire 182s before onset
+  BNED       -1309 approach fire 1309s before onset (genuine no-fire near halt)
+  BNED       -1989 approach fire 1989s before onset (genuine no-fire near halt)
+  JL        433077 fire 433077s after seg_end (genuine no-fire near halt)
+  PHUN        1436 fire 1436s after seg_end (genuine no-fire near halt)
+  JWEL      458403 fire 458403s after seg_end (genuine no-fire near halt)
+
+  Halts with no fire within 300s of the window: 22

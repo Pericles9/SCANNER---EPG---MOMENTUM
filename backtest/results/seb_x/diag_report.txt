@@ -1,0 +1,50 @@
+Phase SEB-X -- Path Diagnostics (Gate B)
+============================================================
+
+Universe
+  total entries:   990
+  runners (MFE30>=5%): 622 (62.8%)
+  losers:          368
+
+Per-event sigma (primary ATR, in price units)
+  sigma percentiles:
+     p10     p25     p50     p75     p90     p95
+  0.4433  0.4433  0.4433  0.4433  0.4433  0.4433
+  vol-regime split threshold (median): 0.44333
+
+--- Gate B: R1 sweep center ---
+Winners' pre-MFE MAE in sigma-units (how deep winners dip before peak)
+  (p50=tolerate, p90-p95=hard floor center):
+     p50     p75     p90     p95
+  0.0640  0.1215  0.2046  0.2625
+  => R1 k1 sweep center: p90-p95 of this distribution
+     Keep k1 ABOVE p90 to avoid cutting 90% of winners early.
+
+--- Gate B: R2 sweep center ---
+Time-to-MFE(30m) for WINNERS (bars from entry to peak)
+  winners:
+     p10     p25     p50     p75     p90
+  2.0000  6.0000  13.0000  23.0000  29.0000
+Time-to-MFE(30m) for LOSERS
+  losers:
+     p10     p25     p50     p75     p90
+  1.0000  1.0000  2.0000  6.0000  17.0000
+  => T_dead should be < p50 of winners' time-to-MFE (don't kill running winners).
+     Center sweep on p25-p50 of losers' time where they haven't moved.
+
+--- Gate B: R3 sweep center ---
+Give-back from 30m peak to 45m low (runners only, in sigma-units)
+  (p25=tight trail, p75=loose trail):
+     p25     p50     p75     p90     p95
+  0.6311  1.4211  3.1128  6.7895  13.3759
+  => R3 g (give-back) sweep center: p25-p50 of this distribution.
+     Tighter captures more, but whips winners prematurely.
+
+--- Early direction (sigma-units at bar 1 from entry) ---
+  Winners bar-1 close vs entry:
+     p10     p25     p50     p75     p90     p95
+  -0.2819  -0.0677  0.0226  0.2451  0.8560  1.4884
+  Losers  bar-1 close vs entry:
+     p10     p25     p50     p75     p90     p95
+  -0.7893  -0.2410  -0.0501  0.0113  0.2092  0.4485
+  => Winners establish +sigma direction faster; losers drift flat/negative.
