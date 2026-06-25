@@ -418,6 +418,7 @@ def _process_event_rapid(args: dict) -> dict:
     entry_mode = args.get("entry_mode", "cross_and_hold")
     n_hold = args.get("n_hold", 3)
     roc_min = args.get("roc_min", None)
+    t_gate_sec = args.get("t_gate_sec", None)  # R1.5 time gate (None = disabled)
     gap_gate_enabled = args.get("gap_gate_enabled", False)
     gap_threshold = args.get("gap_threshold", 0.30)
     epg_cfg = args.get("epg_cfg", {})
@@ -576,6 +577,7 @@ def _process_event_rapid(args: dict) -> dict:
         trades = []
         in_position = False
         closed_today = False
+        t_gate_checked: bool = False   # time gate: fired once, then disabled
         entry_idx = None
         entry_price = None
         entry_t_sec = None
@@ -660,6 +662,52 @@ def _process_event_rapid(args: dict) -> dict:
                     closed_today = True  # hard re-entry off
 
             elif in_position:
+                # Time-gate exit (R1.5): single check at T_gate seconds since entry.
+                # If open P&L < 0 at or after T_gate, cut the position.
+                # Once checked (win or lose), this branch never runs again for this trade.
+                if (t_gate_sec is not None
+                        and not t_gate_checked
+                        and (td.t_sec[i] - entry_t_sec) >= t_gate_sec):
+                    t_gate_checked = True
+                    open_pnl = (float(td.prices[i]) - entry_price) / entry_price
+                    if open_pnl < 0.0:
+                        exit_price = float(td.prices[i])
+                        exit_t_sec = td.t_sec[i]
+                        pnl_pct = (exit_price - entry_price) / entry_price * 100.0
+                        tod_sec = float(
+                            td.timestamps[entry_idx] - session_start_ns
+                        ) / NS_PER_SECOND
+                        trades.append({
+                            "ticker": ticker, "date": date,
+                            "event_idx": event_idx,
+                            "trade_seq": len(trades),
+                            "entry_idx": entry_idx, "exit_idx": i,
+                            "entry_ts": int(td.timestamps[entry_idx]),
+                            "exit_ts": int(td.timestamps[i]),
+                            "entry_t_sec": float(entry_t_sec),
+                            "exit_t_sec": float(exit_t_sec),
+                            "hold_sec": float(exit_t_sec - entry_t_sec),
+                            "entry_lag_sec": float(entry_t_sec - t_event_sec),
+                            "entry_lag_from_scanner_sec": (
+                                float(entry_t_sec - scanner_hit_t_sec)
+                                if scanner_hit_t_sec is not None else None
+                            ),
+                            "entry_price": float(entry_price),
+                            "exit_price": float(exit_price),
+                            "pnl_pct": float(pnl_pct),
+                            "intraday_pct_at_entry": float(intraday_pct_at_entry),
+                            "prev_close": float(prev_close),
+                            "time_of_day_sec": float(tod_sec),
+                            "session_bucket": session_bucket(tod_sec),
+                            "exit_reason": "time_gate",
+                            "n_halt_windows": len(halt_intervals),
+                        })
+                        in_position = False
+                        entry_idx = entry_price = entry_t_sec = None
+                        intraday_pct_at_entry = None
+                        prev_state = cur
+                        break
+
                 # EPG window close: PASS → not-PASS
                 if prev_state == GateState.PASS and cur != GateState.PASS:
                     exit_price = float(td.prices[min(i + 1, N - 1)])
@@ -1008,6 +1056,9 @@ def parse_args():
     parser.add_argument("--max-entry-lag-sec", type=float, default=None,
                         help="Hard per-event filter: skip entry if t_entry - t_scanner_hit > this value. "
                              "None = disabled (R0 log-only mode). Set by Cooper after R0 T7.")
+    parser.add_argument("--t-gate-sec", type=float, default=None,
+                        help="R1.5 time gate: single check at T_gate seconds since entry; "
+                             "if open P&L < 0, exit (reason 'time_gate'). None = disabled.")
     return parser.parse_args()
 
 
@@ -1193,6 +1244,8 @@ def main():
             "scanner_hit_in_catalog": catalog_rec is not None,
             # Entry lag filter (None = disabled, set by Cooper after R0 T7)
             "max_entry_lag_sec": args.max_entry_lag_sec,
+            # R1.5 time gate (None = disabled)
+            "t_gate_sec": args.t_gate_sec,
         }
         work_items.append(item)
 
@@ -1267,6 +1320,7 @@ def main():
                     else (args.p_open if args.p_open is not None else EPG_P)),
         "roc_min": args.roc_min,
         "max_entry_lag_sec": args.max_entry_lag_sec,
+        "t_gate_sec": args.t_gate_sec,
         "event_file": args.event_file,
         "n_events_sampled": len(events),
         "seed": args.seed,
