@@ -4,7 +4,7 @@ Priority chain:
   1. DuckDB `daily_bars` table (currently empty — placeholder for future ingest)
   2. data/daily/{TICKER}_daily.parquet — most recent close strictly before the event date
   3. trades.parquet of a prior event-day directory for the same ticker — last trade
-     before 20:00 ET on the prior trading day
+     before 16:00 ET (RTH close) on the prior trading day
   4. Returns None if all sources fail.
 
 Caller is responsible for caching: each lookup hits disk. Cache the result per
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 _DAILY_DIR = DATA_ROOT / "daily"
 _DUCKDB_PATH = DATA_ROOT / "duckdb" / "main.duckdb"
-_RTH_CLOSE_HOUR_ET = 20  # 8 PM ET — use this as the cutoff for "prior session close"
+_RTH_CLOSE_HOUR_ET = 16  # 4 PM ET — RTH close cutoff for prior session price
 
 
 def _try_duckdb_daily_bars(ticker: str, date: str) -> Optional[float]:
@@ -94,10 +94,10 @@ def _try_daily_parquet(ticker: str, date: str) -> Optional[float]:
 
 
 def _try_prior_trades_parquet(ticker: str, date: str) -> Optional[float]:
-    """Priority 3: last trade in a prior event-day trades.parquet, before 20:00 ET on T-1.
+    """Priority 3: last trade in a prior event-day trades.parquet, before 16:00 ET on T-1.
 
     Scans `filtered/{TICKER}_*/` for prior dates, takes the most recent, and returns the
-    last trade price strictly before 20:00 ET on the prior session.
+    last trade price strictly before 16:00 ET (RTH close) on the prior session.
     """
     if not FILTERED_DIR.exists():
         return None
@@ -139,7 +139,7 @@ def _try_prior_trades_parquet(ticker: str, date: str) -> Optional[float]:
                 et_offset_ns = 4 * 3600 * NS_PER_SECOND
             else:
                 et_offset_ns = 5 * 3600 * NS_PER_SECOND
-            cutoff_ns = midnight_utc + 20 * 3600 * NS_PER_SECOND + et_offset_ns
+            cutoff_ns = midnight_utc + 16 * 3600 * NS_PER_SECOND + et_offset_ns
 
             table = pq.read_table(
                 str(trades_path),
