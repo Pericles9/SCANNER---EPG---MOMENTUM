@@ -1,3 +1,4 @@
+<!-- fullWidth: false tocVisible: false tableWrap: true -->
 ---
 tags:
   - type/strategy
@@ -11,344 +12,285 @@ parent_strategy: epg
 strategy_id: epg_rapid
 ---
 
-# EPG-Rapid — Strategy Outline
-
-**Status:** Proposal — pending backtest validation (see `EPG_Rapid_Test_Phases.md`)
-**Strategy id:** `epg_rapid`
-**Parent:** `epg` (shares live infrastructure, gate code, exit code)
-
-**Related documents:**
-- `LULD_Halt_Architecture.md` — full regulatory mechanics of the rebuilt LULD module
-- `Phase_LULD_REBUILD.md` — the rebuild's own agent prompt and original (upper-only) sweep
+# 
 
 ---
 
-## 1. Thesis
+tags:
 
-Classic EPG enters on the first EPG `FAIL→PASS` rising edge after a 300s warmup. On a
-pre-market dead-to-live gap event, that timing is too slow — by the time the gate opens,
-the best part of the move is often gone.
+- type/strategy
+- domain/backtest
+- domain/hawkes
+- domain/microstructure
+- project/scanner-epg-momentum
+- status/in-progress created: 2026-06-18 updated: 2026-06-30 parent_strategy: epg strategy_id: epg_rapid
+
+---
+
+# EPG-Rapid — Strategy Outline
+
+**Status:** In progress — gate threshold (R1) and entry/exit mechanism (R2/R3) phases complete or superseded; blocked on data-quality + sparse-warmup decision before R1-Final. See §11 and §12. **Strategy id:** `epg_rapid` **Parent:** `epg` (shares live infrastructure, gate code, exit code)
+
+**Related documents:**
+
+- `LULD_Halt_Architecture.md` — full regulatory mechanics of the rebuilt LULD module (historical reference — LULD is not currently in the EPG-Rapid exit stack, see §5)
+- `Phase_LULD_REBUILD.md` — the rebuild's own agent prompt and original (upper-only) sweep
+- 2026-06-30 context handoff — sparse-warmup problem, data-quality findings, the source for most of the updates in this revision
+
+> **2026-06-30 revision note:** This document was last fully accurate as of 2026-06-18. Since then, R2 (setup-filter entry) and R3 (ROC gate) both resolved negative and their mechanisms were removed; LULD was dropped from the exit stack; a time-gate exit was added outside the original phase plan; and a structural sparse-warmup problem was found that blocks R1-Final. This revision updates every section to match. Items I could not independently verify (I don't have repo access — these are reported from Cooper's own handoff doc) are marked **\[CONFIRM\]**.
+
+---
+
+## 1\. Thesis
+
+Classic EPG enters on the first EPG `FAIL→PASS` rising edge after a 300s warmup. On a pre-market dead-to-live gap event, that timing is too slow — by the time the gate opens, the best part of the move is often gone.
 
 EPG-Rapid keeps the **validated exit machinery** and replaces only the **entry**:
 
-- **Entry:** fire on the **first tick at or after `t_scanner_hit`** where `gate.state == PASS`. The scanner hit timestamp is a hard floor — no tick before it is eligible regardless of gate state. In the majority of events the gate is already PASS at scanner hit (warmed on pre-event history), so entry fires within seconds. No rising-edge requirement. No SF involvement of any kind.
-- **Exit:** EPG window close (primary). EXIT_D off. LULD proximity (rebuilt module, both sides, RTH only) active — halt avoidance. Tuned in R4. See §5.
+- **Entry:** fire on the first EPG gate PASS tick at or after scanner hit. See §3 — this has changed from the original cross-and-hold design.
+- **Exit:** time gate → EPG window close → session end. See §4 — LULD and EXIT_D are both out of the current stack.
 - **Re-entry:** hard off. One trade per ticker per session.
 
-The target event is the **dead-tape-to-burst transition**: a stock trading on near-zero
-volume from 4am, news hits 7–9am ET, volume explodes, price runs 100–200%+ over the next
-1–2 hours. The scanner fires at `todaysChangePerc ≥ 30%`.
+The target event is the **dead-tape-to-burst transition**: a stock trading on near-zero volume from 4am, news hits 7–9am ET, volume explodes, price runs 100–200%+ over the next 1–2 hours. The scanner fires at `todaysChangePerc ≥ 30%`.
+
+### 1.1 A known prior risk this design had to confront
+
+**Classic EPG's first entry has no setup-filter gate at all** — it is rising-edge only. This was tested and locked. Phase EPG-OPT2-SF gated classic-EPG first entry on current-bar SF qualification and found it **net-negative**: mean ΔPF = −0.085, 47 of 52 top-decile configs degraded. Reason: *"The filter blocks the early-impulse entries that carry this strategy's alpha."*
+
+EPG-Rapid originally bet that the SF-based admission check would behave differently here because it was solving the opposite problem (rising-edge being too *slow*, not too fast). **That bet did not pay off — see §1.3.**
+
+### 1.2 Open structural problem: the strategy may not be trading its own target event
+
+A sparse-warmup problem (full writeup in §11) means the EPG gate cannot reach PASS within the entry window for true first-appearance, no-pre-tape gap-ups — exactly the dead-tape-to-burst events this strategy was built for. The \~24 events (of \~95 on the current val sample) that currently trade well are **gradual risers**: stocks already actively trading and climbing for hours before crossing 30%, not stocks that jumped from silence. This is not a tuning problem, it's a property of the entry mechanism's dependency on pre-existing tape. **Cooper's current lean is Path A** — narrow scope to the gradual-riser universe explicitly, rather than try to re-architect entry to recover sparse events. This is not yet locked; see §11 for the decision record and §12 for what has to happen first (data-quality validation).
+
+### 1.3 Setup-filter cross-and-hold — tested, removed
+
+R2 tested SF-based cross-and-hold admission (§3.2's original design, kept below for the record). The mechanism was removed from the live entry path; the current rapid runner uses plain `first_pass` entry with no SF precondition. This is consistent with the §1.1 prior — SF admission, even retuned for speed, ended up costing the same kind of early-impulse entries that classic EPG's EPG-OPT2-SF phase found. **\[CONFIRM\]** — I don't have the actual R2 sweep table in context; if you want the specific PF deltas logged here for the audit trail, point me at `results/phase_r2/summary.md` and I'll fold it in.
 
 ---
 
-## 2. Locked Decisions
+## 2\. Locked / Current Decisions
 
-| Decision | Choice | Notes |
-|---|---|---|
-| Gate | `ParticipationGate` — **original symmetric** | `half_life_seconds=300`, `warmup_seconds=300`. No asymmetric hysteresis, no peak cooling. **Not** SlopeGate. Architecture locked; threshold tuned in R1. |
-| Gate threshold | `p_open`, `p_close` — **tuned in Phase R1** | Starting point 0.65/0.65 (original). Swept independently in R1. See §2.1. |
-| Gate role | Entry qualifier **and** exit driver | Entry requires gate PASS; exit fires on PASS→FAIL/INACTIVE. |
-| EXIT_D | **Disabled** | `exit_d.enabled=false`. Code retained, not evaluated. |
-| LULD proximity | **Disabled** | Not in EPG-Rapid exit stack. `LuldProximityExit` retained unchanged for classic EPG runner only. |
-| EPG window close | Enabled | PASS→FAIL or PASS→INACTIVE. Primary exit. Timing determined by gate threshold from R1. |
-| Re-entry | Hard off | One entry per ticker per session. `closed_today=True` set at entry, before fill confirmation. |
-| Entry qualification | First PASS tick at or after `t_scanner_hit` | Hard scanner hit floor checked before gate state. No SF, no rising-edge, no `n_hold`. |
-| ROC gate | 5-minute ROC | `roc_5m ≥ threshold`. Threshold tuned 5–25% (Phase R3). |
-| Scanner heat / quartile | **Void** | Computed and stored as analysis fields only. No gate. Legacy Q3/Q4 filter is not applied. |
-| Halt handling | Pause decay clocks across halt gaps | Hawkes EMA and gate `λ_V` do not decay across detected halt windows. See §6. |
-| Baseline | Classic EPG on MDR≥150 diagnostic sample (first-PASS, same exit stack) | Scanner floor active. See §7. |
-| Test split | Untouched | Opened once at the very end of the full pipeline. Not in any phase. |
-
----
-
-### 2.1 EPG Gate Threshold — The Regime Gate Problem
-
-The `ParticipationGate` threshold (`p_open`, `p_close`) was calibrated at 0.65/0.65 for
-the classic EPG stack: rising-edge entry, EXIT_D providing downside protection. In that
-context the gate was a **regime detector** — is buy-side intensity high enough to justify
-holding a position? EXIT_D owned the exit signal.
-
-**EPG-Rapid changes the gate's role.** EXIT_D is gone. The gate now drives the primary
-exit directly via PASS→FAIL. This means the original 0.65 calibration was done under
-conditions that no longer apply, and recalibration is warranted.
-
-What the threshold controls in EPG-Rapid:
-- `p_open`: how high WJI must be to declare the regime active. Affects entry.
-- `p_close`: how low WJI must fall before declaring the regime exhausted. **Directly
-  controls exit timing.** With EXIT_D absent, a p_close that's too low lets losers run;
-  one that's too high chops out of good trades on noise.
-
-The sweep (Phase R1) starts with **symmetric** arms (`p_open = p_close`), then evaluates
-**asymmetric** combinations. Key diagnostic: average PASS→FAIL transitions per trade
-(gate chatter) and exit-reason distribution. Cooper selects; agent presents data only.
-
-`max_entry_lag_sec` (Phase R1 starting point 180s): maximum allowed seconds from scanner
-hit to entry. Applied per-event as a hard filter in R1 — events where
-`t_entry − t_scanner_hit > max_entry_lag_sec` are excluded from scoring. R0 logs the lag
-distribution; Cooper sets the value before R1 begins.
+| Decision                       | Choice                                                                 | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Gate                           | `ParticipationGate` (`EPGClassicGate`) — peak mode, symmetric          | `half_life_seconds=300`, `warmup_seconds=300`. `tau_peak`/`C` confirmed **inert** in peak mode (verified directly against `gate.py`, 2026-06-30) — they only matter in the unused WJI-v2 `"background"` branch. Peak cooling disabled (`m_cool_sec` not passed → 0.0, no decay).                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Gate threshold                 | `p_open = p_close` — **R1-Fixed sweep done, final selection NOT yet made** | Swept 0.50–0.75 on `val_r3_stratified.json` with T_gate=500 fixed (table in §2.1). R1-Final is blocked behind the data-quality phase (§12) — do not lock a value before that runs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Gate role                      | Entry qualifier **and** primary exit driver                            | Entry requires gate PASS; exit fires on PASS→FAIL/INACTIVE via EPG window close.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| EXIT_D                         | **Disabled**                                                           | Code retained, not evaluated. Unchanged from original design.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Time gate (`T_gate`)           | **Added — not in original plan**                                       | One-shot check at `T_gate=500s` since entry: if open P&L < 0, cut. Fires once, then disabled. `T_gate=500` selected as working value (improves PF and CVaR5 vs no-gate on the diagnostic sample). This effectively replaced LULD as the "stop the bleeding" mechanism — see §4. Verified in source, commit `0409332`. Should retroactively get a phase number for the audit trail — proposing **R1.5** per project convention (R0, R1, R1.5, R3...).                                                                                                                                                                                                                                       |
+| LULD proximity                 | **Dropped from the EPG-Rapid exit stack entirely**                     | Was "enabled, both sides, R4-tuned" in the original plan. Per the 2026-06-30 handoff this is no longer in the runner's exit stack at all. **\[CONFIRM\]** — I don't have a phase record (no R4 run, no FIX-X commit) tying this to an explicit decision. Worth confirming whether this was a deliberate call (e.g., RTH-only coverage wasn't worth it once the time gate existed) or fell out as a side effect of other rapid-runner work. If deliberate, log the reasoning here and retire §5 below or mark it formally superseded. If accidental, this needs its own look — losing halt-avoidance coverage on RTH portions of trades is a real risk-management gap, not a free simplification. |
+| EPG window close               | Enabled                                                                | PASS→FAIL or PASS→INACTIVE. Across all runs, 50–80% of exits are EPG window close regardless of other mechanisms — this remains the binding exit constraint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Re-entry                       | Hard off                                                               | One entry per ticker per session. `closed_today=True` set at entry.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Entry qualification            | **`first_pass`** — first EPG gate PASS tick at or after scanner hit    | No rising-edge requirement. No setup-filter precondition (removed, §1.3). No ROC precondition (disabled, below). Entry deadline `max_entry_lag_sec=300` — abandon if no PASS within 300s of scanner hit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ROC gate                       | **Disabled, permanently**                                              | R3 found it anti-selective: corr(roc_5m, pnl) = −0.431 across thresholds — blocked events outperformed admitted ones. Do not re-enable without new evidence overturning this.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Scanner heat / quartile        | Void as a gate — analysis fields only                                  | Q3/Q4 heat environments significantly outperform Q1/Q2; rank-1-on-scanner systematically underperforms regardless of heat. Confirmed not a thin-day artifact. No gate applied.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Halt handling                  | Pause decay clocks across halt gaps                                    | Hawkes EMA and gate `λ_V` do not decay across detected halt windows. T6b fix verified in source — `dt`-substitution applied at halt-window crossings.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Sparse-warmup / universe scope | **Open — current lean Path A**                                         | See §11. Blocking decision, pending §12.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Data quality                   | **Open — blocking**                                                    | See §12. Dirty tick data found in some events post-R1-Fixed; severity/concentration not yet characterized. Next phase.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Baseline                       | Best validated EPG on val sample, **same exit stack as current EPG-Rapid** | §7's original baseline assumed LULD-on. Needs re-running against the actual current stack (time gate + EPG window close + session end, no LULD) once that's confirmed locked — see the LULD `[CONFIRM]` row above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Test split                     | Untouched                                                              | Opened once at the very end of the full pipeline. Nowhere near that point.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ---
 
+### 2.1 EPG Gate Threshold — R1-Fixed Results (not yet selected)
+
+Corrected R1-Fixed sweep, `val_r3_stratified.json` (95–97 events, seed=42, stratified 50/27/20 low/mid/high gap), `p_open = p_close`, T_gate=500 fixed:
+
+| p    | n_trades | PF   | WR%  | mean PnL | CVaR5  |
+| ---- | -------- | ---- | ---- | -------- | ------ |
+| 0.50 | 25       | 1.24 | 48.0 | 0.80     | −17.50 |
+| 0.55 | 25       | 1.44 | 52.0 | 1.41     | −20.36 |
+| 0.60 | 25       | 1.61 | 52.0 | 1.99     | −17.50 |
+| 0.65 | 24       | 1.43 | 41.7 | 1.15     | −17.50 |
+| 0.70 | 24       | 1.26 | 37.5 | 0.59     | −8.42  |
+| 0.75 | 24       | 1.79 | 50.0 | 1.63     | −8.27  |
+
+CVaR5 clears the −15% floor comfortably at p=0.70/0.75 (best −8.27%) — a real improvement from the `prev_close` fix and the time gate. PF is materially lower than the old (retired, contaminated) MDR≥200 sample's best \~3.9 — expected, since that sample was best-case 200%+ movers only. n_trades=24 at p=0.65 triggered the escalation against the prior sample's 28-trade floor, but that floor came from the retired sample — the real read is "the strategy currently catches \~24–25 of \~95 events," which is the §11 problem expressed as a trade count, not a regression.
+
+**What controls what:**
+
+- `p_open` — how high participation must be to declare the regime active (entry).
+- `p_close` — how low it must fall before declaring exhaustion (exit timing). With EXIT_D absent, too-low lets losers run; too-high chops out of good trades on noise.
+
+R1-Final selection of `p_open`/`p_close` is deferred until the data-quality phase (§12) confirms these numbers aren't contaminated by dirty ticks.
+
 ---
 
-## 3. Entry Stack
+## 3\. Entry Stack (current)
 
 ```
-Scanner hit  (todaysChangePerc ≥ 30%; pre-computed in scanner_hit_catalog.json)
+Scanner hit (todaysChangePerc ≥ 30%)
     ↓
-ROC gate  roc_5m = pct_change_now − pct_change_5min_ago ≥ roc_min
+EPG gate evaluated — PASS check on each live tick
+  (if WARMUP/INACTIVE at scanner hit, wait for first live PASS tick)
     ↓
-Context fetch + historical replay
-    ├─ Hawkes engine: warmed from 4am, halt-gap dt=0 substitution active
-    └─ ParticipationGate: replayed through full pre-event history
+First PASS tick at or after scanner hit → ENTRY (entry_mode = first_pass)
+  No rising-edge requirement.
+  No setup-filter precondition (§3.2 — removed).
+  No ROC precondition (§3.1 — disabled).
     ↓
-Entry loop — first tick at or after t_scanner_hit where BOTH conditions hold:
-    ├─ [FLOOR]  t_sec ≥ t_scanner_hit          (hard floor — always checked first)
-    └─ [GATE]   gate.state == PASS
+Entry deadline: max_entry_lag_sec = 300s.
+  No valid entry within 300s of scanner hit → event abandoned.
     ↓
-ENTRY  →  closed_today = True  (no re-entry)
+closed_today = True   (no re-entry this session)
+
 ```
 
-*Note:* ROC gate checked on the pre-computed snapshot, before the replay. Scanner hit floor (`t_sec ≥ t_scanner_hit`) is always the first guard inside the entry loop; context fetch does not depend on it.
+The bimodal entry lag (median \~0s, mean \~58s on the earlier sample) is the expected `first_pass` distribution given gate state at scanner hit, not a bug.
 
-### 3.0 Scanner Hit Floor
+### 3.1 ROC Gate (5-minute) — DISABLED
 
-`t_scanner_hit_sec` is the timestamp when `todaysChangePerc ≥ 30%` was first satisfied,
-read from `scanner_hit_catalog.json`. Events with no confirmed scanner hit in the catalog
-are skipped (`reason=no_scanner_hit`).
+> Kept for the record. **Not active.**
 
-The gate is replayed through all pre-event history from 4:00am, so it is already warm —
-and often in PASS state — at the scanner hit tick. In 41.8% of val events the gate was in
-PASS at scanner hit; entry fired within seconds.
+Originally: `roc_5m = pct_change[t_now] − pct_change[t_now − 5min]`, gate `roc_5m ≥ roc_min`, swept 5–25% in Phase R3. **Result: anti-selective.** corr(roc_5m, pnl) = −0.431 — blocked (low-ROC) events outperformed admitted (high-ROC) events at every threshold tested. Disabled permanently. Do not re-enable without new evidence.
 
-The floor guard is always the first check in the entry loop. No gate-state condition is
-evaluated for ticks before `t_scanner_hit_sec`.
+### 3.2 Setup Filter — Cross-and-Hold — REMOVED
 
-### 3.1 ROC Gate (5-minute)
+> Kept for the record as the original design rationale and the reason this was tried. **Not active.** Current entry is plain `first_pass` (§3 above) with no SF gate of any kind on first entry.
 
-```
-roc_5m = pct_change[t_now] − pct_change[t_now − 5min]
-```
-
-- Comparison point is the scanner poll closest to (but at least) 5 minutes before `t_now`.
-- If the earliest available poll is < 5 minutes old (early in session / recent first
-  appearance), use it as a **partial window** and record the actual lookback used.
-- **First appearance = admit.** If no prior poll exists for this ticker, skip the ROC
-  check entirely. No special handling for a gapper that dipped below 30% and re-qualified —
-  first appearance in the scanner is "first," full stop.
-- Gate: `roc_5m ≥ roc_min`. Swept 5–25% (Phase R3); `disabled` included as a baseline arm.
+The original premise: replace classic EPG's rising-edge timing signal entirely with an SF-based admission check (`entry_eligible()`, `rho_fast` lowered toward \~0.75 to cut smoothing lag), on the bet that the dead-tape-to-burst transition is different enough from a generic EPG rising edge that SF admission would help rather than hurt, unlike in classic EPG's EPG-OPT2-SF finding (§1.1). R2 tested this and it did not hold — see §1.3. The 15-bar sustain remains in place as the **live system's** continuous disqualifier during position management; that's a separate mechanism from the backtest's first-entry gate and was never affected by this change.
 
 ---
 
-## 4. Exit Stack
+## 4\. Exit Stack (current)
 
 First exit to fire wins, checked each trade tick.
 
 ```
-1. LULD proximity (both sides) — RTH only — HALT AVOIDANCE
+1. Time gate (T_gate = 500s) — one-shot, fires once at 500s since entry,
+   cuts if open P&L < 0, then disabled for the remainder of the trade
 2. EPG window close — PASS → FAIL / INACTIVE
+3. Session end — fallback if still in position at last tick
+
 ```
 
-EXIT_D is **not** in the stack.
+EXIT_D is **not** in the stack (unchanged from original design). LULD proximity is **not** in the stack (changed — see §2 and §5).
 
 ---
 
-## 5. The LULD Exit — Rebuilt Module, Both Sides
+## 5\. The LULD Exit — SUPERSEDED, NOT CURRENTLY ACTIVE
 
-**Important:** EPG-Rapid uses the **rebuilt** LULD module, not the legacy
-spread-multiple / continuously-recomputing-reference version. The rebuild (Phase
-LULD-REBUILD, design docs `LULD_Halt_Architecture.md` and `Phase_LULD_REBUILD.md`)
-replaced `backtest/core/exits/luld_proximity.py` in place. Two structural changes:
+> **Status as of 2026-06-30: not in the EPG-Rapid exit stack.** Everything below is the original design — kept for history and in case this gets revisited. **\[CONFIRM\]** with Cooper whether this was an intentional removal and, if so, why, before treating this section as dead. If LULD coverage is something you still want (it was specifically a halt-avoidance/risk-management exit, not an alpha source — losing it means RTH halt exposure during open positions is currently unmitigated, covered only by the time gate and EPG window close, neither of which is halt-aware in the way LULD proximity was designed to be), this is worth restoring rather than letting it quietly disappear.
 
-1. **Quote-based signal.** The exit watches the National Best Bid (NBB) approaching the
-   Upper/Lower Price Band — from `quotes.parquet` `bid_price`/`ask_price` — not trade
-   price. This is the actual regulatory Limit State precursor, not a proxy for it.
-2. **Sticky reference price.** The real SIP only republishes the reference price when the
-   new 5-minute mean moves ≥1% from the current published value. The rebuilt module
-   matches this — `reference_update_threshold_pct = 0.01` — instead of recomputing on
-   every tick. This was the source of the upper-band late-fire problem (see §5.3,
-   resolved) and is now fixed at the module level.
+**Original design (kept for reference):** EPG-Rapid was to use the **rebuilt** LULD module (quote-based, sticky reference price) on both sides — upper and lower bands independently tuned in Phase R4. The lower band was specifically re-enabled relative to classic EPG because the rationale for disabling it (pre-empting EXIT_D) doesn't apply once EXIT_D is gone. RTH-only by construction (the rebuilt module returns INACTIVE outside 09:30–16:00 ET) — pre-market halt exposure was always uncovered by this exit regardless. Given the target event is heavily pre-market, this was already a known partial-coverage exit even when active.
 
-The rebuild's own stated design intent — per the architecture doc — was already
-**halt-avoidance, not profit capture**: exit moments before a real halt, not capture a
-band-touch as alpha. EPG-Rapid does not need to re-argue that framing; it only needs to
-**extend it to both sides**, since the rebuild's first validation pass (Phase
-LULD-REBUILD) swept the upper band only (lower band was still locked off in classic EPG
-at that time).
-
-### 5.1 What changed and why two-sided is correct here
-
-The project previously locked **lower band disabled** in classic EPG because lower-band
-exits *pre-empted EXIT_D* on declining trades (legacy-module luld_lower PF=0.059 — it
-fired on trades that EXIT_D would otherwise have handled, and many of those trades
-recovered). That rationale is specific to a stack that contains EXIT_D, and specific to
-the legacy module's trade-price-based trigger.
-
-**EPG-Rapid disables EXIT_D.** There is nothing for the lower band to pre-empt. So the
-lower band is re-enabled on the **rebuilt** module — quote-based, sticky-reference,
-halt-avoidance by design on both sides.
-
-> The LULD proximity exit in EPG-Rapid is a **risk-management exit, not an alpha signal.**
-> Its job is to get the position flat *before* a LULD halt freezes us in. Being frozen in a
-> halted position — unable to exit while the stock is suspended, then gapping on resumption —
-> is the specific risk this exit exists to remove. A halt can come from either direction, so
-> the exit watches both bands.
-
-### 5.2 The honest cost
-
-The legacy-module luld_lower PF of 0.059 was measured on the **old** trade-price trigger,
-not the rebuilt quote-based one — so it isn't a direct read on how the rebuilt module's
-lower side will perform. But it's still the right prior: historically, lower-band
-proximity fires landed on trades that recovered. In halt-avoidance terms, those are
-**false exits** — we left a position that did not actually halt, and gave up PnL to do it.
-There's no reason to assume the rebuild eliminates this dynamic on the lower side; it only
-fixes the *reference-chasing* failure mode, which was specifically an upper-side problem.
-
-This means:
-
-- The lower side should still be assumed to carry a **higher false-exit rate** than the
-  upper side until R4's data says otherwise.
-- Upper and lower thresholds must be **tuned independently** (Phase R4). A single symmetric
-  threshold is almost certainly wrong.
-- The tuning objective is explicitly a **precision/recall tradeoff**, not PF maximization:
-  maximize the fraction of real halts we exit ahead of, while minimizing exits that were
-  not followed by a halt. Cooper selects the operating point on the frontier; the agent
-  presents the frontier only.
-
-### 5.3 Known limitations (must be carried into results)
-
-- **RTH only.** The rebuilt module returns INACTIVE outside 09:30–16:00 ET — this did not
-  change in the rebuild. Pre-market halts are exchange-discretion with no standardized
-  LULD formula, so this exit does **not** protect pre-market positions. Pre-market halt
-  exposure is covered only by the generic "no quote > 30s → soft halt" fallback and is a
-  separate, unsolved problem. Given the target event profile is heavily pre-market,
-  **the LULD exit protects only the RTH portion of the position lifecycle.** Document the
-  pre-market/RTH split of halt exposure in results.
-- **Reference-price chasing — RESOLVED by the rebuild.** The legacy module recomputed the
-  reference price on every tick, which made the modeled upper band chase price up during
-  a momentum run and fire *late* on exactly the parabolic run-ups most likely to halt. The
-  rebuilt module's sticky reference price (only updates on a ≥1% move, matching the real
-  SIP) directly fixes this. R4's T6 task (reference-chase audit) is retained as a
-  **regression check** — confirming the fix holds under two-sided tuning — not as an
-  open bug investigation.
+Full original mechanics, the reference-chasing bug fix, and the precision/recall tuning objective are preserved in `LULD_Halt_Architecture.md` and `Phase_LULD_REBUILD.md` if this gets revived.
 
 ---
 
-## 6. Halt-Gap Clock Handling
+## 6\. Halt-Gap Clock Handling
 
-Detected halt windows must not advance any decay clock.
+Unchanged, verified.
 
-- **Source of truth:** `detect_luld_halts()` in `luld_halt_detection.py` produces a
-  `HaltWindow` list (30s VWAP-band breach + gap detection) from the event's trades.
-- **Hawkes EMA / gate `λ_V`:** for any trade pair straddling a halt gap (`dt` exceeds the
-  halt-gap threshold), substitute `dt = 0` (or epsilon) in the exponential decay term so the
-  intensity and `λ_V` do not collapse across the suspension. This is the principle from
-  `HPC_Data_Processing.md §7.3` — pause, don't decay.
-- **Setup filter bars:** halt gaps generally fall on bar boundaries. A bar spanning a halt
-  boundary is treated as the active portion only; no synthetic bars are inserted across the
-  gap.
-- **Backtest wiring:** the replay loop (`_hawkes_replay_with_refit`) receives the
-  `halt_windows` for the event and applies the `dt=0` substitution at gap crossings.
+- **Source of truth:** `detect_luld_halts()` produces a `HaltWindow` list (30s VWAP-band breach + gap detection) from the event's trades.
+- **Hawkes EMA / gate `λ_V`:** for any trade pair straddling a halt gap, substitute `dt = 0` (or epsilon) in the exponential decay term so intensity and `λ_V` do not collapse across the suspension. T6b fix (commit `724617a`) confirmed this is correctly wired — verified directly against source.
+- **Setup filter bars:** halt gaps generally fall on bar boundaries; a bar spanning a halt boundary is treated as the active portion only.
 
 ---
 
-## 7. Baseline Definition
+## 7\. Baseline Definition — NEEDS RE-RUN
 
-EPG-Rapid numbers are only meaningful against a baseline run with the **same exit stack**.
-The baseline used throughout R0–R4 is classic-EPG first-PASS entry on the **MDR≥150
-diagnostic sample** (100 events, randomly selected from events where `mom_pct ≥ 150` and
-`t_scanner_hit_sec IS NOT NULL`, not top-ranked), configured to match EPG-Rapid exits.
+The EPG-Rapid numbers are only meaningful against a baseline run with the **same exit stack**. The original baseline spec below assumed LULD-on — that's now wrong given §5. **Re-run the baseline against the current stack (time gate + EPG window close + session end, no LULD, no EXIT_D) once the LULD question in §2/§5 is resolved one way or the other.** Don't compare current EPG-Rapid numbers to the old LULD-inclusive baseline in the meantime — it's not an apples-to-apples comparator anymore.
 
-- Gate: `ParticipationGate`, original symmetric (`τ=300`, `p=0.65`, `warmup=300`).
-- EXIT_D: off. LULD: off. EPG window close: on.
-- Entry: **classic first-PASS** — first tick where `gate.state == PASS` at or after
-  `t_scanner_hit`. Scanner floor active. No SF, no rising-edge, no `n_hold`.
+Baseline entry stays **classic rising-edge only** — no `entry_eligible()` call, no setup-filter precondition of any kind on first entry. This was the actual confirmed behavior of classic EPG and is unaffected by anything in this revision.
 
-Reported deltas: PF, trade count, mean entry lag (t_entry − t_scanner_hit), CVaR5,
-exit-reason distribution.
-
-> Note: the live system currently runs SlopeGate F_ss heuristically and is **not** the
-> backtest baseline. The baseline here is a backtest-validated ParticipationGate config, so
-> the comparison is gate-consistent.
+Reported deltas: PF, trade count, mean entry lag, CVaR5, exit-reason distribution.
 
 ---
 
-## 8. Code Modularity Changes (backwards-compatible)
+## 8\. Code Modularity Changes
 
-All changes are additive or default-preserving. Where a signature changes, every caller is
-updated in the same pass.
+Historical record of the additive changes made to reach the current state. Status column added to reflect what's actually active.
 
-| Change | File(s) | Compatibility |
-|---|---|---|
-| `LuldProximityExit` — expose independent upper/lower thresholds | `core/exits/luld_proximity.py` (**the rebuilt, quote-based, sticky-reference module** — see §5) | Add `proximity_threshold_upper` / `proximity_threshold_lower` (fraction of price, NBB-to-band, sticky reference); default both to the rebuild's existing single `proximity_threshold`. Add `lower_enabled: bool` config flag. |
-| Halt-gap `dt=0` substitution in replay | `backtest/runner.py` (`_hawkes_replay_with_refit`) | Gated on presence of `halt_windows`; absent → current behavior. |
-| ROC 5-min buffer | scanner monitor (live) + backtest snapshot reader | New per-ticker rolling buffer of `(ts, pct_change)`. Additive. |
-| Rapid runner | `runner_rapid.py` or `--mode rapid` flag on existing runner | Classic path untouched behind the flag. |
-
-> **Module identity note:** the LULD exit module referenced throughout this document is
-> the **rebuilt** version (Phase LULD-REBUILD). Its trigger parameter is
-> `proximity_threshold` — a fraction of price representing distance from the relevant
-> band, evaluated against the sticky reference price and the NBB — **not** the legacy
-> module's `n_spread_multiple` (spread-multiple buffer on trade price). A fixed
-> fraction-of-band threshold is the right parameterization here: the regulatory LULD band
-> itself is already a fixed percentage of the reference price (10%/20% Tier 2 schedule),
-> so a proximity-to-band threshold expressed the same way is the natural fit — the
-> spread-multiple approach was a workaround for the legacy module's trade-price/staleness
-> problem, which the sticky-reference fix now addresses directly.
+| Change                                               | File(s)                                    | Status                                                                                                                                                                                                                                      |
+| ---------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `_compute_setup_signals(..., rho_fast=RHO_FAST)`     | `setup_filter.py` (root + 2 copies)        | Built (C1). Not exercised in current entry path since SF entry was removed (§3.2). May still be used elsewhere (live system continuous disqualifier) — unaffected.                                                                          |
+| `entry_eligible(result, n_hold)`                     | `core/filters/rapid_entry.py`              | Built (C1). **Not called** by the current rapid entry path (`first_pass` doesn't use it). **\[CONFIRM\]** whether to delete, deprecate-in-place, or keep dormant for a possible Path B revival (§11) that might want a gated-admission mechanism again. |
+| `LuldProximityExit` independent upper/lower thresholds | `core/exits/luld_proximity.py`             | Built (C2). Not called by the current rapid exit stack (§5).                                                                                                                                                                                |
+| Halt-gap `dt=0` substitution in replay               | `runner.py` / `runner_rapid.py`            | **Active, verified (T6b).**                                                                                                                                                                                                                 |
+| ROC 5-min buffer                                     | scanner monitor + backtest snapshot reader | Built (C4), tested (R3), **disabled** at the gate level. Buffer itself may still be computed/logged even though the gate isn't applied — confirm if you want it stripped or kept as a logged-only feature.                                  |
+| Time gate (`T_gate`)                                 | `runner_rapid.py`                          | **Active, new, not originally planned.** Commit `0409332`.                                                                                                                                                                                  |
+| Rapid runner                                         | `runner_rapid.py`                          | Active. T4e/T6b fixes landed (`724617a`).                                                                                                                                                                                                   |
 
 ---
 
-## 9. Open Decisions (need a call before R4)
+## 9\. Open Decisions
 
-| # | Decision | Status |
-|---|---|---|
-| 1 | LULD reference implementation for tuning | **Resolved.** Rebuild has landed — R4 tunes the rebuilt quote-based, sticky-reference module directly. Not module-agnostic/conditional anymore. |
-| 2 | LULD trigger parameterization | **Resolved.** Rebuilt module uses `proximity_threshold` (fraction of price, NBB-to-band, sticky reference) — not spread-multiple. R4 sweeps this parameter independently per side. |
-| 3 | Upper-band fate under reference-chasing bug | **Resolved.** Bug fixed by the rebuild (sticky reference). R4's T6 is now a regression check, not an open investigation. |
-| 4 | Position-size scope for false-exit cost | Open. RTH-only notional vs full — report both; sizing is a paper-trade concern, not a backtest one. |
+| \#  | Decision                                                 | Status                                           |
+| --- | -------------------------------------------------------- | ------------------------------------------------ |
+| 1   | LULD: revive, formally retire, or leave dormant          | **Open — see §2/§5 \[CONFIRM\]**                 |
+| 2   | Sparse-warmup / universe scope (Path A/B/C)              | **Open — lean Path A, see §11.** Blocked behind §12. |
+| 3   | Data quality characterization and remediation            | **Open — blocking everything else.** See §12.    |
+| 4   | `T_gate` retroactive phase numbering (proposed R1.5)     | Open — administrative, doesn't block research    |
+| 5   | `entry_eligible()` / dormant SF-entry code: keep or remove | Open — low priority                              |
+| 6   | Position-size scope for false-exit cost reporting        | Open — paper-trade concern, not blocking         |
 
 ---
 
-## 10. Config Skeleton
+## 10\. Config Skeleton (current, approximate)
 
 ```json
 {
   "strategy_id": "epg_rapid",
   "gate": {
     "type": "participation",
+    "mode": "peak",
     "half_life_seconds": 300,
-    "p_open": 0.65,
-    "p_close": 0.65,
-    "warmup_seconds": 300
+    "p_open": null,
+    "p_close": null,
+    "warmup_seconds": 300,
+    "m_cool_sec": 0.0
   },
   "entry": {
-    "mode": "rapid",
-    "require_epg_pass": true,
-    "scanner_floor": true,
-    "max_entry_lag_sec": null,
-    "roc_min_5m": 0.05
+    "mode": "first_pass",
+    "max_entry_lag_sec": 300,
+    "require_epg_pass": true
   },
   "reentry": { "enabled": false },
-  "context_fetch": { "max_ticks": 5000 },
   "exit": {
+    "time_gate": { "enabled": true, "t_gate_sec": 500 },
+    "epg_window_close": { "enabled": true },
     "exit_d": { "enabled": false },
-    "luld": {
-      "enabled": true,
-      "rth_only": true,
-      "upper_enabled": true,
-      "lower_enabled": true,
-      "proximity_threshold_upper": 0.02,
-      "proximity_threshold_lower": 0.02,
-      "reference_update_threshold_pct": 0.01,
-      "reference_window_sec": 300.0
-    },
-    "epg_window_close": { "enabled": true }
+    "luld": { "enabled": false }
   },
-  "halt": { "gap_seconds": 60, "pause_decay": true }
+  "halt": { "gap_seconds": 60, "pause_decay": true },
+  "roc_gate": { "enabled": false }
 }
+
 ```
 
-All values above are **starting points**, not selected. `p_open`/`p_close` selected in R1;
-`roc_min_5m` in R3; `proximity_threshold_upper`/`_lower` in R4.
-`max_entry_lag_sec` set by Cooper after R0 T7 distribution; `null` in R0 (log only).
-`reference_update_threshold_pct=0.01` is fixed (matches the real SIP rule, not a tuning target).
+`p_open`/`p_close` left null — R1-Final selection pending §12. This skeleton replaces the 2026-06-18 version, which included an active ROC gate and a two-sided LULD block that no longer reflect the running config. **\[CONFIRM\]** this against the actual `runner_rapid.py` config schema before treating it as authoritative — I built it from the handoff's prose description, not the source file.
+
+---
+
+## 11\. Open Structural Decision — Sparse Warmup / Universe Scope
+
+Full investigation in the 2026-06-30 context handoff. Summary:
+
+**The problem:** the EPG gate needs accumulated pre-scanner trade history to reach PASS (Hawkes replay → EventAnchor fire → 300s warmup, in sequence). True first-appearance gap-ups have little or no pre-scanner tape, so this chain can't complete before the 300s entry deadline. 61% of events fail entry on this (ANCHOR_LATE 42%, WARMUP_AT_DEADLINE 19%). The high-gap stratum (>200% gap) is 0/20 traded — a complete structural failure for that stratum, not a tuning artifact.
+
+**The deeper tension:** the events that *do* trade (\~24 of \~95) are gradual risers — already actively trading for hours before crossing 30%. The strategy was designed for dead-tape-to-burst events, which are structurally the events it currently can't trade.
+
+**Three paths, evaluated in the handoff:**
+
+- **Path A** — accept the gradual-riser universe, add an explicit `n_trades_before_scanner > threshold` filter, document it as a design constraint, optimize on that universe. Honest, immediately actionable, abandons the original thesis.
+- **Path B** — force anchor = scanner hit + reduced warmup for sparse events (`sparse_warmup_sec` swept 0/30/60/120s). Tries to recover the high/mid gap strata. Requires its own MFE/MAE validation before trusting the PASS signal on this new event class — this would effectively be a new mini R0/R1, not a parameter tweak.
+- **Path C** — trade T1_POSTMARKET events the night before, in after-hours. Only helps one of three gap sub-categories (post-market gappers); thin liquidity, overnight gap risk, different trade structure entirely. Probably a separate strategy/project.
+
+**Current lean: Path A.** Narrow the universe explicitly rather than chase the original thesis through an unvalidated entry re-architecture. This is not locked — it's deferred until §12 (data quality) clears, since the sparse-warmup failure counts themselves need to be confirmed clean before they're trusted as the basis for a scope decision.
+
+---
+
+## 12\. Data & Chart Quality — Blocking, Next Phase
+
+Reviewing per-event charts from the corrected R1-Fixed run surfaced dirty tick data in some events (large price spikes/reversions, possible zero/negative prices or sizes, duplicate timestamps, out-of-session ticks, halt-inconsistent gaps, possible further `prev_close` anomalies beyond the one already fixed). Severity and concentration are not yet characterized — could be concentrated in illiquid sub-$1 names, could be spread evenly, unknown until measured.
+
+Separately, the per-event charts from the corrected R1 run don't meet the project standard (`Agent_Prompt_Standard.md` §7) and need regeneration.
+
+**Both block trust in every downstream number** — the R1-Fixed table in §2.1 and the sparse-warmup stratum counts in §11 are both built on this data. **This is the next phase.** See the companion agent prompt, `Phase_DIAG-DQ_Agent_Prompt.md`, for the task breakdown.
+
+---
+
+## 13\. One-Paragraph Current State
+
+EPG-Rapid's mechanics are verified clean: the gate, the T4e/T6b fixes, the time gate, and the halt-aware decay are all confirmed against source. SF-based entry and the ROC gate were both tried and abandoned on real evidence. LULD was dropped from the exit stack — status needs confirming. On the current (possibly-dirty) val sample the strategy trades \~24–25 of \~95 events, all gradual risers, at PF \~1.2–1.8, CVaR5 clearing −15% at the higher thresholds. The strategy may not currently trade its own target event type (dead-tape-to-burst) at all — that's an open scope decision (§11, lean Path A) gated behind a data-quality and chart-standards pass (§12) that has to happen first.
